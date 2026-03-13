@@ -1,0 +1,65 @@
+from django.db import models
+
+
+class Client(models.Model):
+    name = models.CharField('Название', max_length=255)
+    contact = models.CharField('Контакт', max_length=255, blank=True)
+    phone = models.CharField('Телефон', max_length=50, blank=True)
+    inn = models.CharField('ИНН', max_length=20, blank=True)
+    address = models.TextField('Адрес', blank=True)
+
+    class Meta:
+        db_table = 'clients'
+        verbose_name = 'Клиент'
+        verbose_name_plural = 'Клиенты'
+
+    def __str__(self):
+        return self.name
+
+
+class Sale(models.Model):
+    order_number = models.CharField('Номер заказа', max_length=100)
+    client = models.ForeignKey(Client, on_delete=models.PROTECT, related_name='sales')
+    product = models.CharField('Продукт', max_length=255)
+    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4)
+    price = models.DecimalField('Цена', max_digits=14, decimal_places=2, null=True, blank=True)
+    date = models.DateField('Дата')
+    comment = models.TextField('Комментарий', blank=True)
+    profit = models.DecimalField('Прибыль', max_digits=14, decimal_places=2, default=0)
+
+    class Meta:
+        db_table = 'sales'
+        verbose_name = 'Продажа'
+        verbose_name_plural = 'Продажи'
+        ordering = ['-date', '-id']
+
+    def __str__(self):
+        return f'{self.order_number} — {self.client.name}'
+
+
+class Shipment(models.Model):
+    STATUS_PENDING = 'pending'
+    STATUS_SHIPPED = 'shipped'
+    STATUS_DELIVERED = 'delivered'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'К отгрузке'),
+        (STATUS_SHIPPED, 'Отгружено'),
+        (STATUS_DELIVERED, 'Доставлено'),
+    ]
+
+    sale = models.ForeignKey(Sale, on_delete=models.PROTECT, related_name='shipments')
+    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4)
+    status = models.CharField('Статус', max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    shipment_date = models.DateField('Дата отгрузки', null=True, blank=True)
+    delivery_date = models.DateField('Дата доставки', null=True, blank=True)
+    address = models.TextField('Адрес доставки', blank=True)
+    comment = models.TextField('Комментарий', blank=True)
+
+    class Meta:
+        db_table = 'shipments'
+        verbose_name = 'Отгрузка'
+        verbose_name_plural = 'Отгрузки'
+        ordering = ['-id']
+
+    def __str__(self):
+        return f'Отгрузка #{self.id} — {self.get_status_display()}'
