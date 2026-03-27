@@ -9,5 +9,5 @@ class RecipeComponentInline(admin.TabularInline):
 
 @admin.register(Recipe)
 class RecipeAdmin(admin.ModelAdmin):
-    list_display = ('recipe', 'product')
+    list_display = ('recipe', 'product', 'output_quantity', 'output_unit_kind')
     inlines = [RecipeComponentInline]

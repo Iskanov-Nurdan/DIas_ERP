@@ -21,6 +21,21 @@ class HasAccessKey(BasePermission):
         return HasAccessKey(access_key=access_key)
 
 
+class CanAccessShiftComplaints(BasePermission):
+    """
+    Жалобы по сменам: авторизован и есть ключ my_shift или shifts (или суперпользователь).
+    Полная лента — при ключе shifts; иначе только свои жалобы и где упомянут.
+    """
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if getattr(request.user, 'is_superuser', False):
+            return True
+        keys = request.user.get_access_keys()
+        return 'my_shift' in keys or 'shifts' in keys
+
+
 class IsAdminOrHasAccess(BasePermission):
     """Суперпользователь или наличие access_key."""
     def __init__(self, access_key=None):

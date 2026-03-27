@@ -1,43 +1,403 @@
+from decimal import Decimal
+from typing import Optional
+
+from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import serializers
-from .models import Line, LineHistory, Order, ProductionBatch
+
+from config.decimal_format import format_decimal_plain
+from config.fields import CleanDecimalField
+
+from apps.accounts.models import User
+from apps.recipes.models import Recipe, RecipeComponent
+from apps.recipes.serializers import RecipeSerializer
+from config.exceptions import LineShiftPausedForRecipeRun
+from .recipe_run_stock import apply_recipe_run_stock, reverse_recipe_run_stock
+from .shift_state import (
+    line_current_shift_open_event,
+    line_current_shift_params_event,
+    line_shift_is_open,
+    line_shift_is_paused,
+    line_shift_pause_reason,
+)
+from .models import (
+    Line,
+    LineHistory,
+    ProductionBatch,
+    RecipeRun,
+    RecipeRunBatch,
+    RecipeRunBatchComponent,
+    Shift,
+    ShiftComplaint,
+    ShiftNote,
+)
+
+
+def _recipe_display_name(obj) -> Optional[str]:
+    """Человекочитаемое имя рецепта (Order / RecipeRun): живой FK или снимок."""
+    if getattr(obj, 'recipe_id', None):
+        try:
+            return (obj.recipe.recipe or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    snap = (getattr(obj, 'recipe_name_snapshot', None) or '').strip()
+    return snap or None
+
+
+def _line_display_name(obj) -> Optional[str]:
+    if getattr(obj, 'line_id', None):
+        try:
+            return (obj.line.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    snap = (getattr(obj, 'line_name_snapshot', None) or '').strip()
+    return snap or None
+
+
+def _recipe_run_display_recipe(run) -> Optional[str]:
+    """Имя рецепта для запуска: снимок на запуске, затем заказ связанной партии ОТК."""
+    n = _recipe_display_name(run)
+    if n:
+        return n
+    pb = getattr(run, 'production_batch', None)
+    if pb is None:
+        return None
+    try:
+        order = pb.order
+    except ObjectDoesNotExist:
+        return None
+    snap = (getattr(order, 'recipe_name_snapshot', None) or '').strip()
+    if snap:
+        return snap
+    if getattr(order, 'recipe_id', None):
+        try:
+            return (order.recipe.recipe or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    return (getattr(order, 'product', None) or '').strip() or None
+
+
+def _recipe_run_release_qty_decimal(obj) -> Optional[Decimal]:
+    """Выпуск для ОТК: quantity партии производства, иначе норма рецепта (не сумма ёмкостей)."""
+    if getattr(obj, 'production_batch_id', None):
+        try:
+            pb = obj.production_batch
+            return Decimal(str(pb.quantity))
+        except ObjectDoesNotExist:
+            pass
+    if getattr(obj, 'recipe_id', None):
+        try:
+            rq = obj.recipe.output_quantity
+            if rq is not None:
+                return Decimal(str(rq))
+        except ObjectDoesNotExist:
+            pass
+    return None
+
+
+def _recipe_norm_output_str(obj) -> Optional[str]:
+    if not getattr(obj, 'recipe_id', None):
+        return None
+    try:
+        rq = obj.recipe.output_quantity
+        if rq is None:
+            return None
+        return format_decimal_plain(rq)
+    except ObjectDoesNotExist:
+        return None
+
+
+def _recipe_output_unit_kind_value(obj) -> Optional[str]:
+    if not getattr(obj, 'recipe_id', None):
+        return None
+    try:
+        return obj.recipe.output_unit_kind
+    except ObjectDoesNotExist:
+        return None
+
+
+def _recipe_run_display_line(run) -> Optional[str]:
+    n = _line_display_name(run)
+    if n:
+        return n
+    pb = getattr(run, 'production_batch', None)
+    if pb is None:
+        return None
+    try:
+        order = pb.order
+    except ObjectDoesNotExist:
+        return None
+    snap = (getattr(order, 'line_name_snapshot', None) or '').strip()
+    if snap:
+        return snap
+    if getattr(order, 'line_id', None):
+        try:
+            return (order.line.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    return None
 
 
 class LineSerializer(serializers.ModelSerializer):
+    shift_is_open = serializers.SerializerMethodField()
+    shift_is_paused = serializers.SerializerMethodField()
+    shift_pause_reason = serializers.SerializerMethodField()
+    shift_snapshot = serializers.SerializerMethodField()
+
     class Meta:
         model = Line
-        fields = ('id', 'name')
+        fields = (
+            'id',
+            'name',
+            'shift_is_open',
+            'shift_is_paused',
+            'shift_pause_reason',
+            'shift_snapshot',
+        )
+
+    def get_shift_is_open(self, obj):
+        m = self.context.get('line_histories') or {}
+        hist = m.get(obj.pk)
+        return line_shift_is_open(obj, histories=hist)
+
+    def get_shift_is_paused(self, obj):
+        m = self.context.get('line_histories') or {}
+        hist = m.get(obj.pk)
+        return line_shift_is_paused(obj, histories=hist)
+
+    def get_shift_pause_reason(self, obj):
+        m = self.context.get('line_histories') or {}
+        hist = m.get(obj.pk)
+        return line_shift_pause_reason(obj, histories=hist)
+
+    def get_shift_snapshot(self, obj):
+        m = self.context.get('line_histories') or {}
+        hist = m.get(obj.pk)
+        if not line_shift_is_open(obj, histories=hist):
+            return None
+        ev_open = line_current_shift_open_event(obj, histories=hist)
+        if ev_open is None:
+            return None
+        ev_params = line_current_shift_params_event(obj, histories=hist)
+        if ev_params is None:
+            return None
+        from datetime import datetime, time as time_cls
+        from django.utils import timezone as dj_tz
+
+        t = ev_open.time or time_cls.min
+        dt = datetime.combine(ev_open.date, t)
+        opened_at = dj_tz.make_aware(dt) if dj_tz.is_naive(dt) else dt
+        return {
+            'height': float(ev_params.height) if ev_params.height is not None else None,
+            'width': float(ev_params.width) if ev_params.width is not None else None,
+            'angle_deg': float(ev_params.angle_deg) if ev_params.angle_deg is not None else None,
+            'opened_by': ev_open.user.name if ev_open.user_id else None,
+            'opened_at': opened_at.isoformat(),
+            'session_title': ev_open.session_title or None,
+            'is_paused': line_shift_is_paused(obj, histories=hist),
+            'pause_reason': line_shift_pause_reason(obj, histories=hist),
+        }
+
+    def to_representation(self, instance):
+        if instance is None:
+            return None
+        return super().to_representation(instance)
+
+
+class ShiftNoteSerializer(serializers.ModelSerializer):
+    note = serializers.CharField(source='text', read_only=True)
+
+    class Meta:
+        model = ShiftNote
+        fields = ('id', 'note', 'created_at')
+
+
+class ShiftSerializer(serializers.ModelSerializer):
+    status = serializers.SerializerMethodField()
+    user_name = serializers.SerializerMethodField()
+    line_name = serializers.SerializerMethodField()
+    line_label = serializers.SerializerMethodField()
+    notes_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Shift
+        fields = (
+            'id', 'line', 'line_name', 'line_label', 'line_name_snapshot', 'former_line_id',
+            'user', 'user_name',
+            'opened_at', 'closed_at', 'status', 'comment', 'notes_count',
+        )
+        read_only_fields = ('line_name_snapshot', 'former_line_id',)
+
+    def get_line_label(self, obj):
+        return self.get_line_name(obj)
+
+    def get_user_name(self, obj):
+        if obj.user_id:
+            try:
+                return obj.user.name
+            except ObjectDoesNotExist:
+                return None
+        return None
+
+    def get_status(self, obj):
+        return obj.status
+
+    def get_line_name(self, obj):
+        return _line_display_name(obj)
+
+
+class ShiftDetailSerializer(ShiftSerializer):
+    """Расширенный сериализатор для GET /api/shifts/{id}/ — включает notes."""
+    notes = serializers.SerializerMethodField()
+
+    class Meta(ShiftSerializer.Meta):
+        fields = ShiftSerializer.Meta.fields + ('notes',)
+
+    def get_notes(self, obj):
+        qs = obj.notes.order_by('-created_at')
+        return ShiftNoteSerializer(qs, many=True).data
+
+
+class ShiftComplaintListSerializer(serializers.ModelSerializer):
+    author = serializers.SerializerMethodField()
+    mentioned_users = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftComplaint
+        fields = ('id', 'body', 'created_at', 'author', 'mentioned_users', 'shift_id')
+
+    def get_author(self, obj):
+        u = obj.author
+        return {'id': u.pk, 'name': u.name, 'username': u.email}
+
+    def get_mentioned_users(self, obj):
+        return [{'id': u.pk, 'name': u.name, 'username': u.email} for u in obj.mentioned_users.all()]
+
+
+class ShiftComplaintCreateSerializer(serializers.ModelSerializer):
+    mentioned_user_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        default=list,
+    )
+    shift_id = serializers.IntegerField(required=False, allow_null=True, write_only=True)
+
+    class Meta:
+        model = ShiftComplaint
+        fields = ('body', 'mentioned_user_ids', 'shift_id')
+
+    def validate_body(self, value):
+        s = (value or '').strip()
+        if not s:
+            raise serializers.ValidationError('Укажите текст жалобы.')
+        return s
+
+    def validate(self, attrs):
+        request = self.context['request']
+        shift_raw = attrs.pop('shift_id', None)
+        if shift_raw is not None:
+            sh = Shift.objects.filter(pk=shift_raw).first()
+            if not sh:
+                raise serializers.ValidationError({'shift_id': 'Смена не найдена'})
+            if sh.user_id != request.user.pk:
+                raise serializers.ValidationError({'shift_id': 'Можно указать только свою смену'})
+            attrs['shift'] = sh
+
+        ids = attrs.get('mentioned_user_ids', []) or []
+        ids = list(dict.fromkeys(ids))
+        ids = [i for i in ids if i != request.user.pk]
+        attrs['mentioned_user_ids'] = ids
+        if ids:
+            found = set(User.objects.filter(pk__in=ids).values_list('pk', flat=True))
+            missing = [i for i in ids if i not in found]
+            if missing:
+                raise serializers.ValidationError(
+                    {'mentioned_user_ids': f'Неизвестные пользователи: {missing}'},
+                )
+        return attrs
+
+    def create(self, validated_data):
+        ids = validated_data.pop('mentioned_user_ids', [])
+        author = self.context['request'].user
+        complaint = ShiftComplaint.objects.create(author=author, **validated_data)
+        if ids:
+            complaint.mentioned_users.set(User.objects.filter(pk__in=ids))
+        return complaint
+
+
+class LineShiftSnapshotSerializer(serializers.Serializer):
+    """Снимок параметров для open / close / params_update."""
+
+    height = serializers.DecimalField(max_digits=10, decimal_places=2)
+    width = serializers.DecimalField(max_digits=10, decimal_places=2)
+    angle_deg = serializers.DecimalField(max_digits=8, decimal_places=2)
+    comment = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class LineShiftOpenSerializer(LineShiftSnapshotSerializer):
+    session_title = serializers.CharField(required=False, allow_blank=True, max_length=255, default='')
+
+
+class LineShiftPauseSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=4000)
+
+    def validate_reason(self, value):
+        s = (value or '').strip()
+        if not s:
+            raise serializers.ValidationError('Укажите непустую причину остановки.')
+        return s
 
 
 class LineHistorySerializer(serializers.ModelSerializer):
-    line_name = serializers.CharField(source='line.name', read_only=True)
+    line_name = serializers.SerializerMethodField()
+    line_label = serializers.SerializerMethodField()
     date = serializers.DateField(format='%Y-%m-%d')
     time = serializers.TimeField(format='%H:%M')
+    height = serializers.SerializerMethodField()
+    width = serializers.SerializerMethodField()
+    angle_deg = serializers.SerializerMethodField()
+    session_title = serializers.SerializerMethodField()
+    reason = serializers.SerializerMethodField()
+    pause_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = LineHistory
-        fields = ('id', 'line', 'line_name', 'action', 'date', 'time')
-
-
-class OrderSerializer(serializers.ModelSerializer):
-    """Контракт: GET — items с id, status, product, recipe, line, quantity, date, assigned_to (operator)."""
-    recipe_name = serializers.CharField(source='recipe.recipe', read_only=True)
-    line_name = serializers.CharField(source='line.name', read_only=True)
-    assigned_to = serializers.PrimaryKeyRelatedField(source='operator', read_only=True, allow_null=True)
-
-    class Meta:
-        model = Order
         fields = (
-            'id', 'status', 'recipe', 'recipe_name', 'line', 'line_name',
-            'quantity', 'product', 'operator', 'assigned_to', 'date',
+            'id', 'line_id', 'date', 'time', 'line_name', 'line_label',
+            'line_name_snapshot', 'former_line_id',
+            'action',
+            'height', 'width', 'angle_deg', 'comment', 'session_title',
+            'reason', 'pause_reason',
         )
-        extra_kwargs = {
-            'operator': {'allow_null': True},
-            'recipe': {'required': True},
-            'line': {'required': True},
-            'quantity': {'required': True},
-            'product': {'required': False},
-            'date': {'required': False},
-        }
+        read_only_fields = ('line_name_snapshot', 'former_line_id')
+
+    def get_line_name(self, obj):
+        return _line_display_name(obj)
+
+    def get_line_label(self, obj):
+        return self.get_line_name(obj)
+
+    def get_height(self, obj):
+        return float(obj.height) if obj.height is not None else None
+
+    def get_width(self, obj):
+        return float(obj.width) if obj.width is not None else None
+
+    def get_angle_deg(self, obj):
+        return float(obj.angle_deg) if obj.angle_deg is not None else None
+
+    def get_session_title(self, obj):
+        if obj.action != LineHistory.ACTION_OPEN:
+            return None
+        return obj.session_title or None
+
+    def get_reason(self, obj):
+        if obj.action != LineHistory.ACTION_SHIFT_PAUSE:
+            return None
+        s = (obj.comment or '').strip()
+        return s or None
+
+    def get_pause_reason(self, obj):
+        return self.get_reason(obj)
 
 
 class ProductionBatchSerializer(serializers.ModelSerializer):
@@ -54,6 +414,7 @@ class BatchListSerializer(serializers.ModelSerializer):
     Контракт GET /api/batches/: id, order_name, product_name, quantity/released,
     operator_name, date, created_at, otk_status, otk_accepted, otk_defect,
     otk_defect_reason, otk_comment, otk_inspector, otk_checked_at.
+    Дополнительно: recipe_name, recipe_output_quantity (норма по рецепту, справочно для ОТК).
     """
     order_name = serializers.CharField(source='order.product', read_only=True)
     product_name = serializers.CharField(source='product', read_only=True)
@@ -66,14 +427,29 @@ class BatchListSerializer(serializers.ModelSerializer):
     otk_comment = serializers.SerializerMethodField()
     otk_inspector = serializers.SerializerMethodField()
     otk_checked_at = serializers.SerializerMethodField()
+    recipe_name = serializers.SerializerMethodField()
+    recipe_label = serializers.SerializerMethodField()
+    recipe_name_snapshot = serializers.SerializerMethodField()
+    former_recipe_id = serializers.SerializerMethodField()
+    recipe_output_quantity = serializers.SerializerMethodField()
+    recipe_output_unit_kind = serializers.SerializerMethodField()
+    line_name = serializers.SerializerMethodField()
+    line_label = serializers.SerializerMethodField()
+    height = serializers.SerializerMethodField()
+    width = serializers.SerializerMethodField()
+    angle_deg = serializers.SerializerMethodField()
+    otk_status_display = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionBatch
         fields = (
             'id', 'order', 'order_name', 'product', 'product_name', 'quantity', 'released',
             'operator', 'operator_name', 'date', 'created_at',
-            'otk_status', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
+            'otk_status', 'otk_status_display', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
             'otk_comment', 'otk_inspector', 'otk_checked_at',
+            'recipe_name', 'recipe_label', 'recipe_name_snapshot', 'former_recipe_id',
+            'recipe_output_quantity', 'recipe_output_unit_kind',
+            'line_name', 'line_label', 'height', 'width', 'angle_deg',
         )
 
     def _last_check(self, obj):
@@ -109,3 +485,670 @@ class BatchListSerializer(serializers.ModelSerializer):
         if c and c.checked_date:
             return c.checked_date.isoformat()
         return None
+
+    def get_recipe_name(self, obj):
+        if not obj.order_id:
+            return None
+        return _recipe_display_name(obj.order)
+
+    def get_recipe_label(self, obj):
+        return self.get_recipe_name(obj)
+
+    def get_recipe_name_snapshot(self, obj):
+        if not obj.order_id:
+            return None
+        return obj.order.recipe_name_snapshot or None
+
+    def get_former_recipe_id(self, obj):
+        if not obj.order_id:
+            return None
+        return obj.order.former_recipe_id
+
+    def get_recipe_output_quantity(self, obj):
+        if not obj.order_id or not getattr(obj.order, 'recipe_id', None):
+            return None
+        try:
+            rq = obj.order.recipe.output_quantity
+            if rq is not None:
+                return format_decimal_plain(rq)
+        except ObjectDoesNotExist:
+            pass
+        return None
+
+    def get_recipe_output_unit_kind(self, obj):
+        if not obj.order_id or not getattr(obj.order, 'recipe_id', None):
+            return None
+        try:
+            return obj.order.recipe.output_unit_kind
+        except ObjectDoesNotExist:
+            return None
+
+    def get_otk_status_display(self, obj):
+        return obj.get_otk_status_display()
+
+    def get_height(self, obj):
+        return float(obj.shift_height) if obj.shift_height is not None else None
+
+    def get_width(self, obj):
+        return float(obj.shift_width) if obj.shift_width is not None else None
+
+    def get_angle_deg(self, obj):
+        return float(obj.shift_angle_deg) if obj.shift_angle_deg is not None else None
+
+    def get_line_name(self, obj):
+        if not obj.order_id:
+            return None
+        return _line_display_name(obj.order)
+
+    def get_line_label(self, obj):
+        return self.get_line_name(obj)
+
+
+# ——— Запуски по рецепту (Химия → Элементы) ———
+
+# Текст, если в БД не осталось ни FK, ни снимка (старые данные / частичное удаление).
+_RECIPE_RUN_COMPONENT_LABEL_FALLBACK = 'Наименование недоступно (удалено из справочника)'
+
+
+def _recipe_component_for_batch_line(obj: RecipeRunBatchComponent):
+    if not getattr(obj, 'recipe_component_id', None):
+        return None
+    try:
+        return obj.recipe_component
+    except ObjectDoesNotExist:
+        return None
+
+
+def _material_label_for_batch_component(obj: RecipeRunBatchComponent) -> Optional[str]:
+    if obj.raw_material_id:
+        try:
+            return (obj.raw_material.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    s = (getattr(obj, 'material_name_snapshot', None) or '').strip()
+    if s:
+        return s
+    rc = _recipe_component_for_batch_line(obj)
+    if rc is not None and rc.type == RecipeComponent.TYPE_RAW and rc.raw_material_id:
+        try:
+            return (rc.raw_material.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    return None
+
+
+def _chemistry_label_for_batch_component(obj: RecipeRunBatchComponent) -> Optional[str]:
+    if obj.chemistry_id:
+        try:
+            return (obj.chemistry.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    s = (getattr(obj, 'chemistry_name_snapshot', None) or '').strip()
+    if s:
+        return s
+    rc = _recipe_component_for_batch_line(obj)
+    if rc is not None and rc.type == RecipeComponent.TYPE_CHEM and rc.chemistry_id:
+        try:
+            return (rc.chemistry.name or '').strip() or None
+        except ObjectDoesNotExist:
+            pass
+    return None
+
+
+def _display_label_for_batch_component(obj: RecipeRunBatchComponent) -> str:
+    m = _material_label_for_batch_component(obj)
+    if m:
+        return m
+    c = _chemistry_label_for_batch_component(obj)
+    if c:
+        return c
+    rc = _recipe_component_for_batch_line(obj)
+    if rc is not None:
+        if rc.type == RecipeComponent.TYPE_CHEM and rc.chemistry_id:
+            try:
+                n = (rc.chemistry.name or '').strip()
+                if n:
+                    return n
+            except ObjectDoesNotExist:
+                pass
+        if rc.type == RecipeComponent.TYPE_RAW and rc.raw_material_id:
+            try:
+                n = (rc.raw_material.name or '').strip()
+                if n:
+                    return n
+            except ObjectDoesNotExist:
+                pass
+        if rc.chemistry_id:
+            try:
+                n = (rc.chemistry.name or '').strip()
+                if n:
+                    return n
+            except ObjectDoesNotExist:
+                pass
+        if rc.raw_material_id:
+            try:
+                n = (rc.raw_material.name or '').strip()
+                if n:
+                    return n
+            except ObjectDoesNotExist:
+                pass
+    return _RECIPE_RUN_COMPONENT_LABEL_FALLBACK
+
+
+class RecipeRunBatchComponentSerializer(serializers.ModelSerializer):
+    material_id = serializers.IntegerField(source='raw_material_id', read_only=True, allow_null=True)
+    chemistry_id = serializers.IntegerField(read_only=True, allow_null=True)
+    recipe_component_id = serializers.IntegerField(read_only=True, allow_null=True)
+    quantity = CleanDecimalField(
+        max_digits=14, decimal_places=4, read_only=True, coerce_to_string=True,
+    )
+    material_name = serializers.SerializerMethodField()
+    element_name = serializers.SerializerMethodField()
+    name = serializers.SerializerMethodField()
+    material_name_snapshot = serializers.SerializerMethodField()
+    chemistry_name_snapshot = serializers.SerializerMethodField()
+
+    def get_material_name(self, obj):
+        m = _material_label_for_batch_component(obj)
+        if m:
+            return m
+        if _chemistry_label_for_batch_component(obj):
+            return None
+        return _display_label_for_batch_component(obj)
+
+    def get_element_name(self, obj):
+        c = _chemistry_label_for_batch_component(obj)
+        if c:
+            return c
+        if _material_label_for_batch_component(obj):
+            return None
+        return _display_label_for_batch_component(obj)
+
+    def get_name(self, obj):
+        return _display_label_for_batch_component(obj)
+
+    def get_material_name_snapshot(self, obj):
+        s = (getattr(obj, 'material_name_snapshot', None) or '').strip()
+        if s:
+            return s
+        m = _material_label_for_batch_component(obj)
+        if m:
+            return m
+        if _chemistry_label_for_batch_component(obj):
+            return None
+        return _display_label_for_batch_component(obj)
+
+    def get_chemistry_name_snapshot(self, obj):
+        s = (getattr(obj, 'chemistry_name_snapshot', None) or '').strip()
+        if s:
+            return s
+        c = _chemistry_label_for_batch_component(obj)
+        if c:
+            return c
+        if _material_label_for_batch_component(obj):
+            return None
+        return _display_label_for_batch_component(obj)
+
+    class Meta:
+        model = RecipeRunBatchComponent
+        fields = (
+            'id', 'material_id', 'material_name', 'material_name_snapshot',
+            'chemistry_id', 'element_name', 'chemistry_name_snapshot', 'name',
+            'quantity', 'unit', 'recipe_component_id',
+        )
+
+
+class RecipeRunBatchSerializer(serializers.ModelSerializer):
+    quantity = CleanDecimalField(
+        max_digits=14, decimal_places=4, read_only=True, allow_null=True, coerce_to_string=True,
+    )
+    components = RecipeRunBatchComponentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = RecipeRunBatch
+        fields = ('id', 'index', 'label', 'quantity', 'components')
+
+
+class RecipeRunListSerializer(serializers.ModelSerializer):
+    recipe = serializers.SerializerMethodField()
+    recipe_name = serializers.SerializerMethodField()
+    recipe_label = serializers.SerializerMethodField()
+    effective_recipe_id = serializers.SerializerMethodField()
+    line = serializers.SerializerMethodField()
+    line_name = serializers.SerializerMethodField()
+    line_label = serializers.SerializerMethodField()
+    batches = RecipeRunBatchSerializer(many=True, read_only=True)
+    batches_count = serializers.IntegerField(read_only=True)
+    total_quantity = serializers.SerializerMethodField()
+    output_quantity = serializers.SerializerMethodField()
+    recipe_output_quantity = serializers.SerializerMethodField()
+    output_unit_kind = serializers.SerializerMethodField()
+    summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RecipeRun
+        fields = (
+            'id', 'recipe', 'recipe_name', 'recipe_label', 'effective_recipe_id',
+            'recipe_name_snapshot', 'former_recipe_id',
+            'line', 'line_name', 'line_label',
+            'line_name_snapshot', 'former_line_id',
+            'batches', 'batches_count',
+            'total_quantity', 'output_quantity', 'recipe_output_quantity', 'output_unit_kind',
+            'created_at', 'summary', 'production_batch_id',
+        )
+        read_only_fields = (
+            'line_name_snapshot', 'former_line_id',
+            'recipe_name_snapshot', 'former_recipe_id',
+        )
+
+    def get_recipe(self, obj):
+        if obj.recipe_id:
+            try:
+                return RecipeSerializer(obj.recipe, context=self.context).data
+            except ObjectDoesNotExist:
+                pass
+        label = _recipe_run_display_recipe(obj)
+        if not label and obj.former_recipe_id is None:
+            return None
+        return {
+            'id': obj.former_recipe_id,
+            'recipe': label,
+            'product': None,
+            'components': [],
+            'output_quantity': None,
+            'output_unit_kind': None,
+        }
+
+    def get_line(self, obj):
+        if obj.line_id:
+            try:
+                return LineSerializer(obj.line).data
+            except ObjectDoesNotExist:
+                pass
+        name = _recipe_run_display_line(obj)
+        if not name and obj.former_line_id is None:
+            return None
+        return {'id': obj.former_line_id, 'name': name}
+
+    def get_recipe_name(self, obj):
+        return _recipe_run_display_recipe(obj)
+
+    def get_recipe_label(self, obj):
+        return self.get_recipe_name(obj)
+
+    def get_effective_recipe_id(self, obj):
+        return obj.recipe_id or obj.former_recipe_id
+
+    def get_line_name(self, obj):
+        return _recipe_run_display_line(obj)
+
+    def get_line_label(self, obj):
+        return self.get_line_name(obj)
+
+    def get_total_quantity(self, obj):
+        q = _recipe_run_release_qty_decimal(obj)
+        return format_decimal_plain(q) if q is not None else None
+
+    def get_output_quantity(self, obj):
+        return self.get_total_quantity(obj)
+
+    def get_recipe_output_quantity(self, obj):
+        return _recipe_norm_output_str(obj)
+
+    def get_output_unit_kind(self, obj):
+        return _recipe_output_unit_kind_value(obj)
+
+    def get_summary(self, obj):
+        n = getattr(obj, 'batches_count', None)
+        if n is None:
+            n = obj.batches.count()
+        rel = _recipe_run_release_qty_decimal(obj)
+        if rel is not None:
+            return f'{n} ёмкостей, выпуск {format_decimal_plain(rel)}'
+        return f'{n} ёмкостей'
+
+
+class RecipeRunDetailSerializer(serializers.ModelSerializer):
+    recipe = serializers.SerializerMethodField()
+    recipe_name = serializers.SerializerMethodField()
+    recipe_label = serializers.SerializerMethodField()
+    recipe_snapshot = serializers.SerializerMethodField()
+    line = serializers.SerializerMethodField()
+    line_name = serializers.SerializerMethodField()
+    line_label = serializers.SerializerMethodField()
+    line_snapshot = serializers.SerializerMethodField()
+    effective_recipe_id = serializers.SerializerMethodField()
+    batches = RecipeRunBatchSerializer(many=True, read_only=True)
+    batches_count = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    output_quantity = serializers.SerializerMethodField()
+    recipe_output_quantity = serializers.SerializerMethodField()
+    output_unit_kind = serializers.SerializerMethodField()
+    summary = serializers.SerializerMethodField()
+    production_batch = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RecipeRun
+        fields = (
+            'id', 'recipe', 'recipe_name', 'recipe_label', 'recipe_snapshot',
+            'recipe_name_snapshot', 'former_recipe_id', 'effective_recipe_id',
+            'line', 'line_name', 'line_label', 'line_snapshot',
+            'line_name_snapshot', 'former_line_id',
+            'batches', 'batches_count',
+            'total_quantity', 'output_quantity', 'recipe_output_quantity', 'output_unit_kind',
+            'created_at', 'summary', 'production_batch_id', 'production_batch',
+        )
+        read_only_fields = (
+            'line_name_snapshot', 'former_line_id',
+            'recipe_name_snapshot', 'former_recipe_id',
+        )
+
+    def get_recipe(self, obj):
+        if obj.recipe_id:
+            try:
+                return RecipeSerializer(obj.recipe, context=self.context).data
+            except ObjectDoesNotExist:
+                pass
+        label = _recipe_run_display_recipe(obj)
+        if not label and obj.former_recipe_id is None:
+            return None
+        return {
+            'id': obj.former_recipe_id,
+            'recipe': label,
+            'product': None,
+            'components': [],
+            'output_quantity': None,
+            'output_unit_kind': None,
+        }
+
+    def get_line(self, obj):
+        if obj.line_id:
+            try:
+                return LineSerializer(obj.line).data
+            except ObjectDoesNotExist:
+                pass
+        name = _recipe_run_display_line(obj)
+        if not name and obj.former_line_id is None:
+            return None
+        return {'id': obj.former_line_id, 'name': name}
+
+    def get_recipe_name(self, obj):
+        return _recipe_run_display_recipe(obj)
+
+    def get_recipe_label(self, obj):
+        return self.get_recipe_name(obj)
+
+    def get_line_name(self, obj):
+        return _recipe_run_display_line(obj)
+
+    def get_line_label(self, obj):
+        return self.get_line_name(obj)
+
+    def get_recipe_snapshot(self, obj):
+        if obj.recipe_id:
+            try:
+                r = obj.recipe
+                return {
+                    'id': r.pk,
+                    'recipe': r.recipe,
+                    'product': r.product,
+                    'source': 'live',
+                }
+            except ObjectDoesNotExist:
+                pass
+        label = (obj.recipe_name_snapshot or '').strip() or None
+        if not label:
+            label = _recipe_run_display_recipe(obj)
+        return {
+            'id': obj.former_recipe_id,
+            'recipe': label,
+            'product': None,
+            'source': 'snapshot',
+        }
+
+    def get_line_snapshot(self, obj):
+        if obj.line_id:
+            try:
+                ln = obj.line
+                return {'id': ln.pk, 'name': ln.name, 'source': 'live'}
+            except ObjectDoesNotExist:
+                pass
+        name = (obj.line_name_snapshot or '').strip() or None
+        if not name:
+            name = _recipe_run_display_line(obj)
+        return {
+            'id': obj.former_line_id,
+            'name': name,
+            'source': 'snapshot',
+        }
+
+    def get_effective_recipe_id(self, obj):
+        return obj.recipe_id or obj.former_recipe_id
+
+    def get_production_batch(self, obj):
+        bid = getattr(obj, 'production_batch_id', None)
+        return {'id': bid} if bid else None
+
+    def get_batches_count(self, obj):
+        return obj.batches.count()
+
+    def get_total_quantity(self, obj):
+        q = _recipe_run_release_qty_decimal(obj)
+        return format_decimal_plain(q) if q is not None else None
+
+    def get_output_quantity(self, obj):
+        return self.get_total_quantity(obj)
+
+    def get_recipe_output_quantity(self, obj):
+        return _recipe_norm_output_str(obj)
+
+    def get_output_unit_kind(self, obj):
+        return _recipe_output_unit_kind_value(obj)
+
+    def get_summary(self, obj):
+        n = obj.batches.count()
+        rel = _recipe_run_release_qty_decimal(obj)
+        if rel is not None:
+            return f'{n} ёмкостей, выпуск {format_decimal_plain(rel)}'
+        return f'{n} ёмкостей'
+
+
+class RecipeRunBatchComponentInputSerializer(serializers.Serializer):
+    material_id = serializers.IntegerField(required=False, allow_null=True)
+    chemistry_id = serializers.IntegerField(required=False, allow_null=True)
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=4, min_value=Decimal('0.0001'))
+    unit = serializers.CharField(required=False, default='кг', max_length=50)
+    recipe_component_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class RecipeRunBatchInputSerializer(serializers.Serializer):
+    id = serializers.IntegerField(required=False)
+    index = serializers.IntegerField(required=False, min_value=0)
+    label = serializers.CharField(required=False, allow_blank=True, max_length=255, default='')
+    quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=4, required=False, allow_null=True, min_value=Decimal('0.0001'),
+    )
+    components = RecipeRunBatchComponentInputSerializer(many=True)
+
+    def validate(self, attrs):
+        comps = attrs.get('components') or []
+        if not comps:
+            raise serializers.ValidationError({'components': 'Нужна хотя бы одна строка расхода (quantity > 0)'})
+        recipe_id = self.context.get('recipe_id')
+        for i, c in enumerate(comps):
+            mid = c.get('material_id')
+            ch = c.get('chemistry_id')
+            has_m = mid is not None
+            has_c = ch is not None
+            if has_m == has_c:
+                raise serializers.ValidationError(
+                    {'components': f'Строка {i + 1}: укажите ровно одно из material_id, chemistry_id'}
+                )
+            rcid = c.get('recipe_component_id')
+            if rcid is not None and recipe_id is not None:
+                if not RecipeComponent.objects.filter(pk=rcid, recipe_id=recipe_id).exists():
+                    raise serializers.ValidationError(
+                        {'components': f'Строка {i + 1}: recipe_component_id не относится к этому рецепту'}
+                    )
+        return attrs
+
+
+class RecipeRunWriteSerializer(serializers.Serializer):
+    recipe_id = serializers.PrimaryKeyRelatedField(
+        queryset=Recipe.objects.all(), source='recipe', required=False,
+    )
+    line_id = serializers.PrimaryKeyRelatedField(
+        queryset=Line.objects.all(), source='line', required=False,
+    )
+    batches = serializers.ListField(
+        child=serializers.DictField(allow_empty=True),
+        required=False,
+        allow_empty=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        updating = self.instance is not None
+        self.fields['recipe_id'].required = not updating
+        self.fields['line_id'].required = not updating
+
+    def validate(self, attrs):
+        recipe = attrs.get('recipe')
+        if self.instance is not None:
+            recipe = recipe or self.instance.recipe
+
+        raw_batches = None
+        if self.instance is None:
+            if 'recipe' not in attrs or 'line' not in attrs:
+                raise serializers.ValidationError('Укажите recipe_id и line_id')
+            line = attrs.get('line')
+            if line is not None:
+                if not line_shift_is_open(line):
+                    raise serializers.ValidationError(
+                        {'line_id': 'На линии нет открытой смены. Откройте смену перед замесом.'},
+                    )
+                if line_shift_is_paused(line):
+                    raise LineShiftPausedForRecipeRun()
+            if 'batches' not in self.initial_data or self.initial_data.get('batches') is None:
+                raise serializers.ValidationError({'batches': 'Нужна хотя бы одна партия'})
+            raw_batches = self.initial_data.get('batches')
+            if not raw_batches:
+                raise serializers.ValidationError({'batches': 'Нужна хотя бы одна партия'})
+        elif 'batches' in self.initial_data:
+            # При передаче batches списание сырья/химии пересчитывается (reverse + apply).
+            # Без ключа batches в PATCH расход и остатки не трогаются — менять состав только через batches.
+            raw_batches = self.initial_data.get('batches')
+            if not raw_batches:
+                raise serializers.ValidationError({
+                    'batches': (
+                        'Нужна хотя бы одна партия. Чтобы убрать все партии, удалите запуск: '
+                        'DELETE /api/chemistry/recipe-runs/{id}/'
+                    ),
+                })
+
+        if self.instance is not None and 'line' in attrs and attrs.get('line') is not None:
+            new_line = attrs['line']
+            if not line_shift_is_open(new_line):
+                raise serializers.ValidationError(
+                    {'line_id': 'На выбранной линии нет открытой смены.'},
+                )
+            if line_shift_is_paused(new_line):
+                raise LineShiftPausedForRecipeRun()
+
+        if raw_batches is not None:
+            if recipe is None:
+                raise serializers.ValidationError(
+                    'Рецепт у запуска отсутствует (удалён из справочника). '
+                    'Изменение состава партий без живой карточки рецепта недоступно.'
+                )
+            ser = RecipeRunBatchInputSerializer(
+                data=raw_batches,
+                many=True,
+                context={'recipe_id': recipe.pk},
+            )
+            ser.is_valid(raise_exception=True)
+            attrs['batches'] = ser.validated_data
+
+        return attrs
+
+    def create(self, validated_data):
+        batches_data = validated_data.pop('batches')
+        run = RecipeRun.objects.create(
+            recipe=validated_data['recipe'],
+            line=validated_data['line'],
+        )
+        self._create_batches(run, batches_data)
+        apply_recipe_run_stock(run)
+        return run
+
+    def update(self, instance, validated_data):
+        batches_data = validated_data.pop('batches', None)
+        if 'recipe' in validated_data:
+            instance.recipe = validated_data['recipe']
+        if 'line' in validated_data:
+            instance.line = validated_data['line']
+        instance.save()
+        if batches_data is not None:
+            reverse_recipe_run_stock(instance)
+            self._sync_batches(instance, batches_data)
+            apply_recipe_run_stock(instance)
+        return instance
+
+    def _create_batches(self, run, batches_data):
+        for pos, b in enumerate(batches_data):
+            idx = b['index'] if b.get('index') is not None else pos
+            label = (b.get('label') or '').strip()
+            if not label:
+                label = f'Партия {idx + 1}'
+            batch = RecipeRunBatch.objects.create(
+                run=run,
+                index=idx,
+                label=label,
+                quantity=b.get('quantity'),
+            )
+            self._create_components(batch, b['components'])
+
+    def _sync_batches(self, run, batches_data):
+        seen_ids = []
+        for pos, b in enumerate(batches_data):
+            idx = b['index'] if b.get('index') is not None else pos
+            label = (b.get('label') or '').strip()
+            if not label:
+                label = f'Партия {idx + 1}'
+            bid = b.get('id')
+            if bid is not None:
+                batch = RecipeRunBatch.objects.filter(pk=bid, run_id=run.pk).first()
+                if not batch:
+                    raise serializers.ValidationError({'batches': f'Неизвестная партия id={bid}'})
+                batch.index = idx
+                batch.label = label
+                batch.quantity = b.get('quantity')
+                batch.save(update_fields=['index', 'label', 'quantity'])
+            else:
+                batch = RecipeRunBatch.objects.create(
+                    run=run,
+                    index=idx,
+                    label=label,
+                    quantity=b.get('quantity'),
+                )
+            seen_ids.append(batch.pk)
+            batch.components.all().delete()
+            self._create_components(batch, b['components'])
+        RecipeRunBatch.objects.filter(run=run).exclude(pk__in=seen_ids).delete()
+
+    def _create_components(self, batch, components_data):
+        recipe_id = batch.run.recipe_id
+        for c in components_data:
+            mid = c.get('material_id')
+            ch = c.get('chemistry_id')
+            rcid = c.get('recipe_component_id')
+            if rcid is not None and not RecipeComponent.objects.filter(pk=rcid, recipe_id=recipe_id).exists():
+                raise serializers.ValidationError('recipe_component_id не относится к рецепту запуска')
+            RecipeRunBatchComponent.objects.create(
+                batch=batch,
+                recipe_component_id=rcid,
+                raw_material_id=mid if mid is not None else None,
+                chemistry_id=ch if ch is not None else None,
+                quantity=c['quantity'],
+                unit=(c.get('unit') or 'кг')[:50],
+            )

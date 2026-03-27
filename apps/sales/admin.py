@@ -4,12 +4,12 @@ from .models import Client, Sale, Shipment
 
 @admin.register(Client)
 class ClientAdmin(admin.ModelAdmin):
-    list_display = ('name', 'contact', 'phone', 'inn')
+    list_display = ('name', 'contact', 'phone', 'phone_alt', 'client_type', 'inn')
 
 
 @admin.register(Sale)
 class SaleAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'client', 'product', 'quantity', 'price', 'date')
+    list_display = ('order_number', 'client', 'warehouse_batch', 'product', 'quantity', 'price', 'date')
     list_filter = ('client',)
 
 

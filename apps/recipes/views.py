@@ -1,23 +1,58 @@
-from rest_framework import viewsets
+from django.db.models import Prefetch, Sum
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Sum
 
+from apps.activity.mixins import ActivityLoggingMixin
 from config.permissions import IsAdminOrHasAccess
 from .models import Recipe, RecipeComponent
 from .serializers import RecipeSerializer
 from apps.materials.models import Incoming, MaterialWriteoff
 from apps.chemistry.models import ChemistryStock
+from apps.production.models import Order, RecipeRun
 
 
-class RecipeViewSet(viewsets.ModelViewSet):
-    queryset = Recipe.objects.prefetch_related('components').all()
+class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    """
+    Рецепт — справочник: сохранение не списывает склад и не создаёт приходы
+    (движения только при производстве и т.п.).
+    """
+    queryset = Recipe.objects.prefetch_related(
+        Prefetch(
+            'components',
+            queryset=RecipeComponent.objects.select_related('raw_material', 'chemistry'),
+        )
+    ).all()
     serializer_class = RecipeSerializer
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'recipes'
+    activity_section = 'Рецепты'
+    activity_label = 'рецепт'
     filterset_fields = []
     search_fields = ['recipe', 'product']
-    ordering_fields = ['id', 'recipe', 'product']
+    ordering_fields = ['id', 'recipe', 'product', 'output_quantity']
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if RecipeRun.objects.filter(recipe=instance).exists():
+            return Response(
+                {
+                    'code': 'RECIPE_IN_USE',
+                    'error': 'Нельзя удалить рецепт: есть связанные замесы (recipe-runs).',
+                    'detail': 'Удалите или архивируйте замесы, затем повторите попытку.',
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if Order.objects.filter(recipe=instance).exists():
+            return Response(
+                {
+                    'code': 'RECIPE_IN_USE',
+                    'error': 'Нельзя удалить рецепт: есть заказы производства с этим рецептом.',
+                    'detail': 'Сначала завершите или удалите связанные заказы.',
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_serializer(self, *args, **kwargs):
         """Поддержка контракта: name (алиас recipe), product, components с material_id/chemistry_id."""
@@ -28,12 +63,30 @@ class RecipeViewSet(viewsets.ModelViewSet):
         return super().get_serializer(*args, **kwargs)
 
     def _normalize_recipe_data(self, data):
-        """Принимаем name (алиас recipe) и product из контракта API."""
+        """Принимаем name (алиас recipe); product дублирует recipe, если не передан.
+        Выпуск: output_quantity / output_unit_kind или алиасы yield_quantity / output_measure."""
         if not data:
             return data
         data = dict(data)
         if 'name' in data and 'recipe' not in data:
             data['recipe'] = data.get('name')
+        if data.get('recipe') is not None and not data.get('product'):
+            data['product'] = data['recipe']
+        if 'output_quantity' not in data and 'yield_quantity' in data:
+            data['output_quantity'] = data.get('yield_quantity')
+        if 'output_unit_kind' not in data and 'output_measure' in data:
+            data['output_unit_kind'] = data.get('output_measure')
+        uk = data.get('output_unit_kind')
+        if isinstance(uk, str):
+            u = uk.strip()
+            if not u:
+                data['output_unit_kind'] = None
+            else:
+                low = u.lower()
+                data['output_unit_kind'] = low if low in ('naming', 'pieces', 'amount') else u
+        # Алиасы уже слиты в canonical; убираем, чтобы не попадали в валидацию как лишние поля.
+        data.pop('yield_quantity', None)
+        data.pop('output_measure', None)
         return data
 
     def _normalize_component(self, c):

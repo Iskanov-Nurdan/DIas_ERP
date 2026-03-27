@@ -6,11 +6,16 @@ from .models import (
 
 
 class ChemistryCompositionSerializer(serializers.ModelSerializer):
+    material_id = serializers.IntegerField(source='raw_material_id', read_only=True)
+    material_name = serializers.CharField(source='raw_material.name', read_only=True)
     raw_material_name = serializers.CharField(source='raw_material.name', read_only=True)
 
     class Meta:
         model = ChemistryComposition
-        fields = ('id', 'raw_material', 'raw_material_name', 'quantity_per_unit')
+        fields = (
+            'id', 'raw_material', 'material_id', 'material_name',
+            'raw_material_name', 'quantity_per_unit',
+        )
 
 
 class ChemistryCatalogSerializer(serializers.ModelSerializer):

@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+from corsheaders.defaults import default_headers
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-change-in-production')
@@ -10,6 +12,8 @@ DEBUG = os.environ.get('DEBUG', 'True').lower() == 'true'
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 INSTALLED_APPS = [
+    'daphne',  # должен быть до django.contrib.staticfiles: подменяет runserver на ASGI (иначе WebSocket не работает)
+    'channels',
     'jazzmin',
     'django.contrib.admin',
     'django.contrib.auth',
@@ -19,9 +23,10 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'django_filters',
     'corsheaders',
-    'drf_yasg',
+    'drf_spectacular',
     'apps.accounts',
     'apps.materials',
     'apps.chemistry',
@@ -31,11 +36,15 @@ INSTALLED_APPS = [
     'apps.sales',
     'apps.otk',
     'apps.analytics',
+    'apps.activity',
+    'apps.realtime',
 ]
 
 MIDDLEWARE = [
-    'django.middleware.security.SecurityMiddleware',
+    # CORS — максимально высоко: ответ на OPTIONS до CommonMiddleware и прочих.
     'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'config.middleware.request_id_middleware',   # X-Request-Id после CORS (на обычных запросах)
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -63,6 +72,23 @@ TEMPLATES = [{
 }]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
+
+# ——— Django Channels (WebSocket) ———
+_redis_channel = os.environ.get('REDIS_URL') or os.environ.get('CHANNEL_LAYER_REDIS')
+if _redis_channel:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [_redis_channel]},
+        },
+    }
+else:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
 
 if os.environ.get('PGDATABASE'):
     DATABASES = {
@@ -105,17 +131,20 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # ——— REST & JWT ———
 # Контракт для фронта: page, page_size, search, ordering, полевые фильтры (filterset_fields).
 # Ответ списков: items, meta (total_count, page, page_size, total_pages), links (next, previous).
+_renderers = ['config.renderers.UTF8JSONRenderer']
+if DEBUG:
+    _renderers.append('rest_framework.renderers.BrowsableAPIRenderer')
+
 REST_FRAMEWORK = {
+    # Decimal в JSON как числа; рендерер DiasJSONEncoder убирает .0 у целых.
+    'COERCE_DECIMAL_TO_STRING': False,
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-    'DEFAULT_RENDERER_CLASSES': [
-        'config.renderers.UTF8JSONRenderer',  # application/json; charset=utf-8, кириллица без экранирования
-        'rest_framework.renderers.BrowsableAPIRenderer',
-    ],
+    'DEFAULT_RENDERER_CLASSES': _renderers,
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -125,6 +154,18 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
     'EXCEPTION_HANDLER': 'config.exceptions.dias_exception_handler',
     'UNICODE_JSON': True,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '120/min',
+        'user': '2000/hour',
+        'login': '10/min',
+        'sensitive_anon': '10/min',
+        'sensitive_user': '30/min',
+    },
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 from datetime import timedelta
@@ -132,22 +173,72 @@ SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=24),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
 }
 
 # ——— CORS (по окружениям) ———
-CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
+_raw_cors_origins = os.environ.get(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://127.0.0.1:3000',
+).split(',')
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _raw_cors_origins if o.strip()]
 if DEBUG and not os.environ.get('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOW_ALL_ORIGINS = False
     CORS_ALLOWED_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000']
 
-# ——— Swagger (drf-yasg) ———
-SWAGGER_SETTINGS = {
-    'USE_SESSION_AUTH': False,
-    'SECURITY_DEFINITIONS': {
-        'Bearer': {'type': 'apiKey', 'name': 'Authorization', 'in': 'header'},
+# Кастомные заголовки: расширяем default_headers (а не подменяем целиком).
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-request-id',
+    'x-correlation-id',
+    'x-audit-shift-id',
+    'x-shift-id',
+]
+
+# WebSocket handshake: браузер шлёт заголовок Origin страницы фронта (как при CORS), а не только Host API.
+# Список ниже переопределяет источники для channels.security.websocket.OriginValidator; пусто = взять CORS_ALLOWED_ORIGINS
+# (см. config/asgi.py). Переменная окружения: WEBSOCKET_ALLOWED_ORIGINS=http://app:3000,https://app.example.com
+_ws_allowed_env = os.environ.get('WEBSOCKET_ALLOWED_ORIGINS', '').strip()
+CHANNELS_WS_ALLOWED_ORIGINS = [o.strip() for o in _ws_allowed_env.split(',') if o.strip()]
+
+# Явный флаг «разрешить любой Origin» для WS (только если осознанно; иначе ориентируемся на CORS_ALLOW_ALL_ORIGINS).
+CHANNELS_WS_ALLOW_ALL_ORIGINS = os.environ.get('CHANNELS_WS_ALLOW_ALL_ORIGINS', '').lower() in ('1', 'true', 'yes')
+
+# ——— OpenAPI 3 (drf-spectacular) ———
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'DIAS API',
+    'DESCRIPTION': (
+        'REST API учёта производства DIAS. Машиночитаемая схема — источник истины для контрактов; '
+        'человекочитаемые обзоры: `docs/API_README.md`, `docs/WEBSOCKET_API.md`, матрица UI — `docs/API_UI_MATRIX.md`.'
+    ),
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SCHEMA_PATH_PREFIX': r'/api',
+    'TAGS': [
+        {'name': 'auth', 'description': 'Вход, профиль, выход (JWT).'},
+        {'name': 'accounts', 'description': 'Пользователи и роли (RBAC).'},
+        {'name': 'production', 'description': 'Линии, заказы, партии, замесы, смены.'},
+        {'name': 'materials', 'description': 'Сырьё, приходы, остатки, списания.'},
+        {'name': 'chemistry', 'description': 'Химия: каталог, задания, остатки, запуски рецептов.'},
+        {'name': 'recipes', 'description': 'Рецептуры.'},
+        {'name': 'warehouse', 'description': 'Склад готовой продукции.'},
+        {'name': 'sales', 'description': 'Клиенты и продажи.'},
+        {'name': 'otk', 'description': 'ОТК: очередь партий.'},
+        {'name': 'analytics', 'description': 'Аналитика (только HTTP, без WebSocket).'},
+        {'name': 'activity', 'description': 'Журнал действий / аудит.'},
+    ],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'bearerAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+                'description': 'Access-токен из POST /api/auth/login (поле token). Заголовок: Authorization: Bearer <token>',
+            },
+        },
     },
-    'LOGIN_URL': None,
-    'LOGOUT_URL': None,
+    'SECURITY': [{'bearerAuth': []}],
 }
 
 # ——— Jazzmin (админка) ———
@@ -197,6 +288,9 @@ JAZZMIN_SETTINGS = {
         'production.linehistory': 'fas fa-history',
         'production.order': 'fas fa-clipboard-list',
         'production.productionbatch': 'fas fa-box',
+        'production.reciperun': 'fas fa-play-circle',
+        'production.reciperunbatch': 'fas fa-flask',
+        'production.reciperunbatchcomponent': 'fas fa-balance-scale',
         'warehouse': 'fas fa-warehouse',
         'warehouse.warehousebatch': 'fas fa-pallet',
         'sales': 'fas fa-shopping-cart',
@@ -278,4 +372,5 @@ LOGGING = {
 ACCESS_KEYS = [
     'users', 'lines', 'materials', 'chemistry', 'recipes', 'orders',
     'production', 'otk', 'warehouse', 'clients', 'sales', 'shipments', 'analytics',
+    'shifts', 'my_shift',
 ]

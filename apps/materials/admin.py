@@ -4,7 +4,7 @@ from .models import RawMaterial, Incoming, MaterialWriteoff
 
 @admin.register(RawMaterial)
 class RawMaterialAdmin(admin.ModelAdmin):
-    list_display = ('name', 'unit')
+    list_display = ('name', 'unit', 'min_balance')
 
 
 @admin.register(Incoming)

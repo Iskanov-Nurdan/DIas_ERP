@@ -4,6 +4,13 @@ from django.db import models
 class RawMaterial(models.Model):
     name = models.CharField('Название', max_length=255)
     unit = models.CharField('Единица', max_length=50, default='кг')
+    min_balance = models.DecimalField(
+        'Мин. остаток (порог)',
+        max_digits=14,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         db_table = 'raw_materials'

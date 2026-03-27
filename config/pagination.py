@@ -8,19 +8,45 @@ class StandardResultsSetPagination(PageNumberPagination):
     max_page_size = 100
 
     def get_paginated_response(self, data):
+        num_pages = self.page.paginator.num_pages
         return Response({
             'items': data,
             'meta': {
-                'total_count': self.page.paginator.count,
+                'total': self.page.paginator.count,
                 'page': self.page.number,
-                'page_size': self.get_page_size(self.request),
-                'total_pages': self.page.paginator.num_pages,
+                'perPage': self.get_page_size(self.request),
+                'totalPages': num_pages,
+                'total_pages': num_pages,
             },
             'links': {
                 'next': self.get_next_link(),
                 'previous': self.get_previous_link(),
             },
         })
+
+    def get_paginated_response_schema(self, schema):
+        return {
+            'type': 'object',
+            'properties': {
+                'items': schema,
+                'meta': {
+                    'type': 'object',
+                    'properties': {
+                        'total': {'type': 'integer'},
+                        'page': {'type': 'integer'},
+                        'perPage': {'type': 'integer'},
+                        'totalPages': {'type': 'integer'},
+                    },
+                },
+                'links': {
+                    'type': 'object',
+                    'properties': {
+                        'next': {'type': 'string', 'nullable': True},
+                        'previous': {'type': 'string', 'nullable': True},
+                    },
+                },
+            },
+        }
 
 
 class CursorResultsSetPagination(CursorPagination):
@@ -33,7 +59,7 @@ class CursorResultsSetPagination(CursorPagination):
         return Response({
             'items': data,
             'meta': {
-                'page_size': self.get_page_size(self.request),
+                'perPage': self.get_page_size(self.request),
             },
             'links': {
                 'next': self.get_next_link(),
