@@ -1,8 +1,9 @@
 """
-RBAC: меню UI строится только по UserAccess (см. User.get_access_keys).
+RBAC: меню UI — только UserAccess (см. User.get_access_keys).
 
-RoleAccess — шаблон для сидов и формы роли в админке; при создании пользователя
-ключи один раз копируются в UserAccess (copy_role_template_to_user_if_empty).
+При создании пользователя вкладки не зависят от роли: в UserAccess попадает
+полный список settings.ACCESS_KEYS (seed_full_user_access_if_empty).
+RoleAccess остаётся для сидов / справочника ролей в админке.
 """
 import logging
 
@@ -76,18 +77,17 @@ def ensure_user_role_for_tab_accesses(user) -> bool:
     return True
 
 
-def copy_role_template_to_user_if_empty(user) -> None:
+def seed_full_user_access_if_empty(user) -> None:
     """
-    Если у пользователя ещё нет UserAccess — копируем ключи из RoleAccess роли (шаблон).
-    Не вызывать при обновлении существующей учётки (чтобы не затирать индивидуальные права).
+    Для нового пользователя: все ключи вкладок из settings.ACCESS_KEYS.
+    Роль не учитывается. Не вызывать при обновлении существующей учётки с уже
+    настроенными UserAccess (есть строки — пропуск).
     """
     from .models import UserAccess
 
     if user.pk and user.user_accesses.exists():
         return
-    if not user.role_id:
-        return
-    keys = list(user.role.accesses.values_list('access_key', flat=True))
+    keys = list(getattr(settings, 'ACCESS_KEYS', ()))
     if not keys:
         return
     UserAccess.objects.bulk_create(
