@@ -1,6 +1,7 @@
+from django.conf import settings
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Role, RoleAccess
+from .models import Role, RoleAccess, UserAccess
 
 User = get_user_model()
 
@@ -51,7 +52,6 @@ class UserSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop('password', None)
-        # Генерируем email из имени
         name_slug = validated_data['name'].lower().replace(' ', '_')
         validated_data['email'] = f"{name_slug}@local.dias"
         user = User.objects.create(**validated_data)
@@ -70,24 +70,27 @@ class UserSerializer(serializers.ModelSerializer):
         return instance
 
 
-class UserAccessSerializer(serializers.Serializer):
+def _validate_access_keys_list(value):
+    allowed = getattr(settings, 'ACCESS_KEYS', [])
+    if allowed and any(k not in allowed for k in value):
+        invalid = [k for k in value if k not in allowed]
+        raise serializers.ValidationError(f'Недопустимые ключи доступа: {invalid}')
+    return value
+
+
+class UserAccessPatchSerializer(serializers.Serializer):
+    """PATCH users/:id/access/ — полная замена UserAccess для пользователя."""
+
     access_keys = serializers.ListField(child=serializers.CharField())
 
     def validate_access_keys(self, value):
-        from django.conf import settings
-        allowed = getattr(settings, 'ACCESS_KEYS', [])
-        if allowed and any(k not in allowed for k in value):
-            invalid = [k for k in value if k not in allowed]
-            raise serializers.ValidationError(f'Недопустимые ключи доступа: {invalid}')
-        return value
+        return _validate_access_keys_list(value)
 
     def update(self, instance, validated_data):
-        from .models import RoleAccess
-        keys = validated_data['access_keys']
-        if instance.role_id:
-            instance.role.accesses.all().delete()
-            for key in keys:
-                RoleAccess.objects.create(role=instance.role, access_key=key)
+        keys = sorted(set(validated_data['access_keys']))
+        instance.user_accesses.all().delete()
+        for k in keys:
+            UserAccess.objects.create(user=instance, access_key=k)
         return instance
 
 

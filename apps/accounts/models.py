@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
 
@@ -27,6 +28,22 @@ class RoleAccess(models.Model):
 
     def __str__(self):
         return f'{self.role.name} — {self.access_key}'
+
+
+class UserAccess(models.Model):
+    """Ключи вкладок UI для пользователя (единственный источник для меню, см. User.get_access_keys)."""
+
+    user = models.ForeignKey('User', on_delete=models.CASCADE, related_name='user_accesses')
+    access_key = models.CharField('Ключ доступа', max_length=50)
+
+    class Meta:
+        db_table = 'user_access'
+        unique_together = [('user', 'access_key')]
+        verbose_name = 'Ключ доступа (вкладка)'
+        verbose_name_plural = 'Ключи доступа (вкладки)'
+
+    def __str__(self):
+        return f'{self.user_id} — {self.access_key}'
 
 
 class UserManager(BaseUserManager):
@@ -67,6 +84,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         return self.email
 
     def get_access_keys(self):
-        if not self.role_id:
-            return []
-        return list(self.role.accesses.values_list('access_key', flat=True))
+        """
+        Только UserAccess. Пустой список и не суперпользователь → нет вкладок в UI.
+        Суперпользователь без строк UserAccess → полный ACCESS_KEYS (обход API).
+        """
+        keys = sorted(set(self.user_accesses.values_list('access_key', flat=True)))
+        if keys:
+            return keys
+        if getattr(self, 'is_superuser', False):
+            return list(getattr(settings, 'ACCESS_KEYS', []))
+        return []

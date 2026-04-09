@@ -15,7 +15,7 @@ from config.openapi_common import DiasErrorSerializer
 from config.permissions import IsAdminOrHasAccess
 from config.throttling import LoginRateThrottle
 from .models import Role
-from .serializers import MeSerializer, RoleSerializer, UserAccessSerializer, UserSerializer
+from .serializers import MeSerializer, RoleSerializer, UserAccessPatchSerializer, UserSerializer
 
 LoginRequestSerializer = inline_serializer(
     name='LoginRequest',
@@ -51,7 +51,7 @@ MeResponseSerializer = inline_serializer(
         'user': MeSerializer(),
         'accesses': serializers.ListField(
             child=serializers.CharField(),
-            help_text='Дублирует user.accesses; список access_keys роли.',
+            help_text='Дублирует user.accesses; ключи из UserAccess.',
         ),
     },
 )
@@ -109,6 +109,7 @@ class LoginView(APIView):
         if not user.is_active:
             return _err('unauthorized', 'Пользователь деактивирован', http_status=401)
 
+        user = User.objects.select_related('role').prefetch_related('user_accesses').get(pk=user.pk)
         refresh = RefreshToken.for_user(user)
         return Response({
             'token': str(refresh.access_token),
@@ -121,11 +122,12 @@ class LoginView(APIView):
     tags=['auth'],
     summary='Текущий пользователь и права',
     responses={200: MeResponseSerializer, 401: DiasErrorSerializer},
-    description='Поле accesses — список строк access_keys (см. settings.ACCESS_KEYS и docs/API_README.md).',
+    description='Поле accesses — ключи из UserAccess (меню UI).',
 )
 class MeView(APIView):
     def get(self, request):
-        data = MeSerializer(request.user).data
+        user = User.objects.select_related('role').prefetch_related('user_accesses').get(pk=request.user.pk)
+        data = MeSerializer(user).data
         return Response({'user': data, 'accesses': data['accesses']})
 
 
@@ -155,7 +157,7 @@ class LogoutView(APIView):
 
 
 class UserViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
-    queryset = User.objects.select_related('role').all()
+    queryset = User.objects.select_related('role').prefetch_related('user_accesses')
     serializer_class = UserSerializer
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'users'
@@ -165,21 +167,28 @@ class UserViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     search_fields = ['name', 'email']
     ordering_fields = ['id', 'name', 'email', 'date_joined']
 
+    @extend_schema(
+        tags=['auth'],
+        summary='Доступы к разделам (UserAccess)',
+        request=UserAccessPatchSerializer,
+        responses={200: UserSerializer},
+        description='Тело: { "access_keys": [...] } — полная замена ключей вкладок только для этого пользователя.',
+    )
     @action(detail=True, methods=['patch'], url_path='access')
     def update_access(self, request, pk=None):
         user = self.get_object()
         before = instance_to_snapshot(user)
-        ser = UserAccessSerializer(user, data=request.data, partial=True)
+        ser = UserAccessPatchSerializer(user, data=request.data, partial=True)
         if not ser.is_valid():
             return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
         ser.save()
-        user.refresh_from_db()
+        user = User.objects.select_related('role').prefetch_related('user_accesses').get(pk=user.pk)
         after = instance_to_snapshot(user)
         schedule_entity_audit(
             user=request.user,
             request=request,
             section='Пользователи',
-            description=f'Изменены права доступа: {user.name}',
+            description=f'Изменены права доступа к разделам: {user.name}',
             action='update',
             model_cls=User,
             before=before,

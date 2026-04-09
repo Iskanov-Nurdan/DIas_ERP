@@ -27,7 +27,7 @@ INSTALLED_APPS = [
     'django_filters',
     'corsheaders',
     'drf_spectacular',
-    'apps.accounts',
+    'apps.accounts.apps.AccountsConfig',
     'apps.materials',
     'apps.chemistry',
     'apps.recipes',
@@ -373,4 +373,14 @@ ACCESS_KEYS = [
     'users', 'lines', 'materials', 'chemistry', 'recipes', 'orders',
     'production', 'otk', 'warehouse', 'clients', 'sales', 'shipments', 'analytics',
     'shifts', 'my_shift',
+]
+
+# Имена ролей из seed_roles: при создании User без role назначается «Планировщик»,
+# для суперпользователя — «Админ» (чтобы вкладки UI совпадали с матрицей RoleAccess).
+USERS_DEFAULT_ROLE_NAME = 'Планировщик'
+USERS_SUPERUSER_ROLE_NAME = 'Админ'
+
+# Ключи вкладок для роли «Планировщик» (как в seed_roles)
+USERS_PLANNER_ACCESS_KEYS = [
+    'lines', 'recipes', 'orders', 'production',
 ]

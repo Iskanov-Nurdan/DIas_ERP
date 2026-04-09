@@ -1,13 +1,9 @@
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.contrib.auth import get_user_model
 from apps.accounts.models import Role, RoleAccess
 
 User = get_user_model()
-
-ACCESS_KEYS = [
-    'users', 'lines', 'materials', 'chemistry', 'recipes', 'orders',
-    'production', 'otk', 'warehouse', 'clients', 'sales', 'shipments', 'analytics',
-]
 
 
 class Command(BaseCommand):
@@ -18,14 +14,14 @@ class Command(BaseCommand):
             name='Админ',
             defaults={'description': 'Полный доступ'}
         )
-        for key in ACCESS_KEYS:
+        for key in settings.ACCESS_KEYS:
             RoleAccess.objects.get_or_create(role=admin_role, access_key=key)
 
         planner_role, _ = Role.objects.get_or_create(
             name='Планировщик',
             defaults={'description': 'Линии, заказы, рецепты'}
         )
-        for key in ['lines', 'recipes', 'orders', 'production']:
+        for key in settings.USERS_PLANNER_ACCESS_KEYS:
             RoleAccess.objects.get_or_create(role=planner_role, access_key=key)
 
         admin_user = User.objects.filter(name='admin', is_superuser=True).first()
