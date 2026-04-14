@@ -34,6 +34,7 @@ class OtkCheck(models.Model):
     reject_reason = models.TextField('Причина брака', blank=True)
     comment = models.TextField('Комментарий', blank=True)
     inspector = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='otk_checks')
+    inspector_name = models.CharField('Контролёр (строка)', max_length=255, blank=True, default='')
     checked_date = models.DateTimeField(auto_now_add=True)
 
     class Meta:

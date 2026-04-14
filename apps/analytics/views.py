@@ -19,7 +19,16 @@ from apps.production.models import ProductionBatch, RecipeRun, Shift, ShiftCompl
 from apps.chemistry.models import ChemistryBatch, ChemistryCatalog, ChemistryTask
 from apps.activity.models import UserActivity
 
-from .services import Period, parse_period
+from apps.otk.models import OtkCheck
+
+from .services import (
+    Period,
+    parse_analytics_scope,
+    parse_period,
+    production_batch_scope_q,
+    recipe_run_scope_q,
+    sale_scope_q,
+)
 
 _ANALYTICS_PERIOD_PARAMS = [
     OpenApiParameter('year', int, required=False, description='Год периода (по умолчанию текущий).'),
@@ -57,21 +66,28 @@ class AnalyticsSummaryView(viewsets.ViewSet):
     required_access_key = 'analytics'
 
     def list(self, request):
-        p: Period = parse_period(request)
+        scope = parse_analytics_scope(request)
+        p: Period = scope.period
 
-        date_filter_sales = p.sale_q()
-        date_filter_incoming = p.incoming_q()
-        date_filter_batches = p.batch_q()
-        date_filter_shipments = p.shipment_by_sale_q()
-        date_filter_writeoffs = p.writeoff_q()
-        date_filter_wh_batches = p.warehouse_batch_q()
-        date_filter_shifts = p.shift_opened_q()
-        date_filter_recipe_runs = p.recipe_run_q()
-        date_filter_activity = p.activity_q()
-        date_filter_complaints = p.complaint_q()
+        sq = sale_scope_q(scope)
+        date_filter_batches = production_batch_scope_q(scope)
+        date_filter_incoming = scope.incoming_date_q()
+        date_filter_shipments = scope.shipment_by_sale_q()
+        date_filter_writeoffs = scope.writeoff_q()
+        date_filter_wh_batches = scope.warehouse_batch_q()
+        if scope.profile_id:
+            date_filter_wh_batches &= Q(profile_id=scope.profile_id)
+        if scope.batch_id:
+            date_filter_wh_batches &= Q(source_batch_id=scope.batch_id)
+        date_filter_shifts = scope.shift_opened_q()
+        if scope.line_id:
+            date_filter_shifts &= Q(line_id=scope.line_id)
+        date_filter_recipe_runs = recipe_run_scope_q(scope)
+        date_filter_activity = scope.activity_q()
+        date_filter_complaints = scope.complaint_q()
 
         # --- Финансы (продажи vs закупки сырья) ---
-        sales_data = Sale.objects.filter(date_filter_sales).aggregate(
+        sales_data = Sale.objects.filter(sq).aggregate(
             revenue=Sum('revenue'),
             count=Count('id'),
             profit_sum=Sum('profit'),
@@ -143,7 +159,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             ChemistryBatch.objects.aggregate(s=Sum('quantity_remaining'))['s'] or 0
         )
 
-        date_filter_chem_batches = p.writeoff_q()  # created_at — те же границы периода
+        date_filter_chem_batches = scope.writeoff_q()  # created_at — те же границы периода
         chem_done_qty = (
             ChemistryBatch.objects.filter(date_filter_chem_batches, source_task_id__isnull=False).aggregate(
                 s=Sum('quantity_produced')
@@ -161,14 +177,14 @@ class AnalyticsSummaryView(viewsets.ViewSet):
         # --- Продажи: топы ---
         top_products_list = []
         top_products_keys = (
-            Sale.objects.filter(date_filter_sales)
+            Sale.objects.filter(sq)
             .values('product')
             .annotate(qty=Sum('quantity'))
             .order_by('-qty')[:5]
         )
         for row in top_products_keys:
             prod = row['product']
-            agg = Sale.objects.filter(date_filter_sales, product=prod).aggregate(
+            agg = Sale.objects.filter(sq, product=prod).aggregate(
                 qty=Sum('quantity'),
                 rev=Sum('revenue'),
             )
@@ -180,14 +196,14 @@ class AnalyticsSummaryView(viewsets.ViewSet):
 
         top_clients_list = []
         top_clients_keys = (
-            Sale.objects.filter(date_filter_sales)
+            Sale.objects.filter(sq)
             .values('client__name')
             .annotate(qty=Sum('quantity'))
             .order_by('-qty')[:5]
         )
         for row in top_clients_keys:
             cname = row['client__name']
-            agg = Sale.objects.filter(date_filter_sales, client__name=cname).aggregate(
+            agg = Sale.objects.filter(sq, client__name=cname).aggregate(
                 qty=Sum('quantity'),
                 rev=Sum('revenue'),
             )
@@ -197,7 +213,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                 'revenue': float(agg['rev'] or 0),
             })
 
-        sales_total_qty = Sale.objects.filter(date_filter_sales).aggregate(s=Sum('quantity'))['s'] or 0
+        sales_total_qty = Sale.objects.filter(sq).aggregate(s=Sum('quantity'))['s'] or 0
 
         # --- Поставщики ---
         top_suppliers_list = []
@@ -251,7 +267,10 @@ class AnalyticsSummaryView(viewsets.ViewSet):
         )
 
         # --- Склад ГП (срез остатков, не только период) ---
-        warehouse_stats = WarehouseBatch.objects.aggregate(
+        wh_stat_qs = WarehouseBatch.objects.all()
+        if scope.profile_id:
+            wh_stat_qs = wh_stat_qs.filter(profile_id=scope.profile_id)
+        warehouse_stats = wh_stat_qs.aggregate(
             available=Sum('quantity', filter=Q(status=WarehouseBatch.STATUS_AVAILABLE)),
             reserved=Sum('quantity', filter=Q(status=WarehouseBatch.STATUS_RESERVED)),
             shipped=Sum('quantity', filter=Q(status=WarehouseBatch.STATUS_SHIPPED)),
@@ -262,7 +281,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                 'available': float(w['available'] or 0),
                 'reserved': float(w['reserved'] or 0),
             }
-            for w in WarehouseBatch.objects.values('product').annotate(
+            for w in wh_stat_qs.values('product').annotate(
                 available=Sum('quantity', filter=Q(status=WarehouseBatch.STATUS_AVAILABLE)),
                 reserved=Sum('quantity', filter=Q(status=WarehouseBatch.STATUS_RESERVED)),
             ).order_by('-available')[:10]
@@ -325,12 +344,12 @@ class AnalyticsSummaryView(viewsets.ViewSet):
 
         daily_revenue_list = []
         for d in (
-            Sale.objects.filter(date__gte=start_date, date__lte=end_date)
+            Sale.objects.filter(sq, date__gte=start_date, date__lte=end_date)
             .values('date')
             .annotate(quantity_sum=Sum('quantity'))
             .order_by('date')
         ):
-            day_revenue = Sale.objects.filter(date=d['date']).aggregate(
+            day_revenue = Sale.objects.filter(sq, date=d['date']).aggregate(
                 revenue=Sum('revenue'),
             )
             daily_revenue_list.append({
@@ -343,7 +362,11 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                 'date': d['date'].strftime('%Y-%m-%d'),
                 'total_meters': float(d['tm'] or 0),
             }
-            for d in ProductionBatch.objects.filter(date__gte=start_date, date__lte=end_date)
+            for d in ProductionBatch.objects.filter(
+                date_filter_batches,
+                date__gte=start_date,
+                date__lte=end_date,
+            )
             .values('date')
             .annotate(tm=Sum('total_meters'))
             .order_by('date')
@@ -384,8 +407,18 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                 'lines': d['n'],
             })
 
+        otk_pb_ids = ProductionBatch.objects.filter(date_filter_batches).values_list('id', flat=True)
+        otk_agg = OtkCheck.objects.filter(batch_id__in=otk_pb_ids).aggregate(
+            acc=Sum('accepted'),
+            rej=Sum('rejected'),
+        )
+        otk_accepted_total = float(otk_agg['acc'] or 0)
+        otk_defect_total = float(otk_agg['rej'] or 0)
+        otk_sum = otk_accepted_total + otk_defect_total
+        otk_defect_rate_pct = (otk_defect_total / otk_sum * 100.0) if otk_sum > 0 else 0.0
+
         return Response({
-            'period': p.as_dict(),
+            'period': scope.as_period_dict(),
             'finances': {
                 'revenue': total_revenue,
                 'expenses': total_expenses,
@@ -517,6 +550,11 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             'stock_balances': {
                 'raw_materials': raw_materials_list,
                 'chemistry': chemistry_list,
+            },
+            'otk': {
+                'accepted_total': otk_accepted_total,
+                'defect_total': otk_defect_total,
+                'defect_rate_pct': round(otk_defect_rate_pct, 4),
             },
             'trends': {
                 'window': {'start': start_date.isoformat(), 'end': end_date.isoformat()},

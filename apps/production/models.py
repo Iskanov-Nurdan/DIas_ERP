@@ -6,6 +6,9 @@ from django.conf import settings
 
 class Line(models.Model):
     name = models.CharField('Название', max_length=255)
+    code = models.CharField('Код', max_length=64, blank=True, default='')
+    notes = models.TextField('Комментарий', blank=True, default='')
+    is_active = models.BooleanField('Активна', default=True)
 
     class Meta:
         db_table = 'lines'
@@ -220,6 +223,23 @@ class ProductionBatch(models.Model):
     produced_at = models.DateTimeField('Произведено', null=True, blank=True)
     comment = models.TextField('Комментарий', blank=True)
     otk_status = models.CharField('Статус ОТК', max_length=20, choices=OTK_STATUS_CHOICES, default=OTK_PENDING)
+    LIFECYCLE_PENDING = 'pending'
+    LIFECYCLE_OTK = 'otk'
+    LIFECYCLE_DONE = 'done'
+    LIFECYCLE_CHOICES = [
+        (LIFECYCLE_PENDING, 'Производство'),
+        (LIFECYCLE_OTK, 'Очередь ОТК'),
+        (LIFECYCLE_DONE, 'Завершено'),
+    ]
+    lifecycle_status = models.CharField(
+        'Этап жизненного цикла',
+        max_length=20,
+        choices=LIFECYCLE_CHOICES,
+        default=LIFECYCLE_PENDING,
+    )
+    sent_to_otk = models.BooleanField('Отправлено в ОТК', default=False)
+    in_otk_queue = models.BooleanField('В очереди ОТК', default=False)
+    otk_submitted_at = models.DateTimeField('Отправлено в ОТК', null=True, blank=True)
     cost_price = models.DecimalField('Себестоимость (legacy)', max_digits=14, decimal_places=2, default=0)
     material_cost_total = models.DecimalField('Материальная себестоимость', max_digits=16, decimal_places=2, default=0)
     cost_per_meter = models.DecimalField('Себестоимость за м', max_digits=16, decimal_places=4, default=0)

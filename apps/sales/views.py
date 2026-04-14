@@ -2,6 +2,8 @@ import logging
 from decimal import Decimal
 from html import escape
 
+from django.db.models import Count, DecimalField, Sum, Value
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 
 from rest_framework import viewsets, status
@@ -11,7 +13,7 @@ from rest_framework.response import Response
 
 from apps.activity.mixins import ActivityLoggingMixin
 from config.permissions import IsAdminOrHasAccess
-from .filters import SaleFilter
+from .filters import ClientFilter, SaleFilter
 from .models import Client, Sale, Shipment
 from .serializers import ClientSerializer, SaleSerializer
 
@@ -37,9 +39,21 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     required_access_key = 'clients'
     activity_section = 'Клиенты'
     activity_label = 'клиент'
-    filterset_fields = []
-    search_fields = ['name', 'inn', 'contact']
+    filterset_class = ClientFilter
+    search_fields = ['name', 'inn', 'contact', 'email', 'messenger']
     ordering_fields = ['id', 'name']
+
+    def get_queryset(self):
+        return (
+            Client.objects.annotate(
+                sales_count=Count('sales', distinct=False),
+                sales_total=Coalesce(
+                    Sum('sales__revenue'),
+                    Value(Decimal('0')),
+                    output_field=DecimalField(max_digits=20, decimal_places=2),
+                ),
+            )
+        )
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -67,7 +81,9 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
 
 class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
-    queryset = Sale.objects.select_related('client', 'warehouse_batch').all()
+    queryset = Sale.objects.select_related(
+        'client', 'warehouse_batch', 'warehouse_batch__profile',
+    ).all()
     serializer_class = SaleSerializer
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'sales'

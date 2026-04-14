@@ -14,9 +14,81 @@ class _NullableRecipeModelSerializer(serializers.ModelSerializer):
 
 
 class PlasticProfileSerializer(serializers.ModelSerializer):
+    deletable = serializers.SerializerMethodField()
+
     class Meta:
         model = PlasticProfile
-        fields = ('id', 'name', 'code')
+        fields = ('id', 'name', 'code', 'comment', 'is_active', 'deletable')
+
+    def get_deletable(self, obj):
+        from .profile_policy import plastic_profile_deletable
+
+        return plastic_profile_deletable(obj)
+
+    def validate_name(self, value):
+        if not (value or '').strip():
+            raise serializers.ValidationError('Укажите название')
+        return (value or '').strip()
+
+    def validate_code(self, value):
+        if not (value or '').strip():
+            raise serializers.ValidationError('Укажите код')
+        return (value or '').strip()
+
+    def validate(self, attrs):
+        code = attrs.get('code')
+        instance = getattr(self, 'instance', None)
+        if code is None and instance is not None:
+            code = instance.code
+        if code is not None:
+            qs = PlasticProfile.objects.filter(code=code)
+            if instance is not None:
+                qs = qs.exclude(pk=instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'code': 'Код уже занят'})
+        return attrs
+
+
+class PlasticProfileListSerializer(serializers.ModelSerializer):
+    recipes_count = serializers.IntegerField(read_only=True)
+    has_recipe = serializers.SerializerMethodField()
+    recipes = serializers.SerializerMethodField()
+    deletable = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PlasticProfile
+        fields = (
+            'id',
+            'name',
+            'code',
+            'comment',
+            'is_active',
+            'recipes_count',
+            'has_recipe',
+            'recipes',
+            'deletable',
+        )
+
+    def get_has_recipe(self, obj):
+        return (getattr(obj, 'recipes_count', 0) or 0) > 0
+
+    def get_recipes(self, obj):
+        return [{'id': r.id, 'name': r.recipe} for r in obj.recipes.all()]
+
+    def get_deletable(self, obj):
+        if (getattr(obj, 'recipes_count', 0) or 0) > 0:
+            return False
+        if getattr(obj, '_has_pb', False):
+            return False
+        return True
+
+
+class PlasticProfileNestedSerializer(serializers.ModelSerializer):
+    """Вложение в рецепт (без deletable и списка рецептов)."""
+
+    class Meta:
+        model = PlasticProfile
+        fields = ('id', 'name', 'code', 'comment', 'is_active')
 
 
 class RecipeComponentSerializer(serializers.ModelSerializer):
@@ -73,9 +145,9 @@ class RecipeListSerializer(serializers.ModelSerializer):
 
     name = serializers.SerializerMethodField()
     recipe = serializers.CharField(read_only=True)
-    profile = PlasticProfileSerializer(read_only=True)
+    profile = PlasticProfileNestedSerializer(read_only=True)
     profile_name = serializers.SerializerMethodField()
-    profile_id = serializers.IntegerField(read_only=True, allow_null=True)
+    profile_id = serializers.IntegerField(read_only=True)
     components_count = serializers.IntegerField(read_only=True)
     deletable = serializers.SerializerMethodField()
 
@@ -122,10 +194,9 @@ class RecipeSerializer(_NullableRecipeModelSerializer):
     profile_id = serializers.PrimaryKeyRelatedField(
         queryset=PlasticProfile.objects.all(),
         source='profile',
-        required=False,
-        allow_null=True,
+        required=True,
     )
-    profile = PlasticProfileSerializer(read_only=True)
+    profile = PlasticProfileNestedSerializer(read_only=True)
     output_quantity = CleanDecimalField(
         max_digits=14,
         decimal_places=4,

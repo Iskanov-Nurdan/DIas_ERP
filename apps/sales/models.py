@@ -10,6 +10,14 @@ class Client(models.Model):
     address = models.TextField('Адрес', blank=True)
     client_type = models.CharField('Тип клиента', max_length=100, blank=True, default='')
     notes = models.TextField('Комментарий', blank=True, default='')
+    email = models.EmailField('Email', blank=True, default='')
+    messenger = models.CharField(
+        'Мессенджер / WhatsApp / Telegram',
+        max_length=255,
+        blank=True,
+        default='',
+    )
+    is_active = models.BooleanField('Активен', default=True)
 
     class Meta:
         db_table = 'clients'

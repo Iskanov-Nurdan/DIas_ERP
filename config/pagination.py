@@ -13,6 +13,31 @@ class StandardResultsSetPagination(PageNumberPagination):
             'items': data,
             'meta': {
                 'total': self.page.paginator.count,
+                'total_count': self.page.paginator.count,
+                'page': self.page.number,
+                'perPage': self.get_page_size(self.request),
+                'page_size': self.get_page_size(self.request),
+                'totalPages': num_pages,
+                'total_pages': num_pages,
+            },
+            'links': {
+                'next': self.get_next_link(),
+                'previous': self.get_previous_link(),
+            },
+        })
+
+
+class RecipeResultsSetPagination(StandardResultsSetPagination):
+    """Список рецептов: допускает page_size до 500 (фильтр по профилю на клиенте)."""
+
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        num_pages = self.page.paginator.num_pages
+        return Response({
+            'items': data,
+            'meta': {
+                'total': self.page.paginator.count,
                 'page': self.page.number,
                 'perPage': self.get_page_size(self.request),
                 'totalPages': num_pages,

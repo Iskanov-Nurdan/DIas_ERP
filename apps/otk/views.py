@@ -26,8 +26,12 @@ class OtkPendingView(viewsets.ViewSet):
 
     def list(self, request):
         qs = (
-            ProductionBatch.objects.filter(otk_status=ProductionBatch.OTK_PENDING)
-            .select_related('order', 'order__recipe', 'order__line', 'operator')
+            ProductionBatch.objects.filter(
+                otk_status=ProductionBatch.OTK_PENDING,
+                lifecycle_status=ProductionBatch.LIFECYCLE_OTK,
+                in_otk_queue=True,
+            )
+            .select_related('order', 'order__recipe', 'order__line', 'operator', 'profile', 'recipe', 'line')
             .prefetch_related('otk_checks__inspector')
         )
         return Response({'items': BatchListSerializer(qs, many=True).data})

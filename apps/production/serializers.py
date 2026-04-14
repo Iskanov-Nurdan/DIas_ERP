@@ -151,6 +151,9 @@ class LineSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'name',
+            'code',
+            'notes',
+            'is_active',
             'shift_is_open',
             'shift_is_paused',
             'shift_pause_reason',
@@ -189,11 +192,15 @@ class LineSerializer(serializers.ModelSerializer):
         t = ev_open.time or time_cls.min
         dt = datetime.combine(ev_open.date, t)
         opened_at = dj_tz.make_aware(dt) if dj_tz.is_naive(dt) else dt
+        opener = ev_open.user.name if ev_open.user_id else None
+        cmt = (ev_params.comment or '').strip() or None
         return {
             'height': float(ev_params.height) if ev_params.height is not None else None,
             'width': float(ev_params.width) if ev_params.width is not None else None,
             'angle_deg': float(ev_params.angle_deg) if ev_params.angle_deg is not None else None,
-            'opened_by': ev_open.user.name if ev_open.user_id else None,
+            'comment': cmt,
+            'opened_by': opener,
+            'opened_by_name': opener,
             'opened_at': opened_at.isoformat(),
             'session_title': ev_open.session_title or None,
             'is_paused': line_shift_is_paused(obj, histories=hist),
@@ -203,7 +210,9 @@ class LineSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         if instance is None:
             return None
-        return super().to_representation(instance)
+        ret = super().to_representation(instance)
+        ret['comment'] = ret.get('notes') or ''
+        return ret
 
 
 class ShiftNoteSerializer(serializers.ModelSerializer):
@@ -357,6 +366,7 @@ class LineHistorySerializer(serializers.ModelSerializer):
     session_title = serializers.SerializerMethodField()
     reason = serializers.SerializerMethodField()
     pause_reason = serializers.SerializerMethodField()
+    opened_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = LineHistory
@@ -364,8 +374,10 @@ class LineHistorySerializer(serializers.ModelSerializer):
             'id', 'line_id', 'date', 'time', 'line_name', 'line_label',
             'line_name_snapshot', 'former_line_id',
             'action',
+            'user',
             'height', 'width', 'angle_deg', 'comment', 'session_title',
             'reason', 'pause_reason',
+            'opened_by_name',
         )
         read_only_fields = ('line_name_snapshot', 'former_line_id')
 
@@ -398,6 +410,16 @@ class LineHistorySerializer(serializers.ModelSerializer):
     def get_pause_reason(self, obj):
         return self.get_reason(obj)
 
+    def get_opened_by_name(self, obj):
+        if obj.action != LineHistory.ACTION_OPEN:
+            return None
+        if obj.user_id:
+            try:
+                return obj.user.name
+            except ObjectDoesNotExist:
+                return None
+        return None
+
 
 class ProductionBatchSerializer(serializers.ModelSerializer):
     order_product = serializers.CharField(source='order.product', read_only=True)
@@ -413,8 +435,13 @@ class ProductionBatchSerializer(serializers.ModelSerializer):
         extra_kwargs = {'operator': {'allow_null': True}}
 
 
+_ALLOWED_BATCH_CREATE_FIELDS = frozenset({
+    'profile', 'recipe', 'line', 'pieces', 'length_per_piece', 'comment', 'date', 'produced_at', 'product',
+})
+
+
 class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
-    """Создание/правка партии профиля: total_meters только с сервера."""
+    """Создание/правка партии профиля: total_meters и себестоимость только с сервера (FIFO)."""
 
     total_meters = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True)
 
@@ -430,14 +457,55 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
             'produced_at': {'required': False, 'allow_null': True},
         }
 
+    def to_internal_value(self, data):
+        if self.instance is None and hasattr(data, 'keys'):
+            extra = set(data.keys()) - _ALLOWED_BATCH_CREATE_FIELDS
+            if extra:
+                raise serializers.ValidationError(
+                    {k: 'Поле не принимается сервером' for k in sorted(extra)},
+                )
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
         request = self.context['request']
         user = request.user
+        initial = getattr(self, 'initial_data', {}) or {}
+
+        if self.instance is not None:
+            forbidden = set(initial.keys()) & {
+                'profile', 'recipe', 'line', 'shift', 'order', 'total_meters', 'material_cost_total',
+                'cost_per_meter', 'cost_per_piece', 'cost_price', 'quantity', 'product',
+            }
+            if forbidden:
+                raise serializers.ValidationError(
+                    {k: 'Нельзя менять это поле после создания партии' for k in sorted(forbidden)},
+                )
+
+            if self.instance.lifecycle_status != ProductionBatch.LIFECYCLE_PENDING:
+                bad = set(initial.keys()) - {'comment'}
+                if bad:
+                    raise serializers.ValidationError(
+                        'После отправки в ОТК можно менять только поле comment',
+                    )
+
         line = attrs.get('line')
         if line is None and self.instance is not None:
             line = self.instance.line
         if line is None:
             raise serializers.ValidationError({'line': 'Укажите линию'})
+
+        hist_map = self.context.get('line_histories') or {}
+        hist = hist_map.get(line.pk) if getattr(line, 'pk', None) else None
+        if getattr(line, 'is_active', True) is False:
+            raise serializers.ValidationError({'line': 'Линия неактивна'})
+        if not line_shift_is_open(line, histories=hist):
+            raise serializers.ValidationError(
+                {'line': 'На линии нет открытой смены'},
+            )
+        if line_shift_is_paused(line, histories=hist):
+            raise serializers.ValidationError(
+                {'line': 'Смена на линии остановлена (пауза). Возобновите смену или выберите другую линию.'},
+            )
 
         shift = Shift.objects.filter(
             user=user,
@@ -447,7 +515,7 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
         ).first()
         if not shift:
             raise serializers.ValidationError(
-                {'shift': 'Нет активной открытой смены на этой линии (не на паузе и не закрыта).'},
+                {'shift': 'Нет активной открытой смены на этой линии для текущего пользователя.'},
             )
         if shift.line_id and line is not None and shift.line_id != line.pk:
             raise serializers.ValidationError({'line': 'Смена привязана к другой линии'})
@@ -458,10 +526,17 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
         recipe = attrs.get('recipe')
         if recipe is None and self.instance is not None:
             recipe = self.instance.recipe
-        if profile is None or recipe is None:
-            raise serializers.ValidationError({'profile': 'Нужны profile и recipe'})
-        if recipe.profile_id and recipe.profile_id != profile.pk:
-            raise serializers.ValidationError({'recipe': 'Рецепт не относится к выбранному профилю'})
+        err = {}
+        if profile is None:
+            err['profile'] = 'Обязательно укажите профиль'
+        if recipe is None:
+            err['recipe'] = 'Обязательно укажите рецепт'
+        if err:
+            raise serializers.ValidationError(err)
+        if recipe.profile_id != profile.pk:
+            raise serializers.ValidationError(
+                {'recipe': 'Рецепт не относится к выбранному профилю'},
+            )
         if not recipe.components.exists():
             raise serializers.ValidationError({'recipe': 'У рецепта нет компонентов'})
 
@@ -489,6 +564,9 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
         if validated_data.get('produced_at') is None:
             validated_data['produced_at'] = timezone.now()
         validated_data['otk_status'] = ProductionBatch.OTK_PENDING
+        validated_data.setdefault('lifecycle_status', ProductionBatch.LIFECYCLE_PENDING)
+        validated_data.setdefault('sent_to_otk', False)
+        validated_data.setdefault('in_otk_queue', False)
         with transaction.atomic():
             batch = ProductionBatch.objects.create(**validated_data)
             apply_production_batch_stock_and_cost(batch)
@@ -497,14 +575,25 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         if RecipeRun.objects.filter(production_batch=instance).exists():
             raise serializers.ValidationError(
-                {'non_field_errors': 'Партия связана с замесом (recipe-run): изменение состава через замес.'},
+                {'non_field_errors': 'Партия связана с замесом (recipe-run): изменение через замес недоступно.'},
             )
+
+        validated_data.pop('_shift', None)
+
+        if instance.lifecycle_status != ProductionBatch.LIFECYCLE_PENDING:
+            comment = validated_data.pop('comment', serializers.empty)
+            if validated_data:
+                raise serializers.ValidationError(
+                    'После отправки в ОТК можно менять только поле comment',
+                )
+            if comment is serializers.empty:
+                return instance
+            instance.comment = comment
+            instance.save(update_fields=['comment'])
+            return instance
+
         if instance.otk_status != ProductionBatch.OTK_PENDING:
             raise serializers.ValidationError({'otk_status': 'Можно менять только партию в статусе «ожидает ОТК»'})
-
-        shift = validated_data.pop('_shift', None)
-        if shift is not None:
-            validated_data['shift'] = shift
 
         old_recipe = instance.recipe
         old_tm = Decimal(str(instance.total_meters))
@@ -542,6 +631,7 @@ class BatchListSerializer(serializers.ModelSerializer):
     otk_defect_reason = serializers.SerializerMethodField()
     otk_comment = serializers.SerializerMethodField()
     otk_inspector = serializers.SerializerMethodField()
+    otk_inspector_name = serializers.SerializerMethodField()
     otk_checked_at = serializers.SerializerMethodField()
     recipe_name = serializers.SerializerMethodField()
     recipe_label = serializers.SerializerMethodField()
@@ -564,11 +654,12 @@ class BatchListSerializer(serializers.ModelSerializer):
             'quantity', 'released',
             'operator', 'operator_name', 'date', 'created_at',
             'otk_status', 'otk_status_display', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
-            'otk_comment', 'otk_inspector', 'otk_checked_at',
+            'otk_comment', 'otk_inspector', 'otk_inspector_name', 'otk_checked_at',
             'recipe_name', 'recipe_label', 'recipe_name_snapshot', 'former_recipe_id',
             'recipe_output_quantity', 'recipe_output_unit_kind',
             'line_name', 'line_label', 'height', 'width', 'angle_deg',
             'material_cost_total', 'cost_per_meter', 'cost_per_piece',
+            'lifecycle_status', 'sent_to_otk', 'in_otk_queue', 'otk_submitted_at',
         )
 
     def _last_check(self, obj):
@@ -605,7 +696,21 @@ class BatchListSerializer(serializers.ModelSerializer):
 
     def get_otk_inspector(self, obj):
         c = self._last_check(obj)
-        return c.inspector.name if c and c.inspector_id else None
+        return c.inspector_id if c and c.inspector_id else None
+
+    def get_otk_inspector_name(self, obj):
+        c = self._last_check(obj)
+        if not c:
+            return None
+        n = (c.inspector_name or '').strip()
+        if n:
+            return n
+        if c.inspector_id:
+            try:
+                return (c.inspector.name or '').strip() or None
+            except ObjectDoesNotExist:
+                return None
+        return None
 
     def get_otk_checked_at(self, obj):
         c = self._last_check(obj)

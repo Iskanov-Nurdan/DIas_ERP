@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Dict, Optional, Tuple
 
 from django.db import transaction
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.materials.fifo import fifo_deduct, material_stock_kg, reverse_stock_deductions
 from apps.materials.models import RawMaterial
@@ -64,10 +64,10 @@ def reverse_production_batch_stock(
 @transaction.atomic
 def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
     if not batch.recipe_id:
-        raise ValidationError({'recipe_id': 'У партии должен быть рецепт'})
+        raise DRFValidationError({'recipe_id': 'У партии должен быть рецепт'})
     recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)
     if not recipe.components.exists():
-        raise ValidationError(
+        raise DRFValidationError(
             {'code': 'INVALID_RECIPE', 'detail': 'Рецепт без компонентов', 'error': 'Рецепт без компонентов'},
         )
     tm = _q(batch.total_meters)
@@ -82,6 +82,7 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             name = RawMaterial.objects.filter(pk=mid).values_list('name', flat=True).first() or f'id={mid}'
             unit = RawMaterial.objects.filter(pk=mid).values_list('unit', flat=True).first() or 'kg'
             missing.append({
+                'kind': 'raw_material',
                 'component': name,
                 'required': float(req),
                 'available': float(avail),
@@ -94,6 +95,7 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
         cat = ChemistryCatalog.objects.filter(pk=cid).only('id', 'name', 'unit').first()
         if not cat:
             missing.append({
+                'kind': 'chemistry',
                 'component': f'Химия id={cid}',
                 'required': float(req),
                 'available': 0.0,
@@ -103,6 +105,7 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
         avail = chemistry_stock_kg(cid)
         if avail < req:
             missing.append({
+                'kind': 'chemistry',
                 'component': cat.name,
                 'required': float(req),
                 'available': float(avail),
@@ -110,12 +113,24 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             })
 
     if missing:
-        raise ValidationError({
-            'code': 'INSUFFICIENT_STOCK',
-            'error': 'Недостаточно остатков для партии',
-            'detail': 'Недостаточно остатков для партии',
-            'missing': missing,
-        })
+        err_list = [
+            {
+                'field': m.get('kind', 'stock'),
+                'message': (
+                    f"{m.get('component', '?')}: нужно {m.get('required')}, доступно {m.get('available')} ({m.get('unit', 'kg')})"
+                ),
+            }
+            for m in missing
+        ]
+        raise DRFValidationError(
+            {
+                'code': 'INSUFFICIENT_STOCK',
+                'error': 'Недостаточно остатков для партии',
+                'detail': 'Недостаточно остатков для партии',
+                'missing': missing,
+                'errors': err_list,
+            }
+        )
 
     raw_cost = Decimal('0')
     for mid, req in raw_agg.items():

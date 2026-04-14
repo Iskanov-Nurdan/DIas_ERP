@@ -2,15 +2,20 @@ from django.db import models
 
 
 class PlasticProfile(models.Model):
-    """Пластиковый профиль (готовая продукция): 1 рецепт привязан к одному профилю."""
+    """Пластиковый профиль (готовая продукция): к профилю привязано много рецептов."""
 
     name = models.CharField('Наименование', max_length=255)
-    code = models.CharField('Код', max_length=100, blank=True, default='')
+    code = models.CharField('Код', max_length=100)
+    comment = models.TextField('Комментарий', blank=True, default='')
+    is_active = models.BooleanField('Активен', default=True)
 
     class Meta:
         db_table = 'plastic_profiles'
         verbose_name = 'Профиль'
         verbose_name_plural = 'Профили'
+        constraints = [
+            models.UniqueConstraint(fields=('code',), name='plastic_profiles_code_key'),
+        ]
 
     def __str__(self):
         return self.name or f'#{self.pk}'
@@ -27,8 +32,6 @@ class Recipe(models.Model):
         PlasticProfile,
         on_delete=models.PROTECT,
         related_name='recipes',
-        null=True,
-        blank=True,
         verbose_name='Профиль',
     )
     product = models.CharField('Продукт (денормализация)', max_length=255, blank=True, default='')

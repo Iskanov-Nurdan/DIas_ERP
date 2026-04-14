@@ -55,12 +55,31 @@ def _quantity_input_api_value(v):
 
 
 class ClientSerializer(serializers.ModelSerializer):
+    contact_person = serializers.CharField(source='contact', required=False, allow_blank=True)
+    whatsapp_telegram = serializers.CharField(source='messenger', required=False, allow_blank=True)
+    sales_count = serializers.IntegerField(read_only=True, required=False, default=0)
+    sales_total = serializers.DecimalField(
+        max_digits=20, decimal_places=2, read_only=True, required=False, coerce_to_string=False,
+    )
+    has_sales = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+
     class Meta:
         model = Client
         fields = (
-            'id', 'name', 'contact', 'phone', 'phone_alt', 'inn', 'address',
-            'client_type', 'notes',
+            'id', 'name', 'contact', 'contact_person', 'phone', 'phone_alt',
+            'inn', 'address', 'email', 'messenger', 'whatsapp_telegram',
+            'client_type', 'notes', 'is_active', 'status',
+            'sales_count', 'sales_total', 'has_sales',
         )
+
+    def get_status(self, obj):
+        return 'active' if obj.is_active else 'inactive'
+
+    def get_has_sales(self, obj):
+        if hasattr(obj, 'sales_count'):
+            return int(obj.sales_count or 0) > 0
+        return obj.sales.exists()
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
@@ -69,12 +88,20 @@ class ClientSerializer(serializers.ModelSerializer):
                 data['phone_alt'] = data.get('second_phone')
             if data.get('notes') in (None, '') and data.get('comment') not in (None, ''):
                 data['notes'] = data.get('comment')
+            cp = data.get('contact_person')
+            if cp not in (None, '') and (data.get('contact') in (None, '')):
+                data['contact'] = cp
+            if data.get('messenger') in (None, '') and data.get('whatsapp_telegram') not in (None, ''):
+                data['messenger'] = data.get('whatsapp_telegram')
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         ret['second_phone'] = ret.get('phone_alt') or ''
         ret['comment'] = ret.get('notes') or ''
+        st = ret.get('sales_total')
+        if st is None:
+            ret['sales_total'] = Decimal('0')
         return ret
 
 
@@ -95,6 +122,9 @@ class SaleSerializer(serializers.ModelSerializer):
     packaging = serializers.CharField(required=False, allow_blank=True, max_length=50, default='')
     stock_form = serializers.CharField(required=False, allow_blank=True, max_length=20, default='')
     piece_pick = serializers.CharField(required=False, allow_blank=True, max_length=40, default='')
+    profile_name = serializers.SerializerMethodField()
+    sale_date = serializers.SerializerMethodField()
+    cost_total = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
@@ -102,15 +132,35 @@ class SaleSerializer(serializers.ModelSerializer):
             'id', 'order_number', 'client', 'client_name', 'warehouse_batch', 'warehouse_batch_id',
             'product', 'quantity', 'sale_mode', 'sold_pieces', 'sold_packages',
             'length_per_piece', 'total_meters',
-            'quantity_input', 'quantity_unit', 'price', 'revenue', 'cost', 'date', 'comment',
+            'quantity_input', 'quantity_unit', 'price', 'revenue', 'cost', 'cost_total', 'date', 'sale_date',
+            'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
+            'profile_name',
         )
         read_only_fields = (
-            'profit', 'revenue', 'cost', 'total_meters', 'inventory_form', 'quantity_unit', 'warehouse_batch_id',
+            'profit', 'revenue', 'cost', 'cost_total', 'total_meters', 'inventory_form', 'quantity_unit',
+            'warehouse_batch_id', 'profile_name', 'sale_date',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
         }
+
+    def get_profile_name(self, obj):
+        if not obj.warehouse_batch_id:
+            return None
+        try:
+            wb = obj.warehouse_batch
+            if wb.profile_id:
+                return wb.profile.name
+        except ObjectDoesNotExist:
+            pass
+        return None
+
+    def get_sale_date(self, obj):
+        return obj.date.isoformat() if obj.date else None
+
+    def get_cost_total(self, obj):
+        return obj.cost
 
     def get_inventory_form(self, obj):
         if obj.warehouse_batch_id:
@@ -138,6 +188,8 @@ class SaleSerializer(serializers.ModelSerializer):
                 data['sale_unit'] = qu
             if data.get('sold_pieces') in (None, '') and data.get('quantity') not in (None, ''):
                 data['sold_pieces'] = data.get('quantity')
+            if data.get('date') in (None, '') and data.get('sale_date') not in (None, ''):
+                data['date'] = data.get('sale_date')
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -325,7 +377,10 @@ class SaleSerializer(serializers.ModelSerializer):
             'sale_mode', 'sold_pieces', 'sold_packages', 'length_per_piece', 'price', 'warehouse_batch',
         )}, **validated_data}
         self._apply_finance(merged)
-        validated_data.update({k: merged[k] for k in ('sold_pieces', 'sold_packages', 'quantity', 'length_per_piece', 'total_meters', 'revenue', 'cost', 'profit') if k in merged})
+        validated_data.update({k: merged[k] for k in (
+            'sold_pieces', 'sold_packages', 'quantity', 'length_per_piece', 'total_meters',
+            'revenue', 'cost', 'profit',
+        ) if k in merged})
 
         with transaction.atomic():
             instance = super().update(instance, validated_data)

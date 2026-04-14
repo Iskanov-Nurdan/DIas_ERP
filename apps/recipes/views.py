@@ -9,10 +9,17 @@ from rest_framework.response import Response
 from apps.activity.mixins import ActivityLoggingMixin
 from apps.chemistry.fifo import chemistry_stock_kg
 from apps.materials.fifo import material_stock_kg
+from config.pagination import RecipeResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 from .models import PlasticProfile, Recipe, RecipeComponent
+from .profile_policy import plastic_profile_deletable
 from .recipe_policy import recipe_deletable
-from .serializers import PlasticProfileSerializer, RecipeSerializer, RecipeListSerializer
+from .serializers import (
+    PlasticProfileSerializer,
+    PlasticProfileListSerializer,
+    RecipeSerializer,
+    RecipeListSerializer,
+)
 from apps.production.models import Order, ProductionBatch, RecipeRun
 
 
@@ -24,8 +31,42 @@ class PlasticProfileViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_section = 'Рецепты'
     activity_label = 'профиль'
     activity_entity_model = PlasticProfile
-    search_fields = ['name', 'code']
-    ordering_fields = ['id', 'name']
+    search_fields = ['name', 'code', 'comment']
+    ordering_fields = ['id', 'name', '-id']
+    filterset_fields = ['is_active']
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return PlasticProfileListSerializer
+        return PlasticProfileSerializer
+
+    def get_queryset(self):
+        has_pb = Exists(ProductionBatch.objects.filter(profile_id=OuterRef('pk')))
+        qs = PlasticProfile.objects.annotate(
+            recipes_count=Count('recipes', distinct=True),
+            _has_pb=has_pb,
+        )
+        if self.action == 'list':
+            qs = qs.prefetch_related(
+                Prefetch(
+                    'recipes',
+                    queryset=Recipe.objects.order_by('recipe', 'id').only('id', 'recipe'),
+                )
+            )
+        return qs.order_by('-id')
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if not plastic_profile_deletable(instance):
+            msg = (
+                'Нельзя удалить профиль: есть рецепты или партии производства. '
+                'Деактивируйте профиль (is_active: false).'
+            )
+            return Response(
+                {'code': 'PROFILE_IN_USE', 'error': msg, 'detail': msg},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
@@ -39,7 +80,8 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     required_access_key = 'recipes'
     activity_section = 'Рецепты'
     activity_label = 'рецепт'
-    filterset_fields = ['is_active', 'profile']
+    pagination_class = RecipeResultsSetPagination
+    filterset_fields = ['is_active', 'profile', 'profile_id']
     search_fields = ['recipe', 'product', 'comment']
     ordering_fields = ['id', 'recipe', 'product', 'components_count', 'output_quantity']
 

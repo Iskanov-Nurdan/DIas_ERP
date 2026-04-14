@@ -71,7 +71,18 @@ def _extract_validation_errors(detail) -> list[dict]:
     """Разворачивает DRF ValidationError detail в список {field, message}."""
     errors = []
     if isinstance(detail, dict):
+        raw_errors = detail.get('errors')
+        if isinstance(raw_errors, list) and raw_errors:
+            for item in raw_errors:
+                if isinstance(item, dict) and 'field' in item and 'message' in item:
+                    errors.append({'field': item['field'], 'message': str(item['message'])})
+                elif isinstance(item, str):
+                    errors.append({'field': 'non_field_errors', 'message': item})
+            if errors:
+                return errors
         for field, messages in detail.items():
+            if field in ('errors', 'code', 'detail', 'error', 'missing'):
+                continue
             if isinstance(messages, list):
                 for msg in messages:
                     errors.append({'field': field, 'message': str(msg)})
@@ -125,8 +136,16 @@ def dias_exception_handler(exc, context):
 
     if isinstance(exc, ValidationError):
         errors = _extract_validation_errors(exc.detail)
-        first_msg = errors[0]['message'] if errors else 'Ошибка валидации'
-        return _make_error_response('validation_error', first_msg, errors=errors, http_status=400)
+        if isinstance(exc.detail, dict) and exc.detail.get('detail'):
+            first_msg = str(exc.detail['detail'])
+        elif isinstance(exc.detail, dict) and exc.detail.get('error'):
+            first_msg = str(exc.detail['error'])
+        else:
+            first_msg = errors[0]['message'] if errors else 'Ошибка валидации'
+        code = 'validation_error'
+        if isinstance(exc.detail, dict) and exc.detail.get('code'):
+            code = str(exc.detail['code'])
+        return _make_error_response(code, first_msg, errors=errors or None, http_status=400)
 
     if isinstance(exc, MethodNotAllowed):
         return _make_error_response('bad_request', f'Метод {exc.args[0]} не поддерживается', http_status=405)

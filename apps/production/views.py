@@ -2,6 +2,7 @@ import logging
 from decimal import Decimal
 from datetime import date
 
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import viewsets, status
@@ -54,7 +55,7 @@ from .serializers import (
 )
 from apps.recipes.models import RecipeComponent
 
-from .batch_stock import apply_production_batch_stock_and_cost, reverse_production_batch_stock
+from .batch_stock import reverse_production_batch_stock
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,7 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_section = 'Линии'
     activity_label = 'линия'
     filterset_fields = []
-    search_fields = ['name']
+    search_fields = ['name', 'code']
     ordering_fields = ['id', 'name']
 
     def retrieve(self, request, *args, **kwargs):
@@ -206,7 +207,13 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
 
         raw_eligible = request.query_params.get('eligible_for_recipe_run')
+        raw_pb = request.query_params.get('eligible_for_production_batch')
+        want_eligible = False
         if raw_eligible is not None and str(raw_eligible).strip().lower() in ('1', 'true', 'yes'):
+            want_eligible = True
+        if raw_pb is not None and str(raw_pb).strip().lower() in ('1', 'true', 'yes'):
+            want_eligible = True
+        if want_eligible:
             ordered_pks = list(queryset.values_list('pk', flat=True))
             hist_tmp = prefetch_line_histories_map(ordered_pks)
             eligible_pks = []
@@ -251,8 +258,10 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from django.utils import timezone
 
         line = self.get_object()
+        if not getattr(line, 'is_active', True):
+            return _err('bad_request', 'Линия неактивна: открытие смены недоступно', http_status=400)
         if line_shift_is_open(line):
-            return _err('bad_request', 'Смена на линии уже открыта', http_status=400)
+            return _err('conflict', 'На линии уже есть открытая смена', http_status=409)
         ser = LineShiftOpenSerializer(data=request.data)
         if not ser.is_valid():
             return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -291,7 +300,11 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         _audit_shift_row(
             request, request.user, shift, action='create', endpoint='POST /api/lines/{id}/open/',
         )
-        return Response({'detail': 'Смена открыта', 'line': LineSerializer(line).data})
+        hist_map = prefetch_line_histories_map([line.pk])
+        line_ctx = {**self.get_serializer_context(), 'line_histories': hist_map}
+        return Response(
+            {'detail': 'Смена открыта', 'line': LineSerializer(line, context=line_ctx).data},
+        )
 
     @action(detail=True, methods=['post'], url_path='close')
     def close_shift(self, request, pk=None):
@@ -355,7 +368,11 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             after=after_shift,
             shift_context=close_shift_context,
         )
-        return Response({'detail': 'Смена закрыта', 'line': LineSerializer(line).data})
+        hist_map = prefetch_line_histories_map([line.pk])
+        line_ctx = {**self.get_serializer_context(), 'line_histories': hist_map}
+        return Response(
+            {'detail': 'Смена закрыта', 'line': LineSerializer(line, context=line_ctx).data},
+        )
 
     @action(detail=True, methods=['patch'], url_path='shift-params')
     def shift_params(self, request, pk=None):
@@ -554,10 +571,12 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             pause_resume_qs = pause_resume_qs.filter(_line_history_q_before_row(close_row))
 
         ser = LineHistorySerializer
+        pause_data = ser(pause_resume_qs, many=True).data
         payload = {
             'open': ser(open_row).data,
             'updates': ser(updates_qs, many=True).data,
-            'pause_resume': ser(pause_resume_qs, many=True).data,
+            'pause_resume': pause_data,
+            'pauseResume': pause_data,
         }
         if close_row:
             payload['close'] = ser(close_row).data
@@ -595,7 +614,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     ).prefetch_related('otk_checks__inspector').all()
     serializer_class = BatchListSerializer
     permission_classes = [IsAdminOrHasProductionOrOtk]
-    filterset_fields = ['otk_status', 'order', 'line', 'profile']
+    filterset_fields = ['otk_status', 'order', 'line', 'profile', 'lifecycle_status']
     ordering_fields = ['id', 'date']
     activity_section = 'Производство'
     activity_label = 'партия'
@@ -607,6 +626,90 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if self.action in ('create', 'update', 'partial_update'):
             return ProductionBatchCreateUpdateSerializer
         return ProductionBatchSerializer
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.action not in ('create', 'update', 'partial_update'):
+            return ctx
+        line_id = None
+        data = getattr(self.request, 'data', None) or {}
+        raw_line = data.get('line') if hasattr(data, 'get') else None
+        if raw_line is not None and str(raw_line).strip() != '':
+            try:
+                line_id = int(raw_line)
+            except (TypeError, ValueError):
+                line_id = None
+        if line_id is None and self.action in ('update', 'partial_update'):
+            pk = self.kwargs.get('pk')
+            if pk is not None:
+                line_id = ProductionBatch.objects.filter(pk=pk).values_list('line_id', flat=True).first()
+        if line_id:
+            ctx['line_histories'] = prefetch_line_histories_map([line_id])
+        return ctx
+
+    def create(self, request, *args, **kwargs):
+        idem = request.headers.get('X-Request-Id') or request.headers.get('Idempotency-Key')
+        if idem and str(idem).strip():
+            key = f'production_batch:create:{request.user.pk}:{str(idem).strip()}'
+            existing = cache.get(key)
+            if existing:
+                batch = ProductionBatch.objects.filter(pk=existing).first()
+                if batch:
+                    serializer = self.get_serializer(batch)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        req = self.request
+        idem = req.headers.get('X-Request-Id') or req.headers.get('Idempotency-Key')
+        if idem and str(idem).strip() and serializer.instance and serializer.instance.pk:
+            cache.set(
+                f'production_batch:create:{req.user.pk}:{str(idem).strip()}',
+                serializer.instance.pk,
+                86400,
+            )
+
+    @action(detail=True, methods=['post'], url_path='submit-for-otk')
+    def submit_for_otk(self, request, pk=None):
+        """Пустое тело. pending → очередь ОТК; повтор — 200 без дубля."""
+        from django.utils import timezone as dj_tz
+
+        with transaction.atomic():
+            batch = ProductionBatch.objects.select_for_update().select_related('line').get(
+                pk=self.kwargs['pk'],
+            )
+            if batch.lifecycle_status == ProductionBatch.LIFECYCLE_OTK:
+                return Response(BatchListSerializer(batch).data, status=status.HTTP_200_OK)
+            if batch.lifecycle_status == ProductionBatch.LIFECYCLE_DONE:
+                return _err(
+                    'conflict',
+                    'Партия уже завершена',
+                    http_status=status.HTTP_409_CONFLICT,
+                )
+            if batch.lifecycle_status != ProductionBatch.LIFECYCLE_PENDING:
+                return _err(
+                    'conflict',
+                    'Отправка в ОТК доступна только из статуса «производство» (pending)',
+                    http_status=status.HTTP_409_CONFLICT,
+                )
+            if batch.otk_status != ProductionBatch.OTK_PENDING:
+                return _err(
+                    'conflict',
+                    'Партия уже обработана ОТК',
+                    http_status=status.HTTP_409_CONFLICT,
+                )
+            now = dj_tz.now()
+            line = batch.line
+            if line:
+                _apply_shift_snapshot_to_batch(batch, line)
+            batch.lifecycle_status = ProductionBatch.LIFECYCLE_OTK
+            batch.sent_to_otk = True
+            batch.in_otk_queue = True
+            batch.otk_submitted_at = now
+            batch.save()
+        batch = self.get_object()
+        return Response(BatchListSerializer(batch).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='otk_accept')
     def otk_accept(self, request, pk=None):
@@ -624,6 +727,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         defect_reason = request.data.get('otk_defect_reason') or request.data.get('rejectReason', '')
         comment = request.data.get('otk_comment') or ''
         otk_inspector_raw = request.data.get('otk_inspector')
+        otk_inspector_name_in = (request.data.get('otk_inspector_name') or '').strip()
         checked_at = request.data.get('otk_checked_at')
 
         errors = []
@@ -674,6 +778,10 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if inspector is None:
             inspector = request.user
 
+        inspector_name_stored = otk_inspector_name_in[:255] if otk_inspector_name_in else ''
+        if not inspector_name_stored and inspector:
+            inspector_name_stored = (getattr(inspector, 'name', None) or '')[:255]
+
         if checked_at and isinstance(checked_at, str):
             from django.utils.dateparse import parse_datetime
             from django.utils import timezone as tz
@@ -706,19 +814,23 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 reject_reason=defect_reason,
                 comment=comment,
                 inspector=inspector,
+                inspector_name=inspector_name_stored,
             )
             OtkCheck.objects.filter(pk=check.pk).update(checked_date=checked_at)
             batch.otk_status = (
                 ProductionBatch.OTK_REJECTED if rejected > 0 and accepted == 0
                 else ProductionBatch.OTK_ACCEPTED
             )
-            batch.save(update_fields=['otk_status'])
+            batch.lifecycle_status = ProductionBatch.LIFECYCLE_DONE
+            batch.sent_to_otk = True
+            batch.in_otk_queue = False
+            batch.save(update_fields=[
+                'otk_status', 'lifecycle_status', 'sent_to_otk', 'in_otk_queue',
+            ])
             if accepted > 0:
                 from apps.warehouse.models import WarehouseBatch
 
-                ins_name = ''
-                if inspector:
-                    ins_name = (getattr(inspector, 'name', None) or '')[:255]
+                ins_name = inspector_name_stored
                 WarehouseBatch.objects.create(
                     profile_id=batch.profile_id,
                     product=batch.product,
@@ -735,7 +847,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     otk_defect=rejected,
                     otk_defect_reason=defect_reason or '',
                     otk_comment=comment or '',
-                    otk_inspector_name=ins_name,
+                    otk_inspector_name=ins_name or '',
                     otk_checked_at=checked_at,
                     otk_status=batch.otk_status,
                 )
@@ -845,8 +957,10 @@ class ShiftViewSet(viewsets.ReadOnlyModelViewSet):
                             'У вас уже есть открытая смена на этой линии. Закройте её через POST /api/lines/{id}/close/ или POST /api/shifts/close/ с line_id.',
                             http_status=409,
                         )
+                    if not getattr(line, 'is_active', True):
+                        return _err('bad_request', 'Линия неактивна', http_status=400)
                     if line_shift_is_open(line):
-                        return _err('bad_request', 'Смена на линии уже открыта', http_status=400)
+                        return _err('conflict', 'На линии уже есть открытая смена', http_status=409)
                     ser = LineShiftOpenSerializer(data=request.data)
                     if not ser.is_valid():
                         return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -1300,6 +1414,7 @@ def _recipe_run_otk_quantity(
 def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=None):
     """
     Создаёт заказ + ProductionBatch (otk_status=pending), связывает с RecipeRun.
+    Списание склада и FIFO не выполняются — только POST /api/batches/.
     Повторный вызов (pending): пересчитывает quantity из тела, из нормы рецепта (× output_scale) или
     оставляет прежнее на партии; не использует сумму/число ёмкостей замеса.
     """
@@ -1326,13 +1441,6 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                             'либо используйте output_scale к норме рецепта.'
                         ),
                     })
-                old_tm = Decimal(str(batch.total_meters))
-                old_recipe = batch.recipe if batch.recipe_id else None
-                reverse_production_batch_stock(
-                    batch_id=batch.pk,
-                    recipe=old_recipe,
-                    total_meters=old_tm,
-                )
                 batch.pieces = 1
                 batch.length_per_piece = qty
                 batch.recompute_totals()
@@ -1350,7 +1458,6 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                     if order.quantity != qty:
                         order.quantity = qty
                         order.save(update_fields=['quantity'])
-                apply_production_batch_stock_and_cost(batch)
             return (
                 ProductionBatch.objects.select_related('order', 'operator')
                 .prefetch_related('otk_checks__inspector')
@@ -1432,7 +1539,6 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
         _apply_shift_snapshot_to_batch(batch, line)
         batch.save()
         RecipeRun.objects.filter(pk=run_locked.pk).update(production_batch=batch)
-        apply_production_batch_stock_and_cost(batch)
 
     return (
         ProductionBatch.objects.select_related('order', 'operator')
@@ -1448,7 +1554,7 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     POST   /api/production/recipe-runs/ — создать замес и поставить партию в очередь ОТК (норма × scale или quantity).
     POST   /api/production/recipe-runs/{id}/submit-to-otk/ — создать/обновить партию pending.
     PATCH  — состав ёмкостей (без движения остатков); при смене объёма ОТК используйте submit-to-otk или PATCH с quantity.
-    DELETE — при pending-партии: откат списания по партии, удаление партии и заказа.
+    DELETE — при pending-партии: удаление партии и заказа (списание FIFO только у партий из POST /api/batches/).
     """
 
     permission_classes = [IsAdminOrHasProductionOrOtk]

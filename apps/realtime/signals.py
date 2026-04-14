@@ -18,7 +18,7 @@ from apps.production.models import (
     ShiftComplaint,
     ShiftNote,
 )
-from apps.recipes.models import Recipe, RecipeComponent
+from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
 from apps.sales.models import Sale
 from apps.warehouse.models import WarehouseBatch
 
@@ -169,11 +169,22 @@ def production_batch_saved(sender, instance, created, **kwargs):
         entity_id=instance.pk,
         extra={'order_id': instance.order_id, 'otk_status': instance.otk_status},
     )
+    schedule_push(
+        resource='batch',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={
+            'profile_id': instance.profile_id,
+            'recipe_id': instance.recipe_id,
+            'otk_status': instance.otk_status,
+        },
+    )
 
 
 @receiver(post_delete, sender=ProductionBatch)
 def production_batch_deleted(sender, instance, **kwargs):
     schedule_push(resource='production_batch', action='deleted', entity_id=instance.pk)
+    schedule_push(resource='batch', action='deleted', entity_id=instance.pk)
 
 
 @receiver(post_save, sender=MaterialBatch)
@@ -323,6 +334,16 @@ def chemistry_deduction_saved(sender, instance, created, **kwargs):
 def chemistry_deduction_deleted(sender, instance, **kwargs):
     cid = instance.batch.chemistry_id if instance.batch_id else None
     schedule_push(resource='chemistry_balance', action='changed', extra={'chemistry_id': cid})
+
+
+@receiver(post_save, sender=PlasticProfile)
+def plastic_profile_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='plastic_profile', action=_act(created), entity_id=instance.pk)
+
+
+@receiver(post_delete, sender=PlasticProfile)
+def plastic_profile_deleted(sender, instance, **kwargs):
+    schedule_push(resource='plastic_profile', action='deleted', entity_id=instance.pk)
 
 
 @receiver(post_save, sender=Recipe)
