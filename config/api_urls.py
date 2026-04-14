@@ -2,9 +2,19 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from apps.accounts.views import UserViewSet, RoleViewSet
-from apps.materials.views import RawMaterialViewSet, IncomingViewSet, MaterialsBalancesView
-from apps.chemistry.views import ChemistryCatalogViewSet, ChemistryTaskViewSet, ChemistryStockViewSet
-from apps.recipes.views import RecipeViewSet
+from apps.materials.views import (
+    RawMaterialViewSet,
+    IncomingViewSet,
+    MaterialsBalancesView,
+    MaterialsMovementsView,
+)
+from apps.chemistry.views import (
+    ChemistryCatalogViewSet,
+    ChemistryTaskViewSet,
+    ChemistryBalancesView,
+    ChemistryBatchViewSet,
+)
+from apps.recipes.views import PlasticProfileViewSet, RecipeViewSet
 from apps.production.views import (
     LineViewSet,
     BatchViewSet,
@@ -34,10 +44,13 @@ router.register(r'lines', LineViewSet, basename='line')
 router.register(r'raw-materials', RawMaterialViewSet, basename='rawmaterial')
 router.register(r'incoming', IncomingViewSet, basename='incoming')
 router.register(r'materials/balances', MaterialsBalancesView, basename='materials-balances')
+router.register(r'materials/movements', MaterialsMovementsView, basename='materials-movements')
 router.register(r'chemistry/elements', ChemistryCatalogViewSet, basename='chemistry-elements')
 router.register(r'chemistry/tasks', ChemistryTaskViewSet, basename='chemistry-tasks')
-router.register(r'chemistry/balances', ChemistryStockViewSet, basename='chemistry-balances')
-router.register(r'chemistry/recipe-runs', RecipeRunViewSet, basename='chemistry-recipe-run')
+router.register(r'chemistry/balances', ChemistryBalancesView, basename='chemistry-balances')
+router.register(r'chemistry/batches', ChemistryBatchViewSet, basename='chemistry-batches')
+router.register(r'production/recipe-runs', RecipeRunViewSet, basename='production-recipe-run')
+router.register(r'plastic-profiles', PlasticProfileViewSet, basename='plastic-profile')
 router.register(r'recipes', RecipeViewSet, basename='recipe')
 router.register(r'batches', BatchViewSet, basename='batch')
 router.register(r'warehouse/batches', WarehouseBatchViewSet, basename='warehouse-batch')

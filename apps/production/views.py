@@ -15,7 +15,7 @@ from apps.activity.mixins import ActivityLoggingMixin
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
 from config.exceptions import _extract_validation_errors, _make_error_response
 from config.openapi_common import DiasErrorSerializer, paginated_inline
-from config.permissions import CanAccessShiftComplaints, IsAdminOrHasAccess
+from config.permissions import CanAccessShiftComplaints, IsAdminOrHasAccess, IsAdminOrHasProductionOrOtk
 from config.pagination import StandardResultsSetPagination
 from .shift_state import (
     line_current_shift_open_event,
@@ -44,7 +44,7 @@ from .serializers import (
     LineShiftOpenSerializer,
     LineShiftPauseSerializer,
     LineShiftSnapshotSerializer,
-    ProductionBatchSerializer, BatchListSerializer,
+    ProductionBatchSerializer, ProductionBatchCreateUpdateSerializer, BatchListSerializer,
     RecipeRunDetailSerializer, RecipeRunListSerializer, RecipeRunWriteSerializer,
     ShiftSerializer,
     ShiftDetailSerializer,
@@ -53,6 +53,8 @@ from .serializers import (
     ShiftComplaintListSerializer,
 )
 from apps.recipes.models import RecipeComponent
+
+from .batch_stock import apply_production_batch_stock_and_cost, reverse_production_batch_stock
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +426,7 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 session_title='',
             )
         _audit_line_history_row(request, request.user, hist, endpoint='POST /api/lines/{id}/shift-pause/')
+        Shift.objects.filter(line=line, closed_at__isnull=True).update(status=Shift.STATUS_PAUSED)
         hist_map = prefetch_line_histories_map([line.pk])
         line_ctx = {**self.get_serializer_context(), 'line_histories': hist_map}
         return Response(
@@ -461,6 +464,7 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 session_title='',
             )
         _audit_line_history_row(request, request.user, hist, endpoint='POST /api/lines/{id}/shift-resume/')
+        Shift.objects.filter(line=line, closed_at__isnull=True).update(status=Shift.STATUS_OPEN)
         hist_map = prefetch_line_histories_map([line.pk])
         line_ctx = {**self.get_serializer_context(), 'line_histories': hist_map}
         return Response(
@@ -580,23 +584,28 @@ def _line_history_q_before_row(row):
     )
 
 
-class BatchViewSet(viewsets.ReadOnlyModelViewSet):
+class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     """
-    GET /api/batches/ — список партий с пагинацией.
+    GET/POST /api/batches/ — партии; POST — выпуск профиля (штуки × длина, смена, рецепт на 1 м).
     POST /api/batches/{id}/otk_accept/ — результат ОТК.
     """
     queryset = ProductionBatch.objects.select_related(
         'order', 'order__recipe', 'order__line', 'operator',
+        'profile', 'recipe', 'line', 'shift',
     ).prefetch_related('otk_checks__inspector').all()
     serializer_class = BatchListSerializer
-    permission_classes = [IsAdminOrHasAccess]
-    required_access_key = 'otk'
-    filterset_fields = ['otk_status', 'order']
+    permission_classes = [IsAdminOrHasProductionOrOtk]
+    filterset_fields = ['otk_status', 'order', 'line', 'profile']
     ordering_fields = ['id', 'date']
+    activity_section = 'Производство'
+    activity_label = 'партия'
+    activity_entity_model = ProductionBatch
 
     def get_serializer_class(self):
         if self.action in ('list', 'retrieve'):
             return BatchListSerializer
+        if self.action in ('create', 'update', 'partial_update'):
+            return ProductionBatchCreateUpdateSerializer
         return ProductionBatchSerializer
 
     @action(detail=True, methods=['post'], url_path='otk_accept')
@@ -634,11 +643,13 @@ class BatchViewSet(viewsets.ReadOnlyModelViewSet):
 
         q_step = Decimal('0.0001')
         sum_q = (accepted + rejected).quantize(q_step)
-        batch_q = Decimal(str(batch.quantity)).quantize(q_step)
-        if sum_q != batch_q:
-            return _err('validation_error',
-                        f'Принято + Брак должно равняться выпущенному количеству ({batch.quantity})',
-                        errors=[{'field': 'otk_accepted', 'message': f'Сумма должна быть {batch.quantity}'}])
+        batch_pieces = Decimal(str(batch.pieces))
+        if sum_q != batch_pieces:
+            return _err(
+                'validation_error',
+                f'Принято + Брак должно равняться числу штук партии ({batch.pieces})',
+                errors=[{'field': 'otk_accepted', 'message': f'Сумма должна быть {batch.pieces}'}],
+            )
 
         if rejected > 0 and not str(defect_reason).strip():
             return _err('validation_error', 'Причина брака обязательна при наличии брака',
@@ -679,10 +690,19 @@ class BatchViewSet(viewsets.ReadOnlyModelViewSet):
             checked_at = tz.now()
 
         with transaction.atomic():
+            otk_st = (
+                OtkCheck.STATUS_REJECTED if rejected > 0 and accepted == 0
+                else OtkCheck.STATUS_ACCEPTED
+            )
             check = OtkCheck.objects.create(
                 batch=batch,
+                profile_id=batch.profile_id,
+                pieces=int(batch.pieces),
+                length_per_piece=batch.length_per_piece,
+                total_meters=batch.total_meters,
                 accepted=accepted,
                 rejected=rejected,
+                check_status=otk_st,
                 reject_reason=defect_reason,
                 comment=comment,
                 inspector=inspector,
@@ -700,13 +720,17 @@ class BatchViewSet(viewsets.ReadOnlyModelViewSet):
                 if inspector:
                     ins_name = (getattr(inspector, 'name', None) or '')[:255]
                 WarehouseBatch.objects.create(
+                    profile_id=batch.profile_id,
                     product=batch.product,
                     quantity=accepted,
+                    length_per_piece=batch.length_per_piece,
+                    cost_per_piece=batch.cost_per_piece,
+                    cost_per_meter=batch.cost_per_meter,
                     status=WarehouseBatch.STATUS_AVAILABLE,
                     date=date.today(),
                     source_batch=batch,
                     inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
-                    unit_meters=batch.shift_height,
+                    unit_meters=batch.length_per_piece,
                     otk_accepted=accepted,
                     otk_defect=rejected,
                     otk_defect_reason=defect_reason or '',
@@ -715,7 +739,8 @@ class BatchViewSet(viewsets.ReadOnlyModelViewSet):
                     otk_checked_at=checked_at,
                     otk_status=batch.otk_status,
                 )
-            Order.objects.filter(pk=batch.order_id).update(status=Order.STATUS_DONE)
+            if batch.order_id:
+                Order.objects.filter(pk=batch.order_id).update(status=Order.STATUS_DONE)
 
         batch = ProductionBatch.objects.select_related(
             'order', 'operator'
@@ -1283,7 +1308,7 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
     with transaction.atomic():
         run_locked = RecipeRun.objects.select_for_update().select_related('recipe', 'line').get(pk=run.pk)
         if run_locked.production_batch_id:
-            batch = ProductionBatch.objects.select_for_update().select_related('order').get(
+            batch = ProductionBatch.objects.select_for_update().select_related('order', 'recipe').get(
                 pk=run_locked.production_batch_id
             )
             if batch.otk_status == ProductionBatch.OTK_PENDING:
@@ -1301,8 +1326,18 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                             'либо используйте output_scale к норме рецепта.'
                         ),
                     })
-                batch.quantity = qty
-                ufs = ['quantity']
+                old_tm = Decimal(str(batch.total_meters))
+                old_recipe = batch.recipe if batch.recipe_id else None
+                reverse_production_batch_stock(
+                    batch_id=batch.pk,
+                    recipe=old_recipe,
+                    total_meters=old_tm,
+                )
+                batch.pieces = 1
+                batch.length_per_piece = qty
+                batch.recompute_totals()
+                batch.quantity = batch.total_meters
+                ufs = ['pieces', 'length_per_piece', 'quantity', 'total_meters']
                 if run_locked.line and line_shift_is_open(run_locked.line):
                     _apply_shift_snapshot_to_batch(batch, run_locked.line)
                     ufs.extend([
@@ -1310,10 +1345,12 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                         'shift_opener_name', 'shift_opened_at',
                     ])
                 batch.save(update_fields=ufs)
-                order = batch.order
-                if order.quantity != qty:
-                    order.quantity = qty
-                    order.save(update_fields=['quantity'])
+                if batch.order_id:
+                    order = batch.order
+                    if order.quantity != qty:
+                        order.quantity = qty
+                        order.save(update_fields=['quantity'])
+                apply_production_batch_stock_and_cost(batch)
             return (
                 ProductionBatch.objects.select_related('order', 'operator')
                 .prefetch_related('otk_checks__inspector')
@@ -1358,18 +1395,44 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
             order_kwargs['recipe_name_snapshot'] = run_locked.recipe_name_snapshot or ''
             order_kwargs['former_recipe_id'] = run_locked.former_recipe_id
         order = Order.objects.create(**order_kwargs)
+        shift_open = None
+        if line is not None and operator is not None:
+            shift_open = (
+                Shift.objects.filter(
+                    user=operator,
+                    line=line,
+                    closed_at__isnull=True,
+                    status=Shift.STATUS_OPEN,
+                )
+                .order_by('-opened_at')
+                .first()
+            )
+        prof_id = None
+        rec_id = None
+        if recipe is not None:
+            rec_id = recipe.pk
+            prof_id = getattr(recipe, 'profile_id', None)
         batch = ProductionBatch(
             order=order,
+            profile_id=prof_id,
+            recipe_id=rec_id,
+            line=line,
+            shift=shift_open,
             product=product,
+            pieces=1,
+            length_per_piece=qty,
             quantity=qty,
+            total_meters=qty,
             operator=operator,
             date=now_d,
             otk_status=ProductionBatch.OTK_PENDING,
             cost_price=0,
+            material_cost_total=0,
         )
         _apply_shift_snapshot_to_batch(batch, line)
         batch.save()
         RecipeRun.objects.filter(pk=run_locked.pk).update(production_batch=batch)
+        apply_production_batch_stock_and_cost(batch)
 
     return (
         ProductionBatch.objects.select_related('order', 'operator')
@@ -1380,25 +1443,16 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
 
 class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     """
-    Учёт запусков по рецепту (партии + расход components). Списание сырья и химии — атомарно с POST/PATCH
-    состава (MaterialWriteoff reason=recipe_run, списание ChemistryStock); при PATCH сначала откат старых
-    движений, затем новый состав. ОТК и incoming здесь не участвуют.
+    Замес до партии ОТК: ёмкости и строки расхода (план/факт замеса). FIFO и себестоимость — у ProductionBatch.
 
-    POST   /api/chemistry/recipe-runs/ — партии ёмкостей (расход) + корневой quantity = выпуск для ОТК
-        (или норма output_quantity рецепта × output_scale); очередь ОТК (ProductionBatch pending).
-    POST   /api/chemistry/recipe-runs/{id}/submit-to-otk/ — то же правило объёма, не сумма по ёмкостям.
-    GET    список и деталка — production_batch_id, у партий полный components, рецепт с составом.
-    PATCH  — полный массив batches: существующие партии с тем же id и составом; новая без id; лишние id удаляются.
-        Важно: пересчёт списания сырья/химии выполняется только если в PATCH передан batches.
-        Любое изменение расхода по составу должно уходить именно так; иначе остатки не синхронизируются.
-        Пустой batches [] не поддерживается — удаляйте запуск целиком: DELETE (см. ниже).
-    DELETE — удаление запуска. Если есть партия ОТК в статусе pending — она и заказ удаляются вместе с запуском;
-        если ОТК уже принял/отклонил партию — 409.
+    POST   /api/production/recipe-runs/ — создать замес и поставить партию в очередь ОТК (норма × scale или quantity).
+    POST   /api/production/recipe-runs/{id}/submit-to-otk/ — создать/обновить партию pending.
+    PATCH  — состав ёмкостей (без движения остатков); при смене объёма ОТК используйте submit-to-otk или PATCH с quantity.
+    DELETE — при pending-партии: откат списания по партии, удаление партии и заказа.
     """
 
-    permission_classes = [IsAdminOrHasAccess]
-    required_access_key = 'chemistry'
-    activity_section = 'Химия'
+    permission_classes = [IsAdminOrHasProductionOrOtk]
+    activity_section = 'Производство'
     activity_label = 'запуск по рецепту'
     activity_entity_model = RecipeRun
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
@@ -1558,7 +1612,7 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         schedule_entity_audit(
             user=request.user,
             request=request,
-            section='Химия',
+            section='Производство',
             description=f'Отправка запуска #{run.pk} в ОТК (партия {batch.pk})',
             action='update',
             model_cls=RecipeRun,
@@ -1566,7 +1620,7 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             after=after_run,
             after_instance=run,
             payload_extra={
-                'endpoint': 'POST /api/chemistry/recipe-runs/{id}/submit-to-otk/',
+                'endpoint': 'POST /api/production/recipe-runs/{id}/submit-to-otk/',
                 'production_batch_id': batch.pk,
                 'already_had_batch': already,
             },
@@ -1574,23 +1628,24 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return Response(payload, status=status.HTTP_200_OK)
 
     def perform_destroy(self, instance):
-        from .recipe_run_stock import reverse_recipe_run_stock
-
         with transaction.atomic():
             run = (
                 RecipeRun.objects.select_for_update()
-                .select_related('production_batch', 'production_batch__order')
+                .select_related('production_batch', 'production_batch__order', 'production_batch__recipe')
                 .get(pk=instance.pk)
             )
-            if run.recipe_run_consumption_applied:
-                reverse_recipe_run_stock(run)
             pb = run.production_batch
             if pb is not None:
                 if pb.otk_status != ProductionBatch.OTK_PENDING:
                     raise RecipeRunDeleteConflict()
-                order = pb.order
+                reverse_production_batch_stock(
+                    batch_id=pb.pk,
+                    recipe=pb.recipe if pb.recipe_id else None,
+                    total_meters=Decimal(str(pb.total_meters)),
+                )
+                order_pk = pb.order_id
                 RecipeRun.objects.filter(pk=run.pk).update(production_batch_id=None)
                 ProductionBatch.objects.filter(pk=pb.pk).delete()
-                if not order.batches.exists():
-                    order.delete()
+                if order_pk and not Order.objects.filter(pk=order_pk).first().batches.exists():
+                    Order.objects.filter(pk=order_pk).delete()
         super().perform_destroy(instance)

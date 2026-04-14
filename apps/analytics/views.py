@@ -2,8 +2,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from calendar import monthrange
 
-from django.db import models
-from django.db.models import Sum, F, Count, Q
+from django.db.models import Sum, Count, Q
 from django.db.models.functions import TruncDate
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
@@ -15,12 +14,12 @@ from config.openapi_common import DiasErrorSerializer
 from config.permissions import IsAdminOrHasAccess
 from apps.sales.models import Sale, Shipment
 from apps.warehouse.models import WarehouseBatch
-from apps.materials.models import Incoming as MaterialIncoming, RawMaterial, MaterialWriteoff
+from apps.materials.models import MaterialBatch, RawMaterial, MaterialStockDeduction
 from apps.production.models import ProductionBatch, RecipeRun, Shift, ShiftComplaint
-from apps.chemistry.models import ChemistryStock, ChemistryTask
+from apps.chemistry.models import ChemistryBatch, ChemistryCatalog, ChemistryTask
 from apps.activity.models import UserActivity
 
-from .services import Period, parse_period, material_avg_unit_prices, estimate_writeoff_value
+from .services import Period, parse_period
 
 _ANALYTICS_PERIOD_PARAMS = [
     OpenApiParameter('year', int, required=False, description='Год периода (по умолчанию текущий).'),
@@ -47,9 +46,9 @@ _ANALYTICS_DETAILS_PERIOD_PARAMS = [
         },
         description=(
             'Крупный вложенный JSON: выручка, расходы, производство, смены, ОТК и т.д. '
-            'В **finances** для карточки «Списания сырья» (сумма за период, оценка по средней цене закупки): '
-            'каноническое поле **`writeoff_total`**; дубли для совместимости: `writeoffs`, `write_offs`, `material_writeoffs` '
-            '(все равны оценочной стоимости списаний, см. `material_flow.writeoffs.estimated_cost_by_avg_purchase_price`).'
+            'В **finances** для карточки «Списания сырья» (сумма за период, **фактическая стоимость FIFO**): '
+            'каноническое поле **`writeoff_total`**; дубли: `writeoffs`, `write_offs`, `material_writeoffs`. '
+            '`material_flow.writeoffs.fifo_cost_total` и `estimated_cost_by_avg_purchase_price` — сумма `line_total` по списаниям.'
         ),
     ),
 )
@@ -73,28 +72,28 @@ class AnalyticsSummaryView(viewsets.ViewSet):
 
         # --- Финансы (продажи vs закупки сырья) ---
         sales_data = Sale.objects.filter(date_filter_sales).aggregate(
-            revenue=Sum(F('quantity') * F('price'), output_field=models.DecimalField()),
+            revenue=Sum('revenue'),
             count=Count('id'),
             profit_sum=Sum('profit'),
         )
         total_revenue = float(sales_data['revenue'] or 0)
         profit_recorded = float(sales_data['profit_sum'] or 0)
 
-        expenses_data = MaterialIncoming.objects.filter(date_filter_incoming).aggregate(
-            expenses=Sum(F('quantity') * F('price_per_unit'), output_field=models.DecimalField()),
+        expenses_data = MaterialBatch.objects.filter(date_filter_incoming).aggregate(
+            expenses=Sum('total_price'),
             incoming_lines=Count('id'),
-            incoming_qty=Sum('quantity'),
+            incoming_qty=Sum('quantity_initial'),
         )
         total_expenses = float(expenses_data['expenses'] or 0)
         profit_simple = total_revenue - total_expenses
 
         cost_price_data = ProductionBatch.objects.filter(date_filter_batches).aggregate(
-            cost=Sum('cost_price'),
+            cost=Sum('material_cost_total'),
         )
         total_cost_price = float(cost_price_data['cost'] or 0)
 
         # --- Списания сырья за период ---
-        wo_qs = MaterialWriteoff.objects.filter(date_filter_writeoffs).select_related('material')
+        wo_qs = MaterialStockDeduction.objects.filter(date_filter_writeoffs).select_related('batch__material')
         wo_agg = wo_qs.aggregate(
             n=Count('id'),
             qty=Sum('quantity'),
@@ -105,12 +104,12 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             .order_by('-count')[:20]
         )
         wo_top_materials = list(
-            wo_qs.values('material__name', 'material__unit')
+            wo_qs.values('batch__material__name', 'batch__material__unit')
             .annotate(count=Count('id'), quantity=Sum('quantity'))
             .order_by('-quantity')[:15]
         )
-        prices = material_avg_unit_prices()
-        wo_value_est, wo_valued_lines = estimate_writeoff_value(wo_qs, prices)
+        wo_value_est = wo_qs.aggregate(s=Sum('line_total'))['s'] or Decimal('0')
+        wo_valued_lines = wo_qs.count()
         writeoff_finance_total = float(wo_value_est)
 
         # --- ОТК / производственные партии ---
@@ -139,18 +138,16 @@ class AnalyticsSummaryView(viewsets.ViewSet):
         shifts_closed = Shift.objects.filter(date_filter_shifts).exclude(closed_at__isnull=True).count()
         complaints_n = ShiftComplaint.objects.filter(date_filter_complaints).count()
 
-        # --- Химия: остатки и задания (выполненные за период по связи со списаниями) ---
-        chem_stock_rows = ChemistryStock.objects.filter(quantity__gt=0).select_related('chemistry')
-        chemistry_balance_total = sum(float(c.quantity or 0) for c in chem_stock_rows)
-
-        chem_task_ids = (
-            MaterialWriteoff.objects.filter(date_filter_writeoffs, reason='chemistry_task')
-            .exclude(reference_id__isnull=True)
-            .values_list('reference_id', flat=True)
-            .distinct()
+        # --- Химия: остатки (сумма по партиям) и выпуск по заданиям за период ---
+        chemistry_balance_total = float(
+            ChemistryBatch.objects.aggregate(s=Sum('quantity_remaining'))['s'] or 0
         )
+
+        date_filter_chem_batches = p.writeoff_q()  # created_at — те же границы периода
         chem_done_qty = (
-            ChemistryTask.objects.filter(id__in=chem_task_ids, status='done').aggregate(s=Sum('quantity'))['s']
+            ChemistryBatch.objects.filter(date_filter_chem_batches, source_task_id__isnull=False).aggregate(
+                s=Sum('quantity_produced')
+            )['s']
         )
 
         # --- Журнал: активность по разделам ---
@@ -173,7 +170,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             prod = row['product']
             agg = Sale.objects.filter(date_filter_sales, product=prod).aggregate(
                 qty=Sum('quantity'),
-                rev=Sum(F('quantity') * F('price'), output_field=models.DecimalField()),
+                rev=Sum('revenue'),
             )
             top_products_list.append({
                 'product_name': prod,
@@ -192,7 +189,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             cname = row['client__name']
             agg = Sale.objects.filter(date_filter_sales, client__name=cname).aggregate(
                 qty=Sum('quantity'),
-                rev=Sum(F('quantity') * F('price'), output_field=models.DecimalField()),
+                rev=Sum('revenue'),
             )
             top_clients_list.append({
                 'client_name': cname or '—',
@@ -205,20 +202,20 @@ class AnalyticsSummaryView(viewsets.ViewSet):
         # --- Поставщики ---
         top_suppliers_list = []
         top_suppliers_data = (
-            MaterialIncoming.objects.filter(date_filter_incoming)
-            .exclude(supplier='')
-            .values('supplier')
-            .annotate(quantity_sum=Sum('quantity'))
+            MaterialBatch.objects.filter(date_filter_incoming)
+            .exclude(supplier_name='')
+            .values('supplier_name')
+            .annotate(quantity_sum=Sum('quantity_initial'))
             .order_by('-quantity_sum')[:5]
         )
         for s in top_suppliers_data:
-            supplier_total = MaterialIncoming.objects.filter(
-                date_filter_incoming, supplier=s['supplier']
+            supplier_total = MaterialBatch.objects.filter(
+                date_filter_incoming, supplier_name=s['supplier_name']
             ).aggregate(
-                amount=Sum(F('quantity') * F('price_per_unit'), output_field=models.DecimalField())
+                amount=Sum('total_price')
             )
             top_suppliers_list.append({
-                'supplier': s['supplier'],
+                'supplier': s['supplier_name'],
                 'amount': float(supplier_total['amount'] or 0),
             })
 
@@ -227,24 +224,25 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             {
                 'product_name': x['product'],
                 'batches': x['batches'],
-                'quantity': float(x['quantity'] or 0),
+                'total_meters': float(x['tm'] or 0),
+                'pieces': float(x['pc'] or 0),
             }
             for x in ProductionBatch.objects.filter(date_filter_batches)
             .values('product')
-            .annotate(batches=Count('id'), quantity=Sum('quantity'))
-            .order_by('-quantity')[:10]
+            .annotate(batches=Count('id'), tm=Sum('total_meters'), pc=Sum('pieces'))
+            .order_by('-tm')[:10]
         ]
 
         production_by_line_list = [
             {
-                'line_name': x['order__line__name'],
+                'line_name': (x['line__name'] or '') or '—',
                 'batches': x['batches'],
-                'quantity': float(x['quantity'] or 0),
+                'total_meters': float(x['tm'] or 0),
             }
             for x in ProductionBatch.objects.filter(date_filter_batches)
-            .values('order__line__name')
-            .annotate(batches=Count('id'), quantity=Sum('quantity'))
-            .order_by('-quantity')
+            .values('line__name')
+            .annotate(batches=Count('id'), tm=Sum('total_meters'))
+            .order_by('-tm')
         ]
 
         batches_stats = ProductionBatch.objects.filter(date_filter_batches).aggregate(
@@ -279,10 +277,10 @@ class AnalyticsSummaryView(viewsets.ViewSet):
 
         # --- Остатки сырья (текущие) с порогом min_balance ---
         raw_materials_list = []
-        for m in RawMaterial.objects.all():
-            total_in = MaterialIncoming.objects.filter(material=m).aggregate(s=Sum('quantity'))['s'] or 0
-            total_out = MaterialWriteoff.objects.filter(material=m).aggregate(s=Sum('quantity'))['s'] or 0
-            balance = float(Decimal(str(total_in)) - Decimal(str(total_out)))
+        for m in RawMaterial.objects.filter(is_active=True):
+            balance = float(
+                MaterialBatch.objects.filter(material=m).aggregate(s=Sum('quantity_remaining'))['s'] or 0
+            )
             if balance <= 0:
                 continue
             min_b = m.min_balance
@@ -302,12 +300,15 @@ class AnalyticsSummaryView(viewsets.ViewSet):
 
         chemistry_list = [
             {
-                'name': c.chemistry.name,
-                'balance': float(c.quantity),
-                'unit': c.unit,
-                'low_stock': float(c.quantity) < 10,
+                'name': row.name,
+                'balance': float(row.bal or 0),
+                'unit': row.unit,
+                'low_stock': float(row.bal or 0) < 10,
             }
-            for c in ChemistryStock.objects.filter(quantity__gt=0).select_related('chemistry')
+            for row in ChemistryCatalog.objects.filter(is_active=True)
+            .annotate(bal=Sum('batches__quantity_remaining'))
+            .filter(bal__gt=0)
+            .order_by('name')
         ]
 
         # --- Тренды по дням (окно внутри выбранного месяца/года) ---
@@ -330,7 +331,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
             .order_by('date')
         ):
             day_revenue = Sale.objects.filter(date=d['date']).aggregate(
-                revenue=Sum(F('quantity') * F('price'), output_field=models.DecimalField())
+                revenue=Sum('revenue'),
             )
             daily_revenue_list.append({
                 'date': d['date'].strftime('%Y-%m-%d'),
@@ -340,32 +341,34 @@ class AnalyticsSummaryView(viewsets.ViewSet):
         daily_production_list = [
             {
                 'date': d['date'].strftime('%Y-%m-%d'),
-                'quantity': float(d['quantity'] or 0),
+                'total_meters': float(d['tm'] or 0),
             }
             for d in ProductionBatch.objects.filter(date__gte=start_date, date__lte=end_date)
             .values('date')
-            .annotate(quantity=Sum('quantity'))
+            .annotate(tm=Sum('total_meters'))
             .order_by('date')
         ]
 
         daily_expenses_list = []
         for d in (
-            MaterialIncoming.objects.filter(date__gte=start_date, date__lte=end_date)
-            .values('date')
-            .annotate(quantity_sum=Sum('quantity'))
-            .order_by('date')
+            MaterialBatch.objects.filter(received_at__date__gte=start_date, received_at__date__lte=end_date)
+            .annotate(day=TruncDate('received_at'))
+            .values('day')
+            .annotate(quantity_sum=Sum('quantity_initial'))
+            .order_by('day')
         ):
-            day_expense = MaterialIncoming.objects.filter(date=d['date']).aggregate(
-                expense=Sum(F('quantity') * F('price_per_unit'), output_field=models.DecimalField())
+            day_val = d['day']
+            day_expense = MaterialBatch.objects.filter(received_at__date=day_val).aggregate(
+                expense=Sum('total_price')
             )
             daily_expenses_list.append({
-                'date': d['date'].strftime('%Y-%m-%d'),
+                'date': day_val.strftime('%Y-%m-%d') if day_val else None,
                 'expense': float(day_expense['expense'] or 0),
             })
 
         daily_writeoffs_list = []
         for d in (
-            MaterialWriteoff.objects.filter(
+            MaterialStockDeduction.objects.filter(
                 created_at__date__gte=start_date,
                 created_at__date__lte=end_date,
             )
@@ -401,7 +404,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                     'profit / profit_simple = выручка − закупки сырья за период. '
                     'profit_recorded_in_sales = сумма поля profit в продажах. '
                     'cost_price = сумма cost_price партий ОТК с датой в периоде. '
-                    'writeoff_total = оценка стоимости списаний сырья за период (quantity × средневзвешенная цена закупки).'
+                    'writeoff_total = фактическая стоимость списаний (FIFO по партиям, сумма line_total).'
                 ),
             },
             'material_flow': {
@@ -423,13 +426,14 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                     ],
                     'top_materials': [
                         {
-                            'material_name': x['material__name'],
-                            'unit': x['material__unit'],
+                            'material_name': x['batch__material__name'],
+                            'unit': x['batch__material__unit'],
                             'count': x['count'],
                             'quantity': float(x['quantity'] or 0),
                         }
                         for x in wo_top_materials
                     ],
+                    'fifo_cost_total': float(wo_value_est),
                     'estimated_cost_by_avg_purchase_price': float(wo_value_est),
                     'lines_with_known_price': wo_valued_lines,
                 },
@@ -438,7 +442,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
                 'stock_positions_positive': len(chemistry_list),
                 'stock_quantity_sum': chemistry_balance_total,
                 'tasks_marked_done_linked_to_writeoffs_qty': float(chem_done_qty or 0),
-                'note': 'Списание сырья под химию — MaterialWriteoff с reason=chemistry_task; выпуск в остатки — confirm задания.',
+                'note': 'Выпуск химии — партии ChemistryBatch; сырьё списывается (FIFO) при produce/confirm.',
             },
             'sales': {
                 'total_count': sales_data['count'],
@@ -550,7 +554,7 @@ class AnalyticsRevenueDetailsView(viewsets.ViewSet):
         items = []
         total = Decimal('0')
         for sale in sales:
-            sale_total = (sale.quantity or 0) * (sale.price or 0)
+            sale_total = sale.revenue or Decimal('0')
             total += sale_total
             items.append({
                 'id': sale.id,
@@ -560,6 +564,8 @@ class AnalyticsRevenueDetailsView(viewsets.ViewSet):
                 'quantity': float(sale.quantity),
                 'price_per_unit': float(sale.price or 0),
                 'total': float(sale_total),
+                'revenue': float(sale.revenue or 0),
+                'cost': float(sale.cost or 0),
                 'profit': float(sale.profit or 0),
                 'warehouse_batch_id': sale.warehouse_batch_id,
             })
@@ -586,22 +592,29 @@ class AnalyticsExpenseDetailsView(viewsets.ViewSet):
         p = parse_period(request)
         date_filter = p.incoming_q()
 
-        incomings = MaterialIncoming.objects.filter(date_filter).select_related('material').order_by('-date', '-id')
+        incomings = MaterialBatch.objects.filter(date_filter).select_related('material').order_by('-received_at', '-id')
 
         items = []
         total = Decimal('0')
         for incoming in incomings:
-            incoming_total = (incoming.quantity or 0) * (incoming.price_per_unit or 0)
+            incoming_total = incoming.total_price or Decimal('0')
             total += incoming_total
             items.append({
                 'id': incoming.id,
-                'date': incoming.date.strftime('%Y-%m-%d'),
+                'date': incoming.received_at.date().strftime('%Y-%m-%d'),
+                'received_at': incoming.received_at.isoformat(),
+                'created_at': incoming.created_at.isoformat(),
                 'material_name': incoming.material.name,
-                'supplier': incoming.supplier or '',
-                'quantity': float(incoming.quantity),
+                'supplier_name': incoming.supplier_name or '',
+                'quantity': float(incoming.quantity_initial),
+                'quantity_initial': float(incoming.quantity_initial),
+                'quantity_remaining': float(incoming.quantity_remaining),
                 'unit': incoming.unit,
-                'price_per_unit': float(incoming.price_per_unit or 0),
+                'unit_price': float(incoming.unit_price or 0),
+                'price_per_unit': float(incoming.unit_price or 0),
                 'total': float(incoming_total),
+                'supplier_batch_number': incoming.supplier_batch_number or '',
+                'comment': incoming.comment or '',
                 'incoming_id': incoming.id,
             })
 
@@ -634,34 +647,33 @@ class AnalyticsWriteoffDetailsView(viewsets.ViewSet):
             raise DRFValidationError({'year': ['Обязательный query-параметр']})
         p = parse_period(request)
         qs = (
-            MaterialWriteoff.objects.filter(p.writeoff_q())
-            .select_related('material')
+            MaterialStockDeduction.objects.filter(p.writeoff_q())
+            .select_related('batch__material')
             .order_by('-created_at', '-id')
         )
-        prices = material_avg_unit_prices()
         items = []
         total_est = Decimal('0')
         for w in qs:
-            unit_price = prices.get(w.material_id)
-            line_est = (w.quantity or Decimal('0')) * unit_price if unit_price is not None else None
-            if line_est is not None:
-                total_est += line_est
+            line_est = w.line_total or Decimal('0')
+            total_est += line_est
             created = w.created_at
             date_str = created.date().isoformat() if created else None
-            ev = float(line_est) if line_est is not None else None
-            material_name = w.material.name
+            ev = float(line_est)
+            material_name = w.batch.material.name
             items.append({
                 'id': w.id,
+                'batch_id': w.batch_id,
                 'date': date_str,
                 'created_at': created.isoformat() if created else None,
                 'material_name': material_name,
                 'raw_material_name': material_name,
                 'name': material_name,
                 'quantity': float(w.quantity),
-                'unit': w.unit,
+                'unit': w.batch.material.unit,
                 'reason': w.reason or '',
                 'reference_id': w.reference_id,
                 'estimated_value': ev,
+                'fifo_line_total': ev,
                 'amount': ev,
                 'value': ev,
                 'cost': ev,
@@ -672,5 +684,5 @@ class AnalyticsWriteoffDetailsView(viewsets.ViewSet):
             'total': total_float,
             'total_estimated_value': total_float,
             'items': items,
-            'note': 'Стоимость оценочная: quantity × средневзвешенная цена закупки по всем приходам данного сырья.',
+            'note': 'Стоимость строки — фактическая (FIFO): line_total при списании с партии.',
         })

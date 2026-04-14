@@ -36,6 +36,21 @@ class CanAccessShiftComplaints(BasePermission):
         return 'my_shift' in keys or 'shifts' in keys
 
 
+class IsAdminOrHasProductionOrOtk(BasePermission):
+    """Список/деталка партий — otk или production; создание/изменение — production."""
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if getattr(request.user, 'is_superuser', False):
+            return True
+        keys = request.user.get_access_keys()
+        action = getattr(view, 'action', None)
+        if action in ('create', 'update', 'partial_update', 'destroy'):
+            return 'production' in keys
+        return 'otk' in keys or 'production' in keys
+
+
 class IsAdminOrHasAccess(BasePermission):
     """Суперпользователь или наличие access_key."""
     def __init__(self, access_key=None):

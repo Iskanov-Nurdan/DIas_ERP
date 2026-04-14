@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import models
 from django.conf import settings
 
@@ -166,13 +168,62 @@ class ProductionBatch(models.Model):
         (OTK_REJECTED, 'Брак'),
     ]
 
-    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name='batches')
-    product = models.CharField('Продукт', max_length=255)
-    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4)
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.PROTECT,
+        related_name='batches',
+        null=True,
+        blank=True,
+    )
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.PROTECT,
+        related_name='production_batches',
+        null=True,
+        blank=True,
+        verbose_name='Профиль',
+    )
+    recipe = models.ForeignKey(
+        'recipes.Recipe',
+        on_delete=models.PROTECT,
+        related_name='production_batches',
+        null=True,
+        blank=True,
+    )
+    line = models.ForeignKey(
+        Line,
+        on_delete=models.PROTECT,
+        related_name='production_batches',
+        null=True,
+        blank=True,
+    )
+    shift = models.ForeignKey(
+        'production.Shift',
+        on_delete=models.PROTECT,
+        related_name='production_batches',
+        null=True,
+        blank=True,
+        verbose_name='Смена',
+    )
+    product = models.CharField('Продукт (наименование)', max_length=255)
+    pieces = models.PositiveIntegerField('Штук', default=1)
+    length_per_piece = models.DecimalField('Длина штуки, м', max_digits=14, decimal_places=4, default=1)
+    total_meters = models.DecimalField('Всего метров', max_digits=16, decimal_places=4, default=0)
+    quantity = models.DecimalField(
+        'Количество (legacy = total_meters)',
+        max_digits=14,
+        decimal_places=4,
+        default=0,
+    )
     operator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='production_batches')
     date = models.DateField('Дата')
+    produced_at = models.DateTimeField('Произведено', null=True, blank=True)
+    comment = models.TextField('Комментарий', blank=True)
     otk_status = models.CharField('Статус ОТК', max_length=20, choices=OTK_STATUS_CHOICES, default=OTK_PENDING)
-    cost_price = models.DecimalField('Себестоимость', max_digits=14, decimal_places=2, default=0)
+    cost_price = models.DecimalField('Себестоимость (legacy)', max_digits=14, decimal_places=2, default=0)
+    material_cost_total = models.DecimalField('Материальная себестоимость', max_digits=16, decimal_places=2, default=0)
+    cost_per_meter = models.DecimalField('Себестоимость за м', max_digits=16, decimal_places=4, default=0)
+    cost_per_piece = models.DecimalField('Себестоимость за шт', max_digits=16, decimal_places=4, default=0)
     shift_height = models.DecimalField('Смена: высота', max_digits=10, decimal_places=2, null=True, blank=True)
     shift_width = models.DecimalField('Смена: ширина', max_digits=10, decimal_places=2, null=True, blank=True)
     shift_angle_deg = models.DecimalField('Смена: угол °', max_digits=8, decimal_places=2, null=True, blank=True)
@@ -185,13 +236,39 @@ class ProductionBatch(models.Model):
         verbose_name_plural = 'Партии производства'
         ordering = ['-date', '-id']
 
+    def recompute_totals(self):
+        p = int(self.pieces or 0)
+        l = Decimal(str(self.length_per_piece or 0))
+        self.total_meters = (Decimal(p) * l).quantize(Decimal('0.0001'))
+        self.quantity = self.total_meters
+
+    def save(self, *args, **kwargs):
+        self.recompute_totals()
+        if self.material_cost_total is not None and self.total_meters and self.total_meters > 0:
+            tm = Decimal(str(self.total_meters))
+            self.cost_per_meter = (Decimal(str(self.material_cost_total)) / tm).quantize(Decimal('0.0001'))
+        else:
+            self.cost_per_meter = Decimal('0')
+        if self.material_cost_total is not None and self.pieces and self.pieces > 0:
+            self.cost_per_piece = (Decimal(str(self.material_cost_total)) / Decimal(int(self.pieces))).quantize(Decimal('0.0001'))
+        else:
+            self.cost_per_piece = Decimal('0')
+        self.cost_price = self.material_cost_total
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f'{self.product} — {self.quantity} ({self.get_otk_status_display()})'
+        return f'{self.product} — {self.pieces}×{self.length_per_piece} м ({self.get_otk_status_display()})'
 
 
 class Shift(models.Model):
     STATUS_OPEN = 'open'
+    STATUS_PAUSED = 'paused'
     STATUS_CLOSED = 'closed'
+    STATUS_CHOICES = [
+        (STATUS_OPEN, 'Открыта'),
+        (STATUS_PAUSED, 'На паузе'),
+        (STATUS_CLOSED, 'Закрыта'),
+    ]
 
     line = models.ForeignKey(
         Line,
@@ -217,6 +294,13 @@ class Shift(models.Model):
     )
     opened_at = models.DateTimeField('Начало смены')
     closed_at = models.DateTimeField('Конец смены', null=True, blank=True)
+    status = models.CharField(
+        'Статус',
+        max_length=10,
+        choices=STATUS_CHOICES,
+        default=STATUS_OPEN,
+        db_index=True,
+    )
     comment = models.TextField('Итоговый комментарий', blank=True)
 
     class Meta:
@@ -243,11 +327,9 @@ class Shift(models.Model):
             ),
         ]
 
-    @property
-    def status(self):
-        return self.STATUS_CLOSED if self.closed_at else self.STATUS_OPEN
-
     def save(self, *args, **kwargs):
+        if self.closed_at is not None and self.status != self.STATUS_CLOSED:
+            self.status = self.STATUS_CLOSED
         if self.line_id:
             try:
                 ln = Line.objects.get(pk=self.line_id)
@@ -327,10 +409,9 @@ class ShiftNote(models.Model):
 
 class RecipeRun(models.Model):
     """
-    Запуск производства по рецепту (несколько партий/ёмкостей, привязка к линии).
+    Подготовка замеса до партии ОТК: ёмкости и фактический расход по строкам (для учёта/экрана).
 
-    Списание сырья (MaterialWriteoff) и расход остатков химии (ChemistryStock) выполняются
-    на бэке при POST/PATCH состава партий; отдельного вызова «списать» с фронта нет.
+    Реальное FIFO-списание и себестоимость — только у связанной ProductionBatch (см. batch_stock).
     """
 
     recipe = models.ForeignKey(
@@ -371,7 +452,7 @@ class RecipeRun(models.Model):
         verbose_name='Партия ОТК',
     )
     recipe_run_consumption_applied = models.BooleanField(
-        'Списание по составу замеса применено',
+        'Устарело: раньше помечало списание по замесу (не используется)',
         default=False,
         db_index=True,
     )

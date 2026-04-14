@@ -1,17 +1,18 @@
 import django_filters
 
-from .models import Incoming
+from .models import MaterialBatch
 
 
-class IncomingFilter(django_filters.FilterSet):
+class MaterialBatchFilter(django_filters.FilterSet):
     """
-    Точный отбор по сырью: material_id или алиас material (оба — id сырья).
-    GET /incoming/?material_id=1 или ?material=1
+    GET /incoming/?material_id=1
+    Дата прихода: received_at (диапазон).
     """
 
     material_id = django_filters.NumberFilter(field_name='material_id')
     material = django_filters.NumberFilter(field_name='material_id')
+    received_at = django_filters.DateFromToRangeFilter(field_name='received_at')
 
     class Meta:
-        model = Incoming
-        fields = ('date',)
+        model = MaterialBatch
+        fields = ('material_id', 'received_at')

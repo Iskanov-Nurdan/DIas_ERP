@@ -5,8 +5,8 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from apps.activity.models import UserActivity
-from apps.chemistry.models import ChemistryStock, ChemistryTask
-from apps.materials.models import Incoming, MaterialWriteoff, RawMaterial
+from apps.chemistry.models import ChemistryBatch, ChemistryCatalog, ChemistryStockDeduction, ChemistryTask
+from apps.materials.models import MaterialBatch, MaterialStockDeduction, RawMaterial
 from apps.production.models import (
     Line,
     LineHistory,
@@ -18,6 +18,7 @@ from apps.production.models import (
     ShiftComplaint,
     ShiftNote,
 )
+from apps.recipes.models import Recipe, RecipeComponent
 from apps.sales.models import Sale
 from apps.warehouse.models import WarehouseBatch
 
@@ -175,8 +176,8 @@ def production_batch_deleted(sender, instance, **kwargs):
     schedule_push(resource='production_batch', action='deleted', entity_id=instance.pk)
 
 
-@receiver(post_save, sender=Incoming)
-def incoming_saved(sender, instance, created, **kwargs):
+@receiver(post_save, sender=MaterialBatch)
+def material_batch_saved(sender, instance, created, **kwargs):
     schedule_push(
         resource='incoming',
         action=_act(created),
@@ -184,29 +185,61 @@ def incoming_saved(sender, instance, created, **kwargs):
         extra={'material_id': instance.material_id},
     )
     schedule_push(resource='material_balance', action='changed', extra={'material_id': instance.material_id})
+    schedule_push(
+        resource='material_movement',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'material_id': instance.material_id, 'batch_id': instance.pk},
+    )
 
 
-@receiver(post_delete, sender=Incoming)
-def incoming_deleted(sender, instance, **kwargs):
+@receiver(post_delete, sender=MaterialBatch)
+def material_batch_deleted(sender, instance, **kwargs):
     schedule_push(resource='incoming', action='deleted', entity_id=instance.pk, extra={'material_id': instance.material_id})
     schedule_push(resource='material_balance', action='changed', extra={'material_id': instance.material_id})
+    schedule_push(
+        resource='material_movement',
+        action='deleted',
+        entity_id=instance.pk,
+        extra={'material_id': instance.material_id, 'batch_id': instance.pk},
+    )
 
 
-@receiver(post_save, sender=MaterialWriteoff)
-def writeoff_saved(sender, instance, created, **kwargs):
+@receiver(post_save, sender=MaterialStockDeduction)
+def material_deduction_saved(sender, instance, created, **kwargs):
+    mid = instance.batch.material_id if instance.batch_id else None
     schedule_push(
         resource='material_writeoff',
         action=_act(created),
         entity_id=instance.pk,
-        extra={'material_id': instance.material_id, 'reason': instance.reason or ''},
+        extra={'material_id': mid, 'reason': instance.reason or ''},
     )
-    schedule_push(resource='material_balance', action='changed', extra={'material_id': instance.material_id})
+    if mid is not None:
+        schedule_push(resource='material_balance', action='changed', extra={'material_id': mid})
+    schedule_push(
+        resource='material_movement',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={
+            'material_id': mid,
+            'batch_id': instance.batch_id,
+            'reason': instance.reason or '',
+        },
+    )
 
 
-@receiver(post_delete, sender=MaterialWriteoff)
-def writeoff_deleted(sender, instance, **kwargs):
-    schedule_push(resource='material_writeoff', action='deleted', entity_id=instance.pk, extra={'material_id': instance.material_id})
-    schedule_push(resource='material_balance', action='changed', extra={'material_id': instance.material_id})
+@receiver(post_delete, sender=MaterialStockDeduction)
+def material_deduction_deleted(sender, instance, **kwargs):
+    mid = instance.batch.material_id if instance.batch_id else None
+    schedule_push(resource='material_writeoff', action='deleted', entity_id=instance.pk, extra={'material_id': mid})
+    if mid is not None:
+        schedule_push(resource='material_balance', action='changed', extra={'material_id': mid})
+    schedule_push(
+        resource='material_movement',
+        action='deleted',
+        entity_id=instance.pk,
+        extra={'material_id': mid, 'batch_id': instance.batch_id},
+    )
 
 
 @receiver(post_save, sender=RawMaterial)
@@ -217,6 +250,20 @@ def raw_material_saved(sender, instance, created, **kwargs):
 @receiver(post_delete, sender=RawMaterial)
 def raw_material_deleted(sender, instance, **kwargs):
     schedule_push(resource='raw_material', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=ChemistryCatalog)
+def chemistry_catalog_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='chemistry_element', action=_act(created), entity_id=instance.pk)
+    schedule_push(resource='chemistry', action=_act(created), entity_id=instance.pk)
+    schedule_push(resource='chemistry_balance', action='changed', extra={'chemistry_id': instance.pk})
+
+
+@receiver(post_delete, sender=ChemistryCatalog)
+def chemistry_catalog_deleted(sender, instance, **kwargs):
+    schedule_push(resource='chemistry_element', action='deleted', entity_id=instance.pk)
+    schedule_push(resource='chemistry', action='deleted', entity_id=instance.pk)
+    schedule_push(resource='chemistry_balance', action='changed', extra={'chemistry_id': instance.pk})
 
 
 @receiver(post_save, sender=ChemistryTask)
@@ -234,8 +281,14 @@ def chemistry_task_deleted(sender, instance, **kwargs):
     schedule_push(resource='chemistry_task', action='deleted', entity_id=instance.pk)
 
 
-@receiver(post_save, sender=ChemistryStock)
-def chemistry_stock_saved(sender, instance, created, **kwargs):
+@receiver(post_save, sender=ChemistryBatch)
+def chemistry_batch_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='chemistry_batch',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'chemistry_id': instance.chemistry_id},
+    )
     schedule_push(
         resource='chemistry_balance',
         action='changed',
@@ -244,14 +297,57 @@ def chemistry_stock_saved(sender, instance, created, **kwargs):
     )
 
 
-@receiver(post_delete, sender=ChemistryStock)
-def chemistry_stock_deleted(sender, instance, **kwargs):
+@receiver(post_delete, sender=ChemistryBatch)
+def chemistry_batch_deleted(sender, instance, **kwargs):
+    schedule_push(
+        resource='chemistry_batch',
+        action='deleted',
+        entity_id=instance.pk,
+        extra={'chemistry_id': instance.chemistry_id},
+    )
     schedule_push(
         resource='chemistry_balance',
         action='deleted',
         entity_id=instance.pk,
         extra={'chemistry_id': instance.chemistry_id},
     )
+
+
+@receiver(post_save, sender=ChemistryStockDeduction)
+def chemistry_deduction_saved(sender, instance, created, **kwargs):
+    cid = instance.batch.chemistry_id if instance.batch_id else None
+    schedule_push(resource='chemistry_balance', action='changed', extra={'chemistry_id': cid})
+
+
+@receiver(post_delete, sender=ChemistryStockDeduction)
+def chemistry_deduction_deleted(sender, instance, **kwargs):
+    cid = instance.batch.chemistry_id if instance.batch_id else None
+    schedule_push(resource='chemistry_balance', action='changed', extra={'chemistry_id': cid})
+
+
+@receiver(post_save, sender=Recipe)
+def recipe_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='recipe', action=_act(created), entity_id=instance.pk)
+    schedule_push(resource='recipes', action='changed', extra={'recipe_id': instance.pk})
+
+
+@receiver(post_delete, sender=Recipe)
+def recipe_deleted(sender, instance, **kwargs):
+    schedule_push(resource='recipe', action='deleted', entity_id=instance.pk)
+    schedule_push(resource='recipes', action='changed', extra={'recipe_id': instance.pk})
+
+
+@receiver(post_save, sender=RecipeComponent)
+def recipe_component_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='recipe', action='updated', entity_id=instance.recipe_id)
+    schedule_push(resource='recipes', action='changed', extra={'recipe_id': instance.recipe_id})
+
+
+@receiver(post_delete, sender=RecipeComponent)
+def recipe_component_deleted(sender, instance, **kwargs):
+    rid = instance.recipe_id
+    schedule_push(resource='recipe', action='updated', entity_id=rid)
+    schedule_push(resource='recipes', action='changed', extra={'recipe_id': rid})
 
 
 @receiver(post_save, sender=WarehouseBatch)

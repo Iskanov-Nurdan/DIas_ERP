@@ -2,16 +2,17 @@ from decimal import Decimal
 from typing import Optional
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import transaction
 from rest_framework import serializers
 
 from config.decimal_format import format_decimal_plain
 from config.fields import CleanDecimalField
 
 from apps.accounts.models import User
-from apps.recipes.models import Recipe, RecipeComponent
+from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
 from apps.recipes.serializers import RecipeSerializer
 from config.exceptions import LineShiftPausedForRecipeRun
-from .recipe_run_stock import apply_recipe_run_stock, reverse_recipe_run_stock
+from .batch_stock import apply_production_batch_stock_and_cost, reverse_production_batch_stock
 from .shift_state import (
     line_current_shift_open_event,
     line_current_shift_params_event,
@@ -33,10 +34,12 @@ from .models import (
 
 
 def _recipe_display_name(obj) -> Optional[str]:
-    """Человекочитаемое имя рецепта (Order / RecipeRun): живой FK или снимок."""
+    """Человекочитаемое имя рецепта (Order / RecipeRun / ProductionBatch): живой FK или снимок."""
     if getattr(obj, 'recipe_id', None):
         try:
-            return (obj.recipe.recipe or '').strip() or None
+            n = (obj.recipe.recipe or '').strip()
+            if n:
+                return n
         except ObjectDoesNotExist:
             pass
     snap = (getattr(obj, 'recipe_name_snapshot', None) or '').strip()
@@ -77,11 +80,11 @@ def _recipe_run_display_recipe(run) -> Optional[str]:
 
 
 def _recipe_run_release_qty_decimal(obj) -> Optional[Decimal]:
-    """Выпуск для ОТК: quantity партии производства, иначе норма рецепта (не сумма ёмкостей)."""
+    """Выпуск для ОТК: total_meters партии, иначе норма рецепта (не сумма ёмкостей)."""
     if getattr(obj, 'production_batch_id', None):
         try:
             pb = obj.production_batch
-            return Decimal(str(pb.quantity))
+            return Decimal(str(pb.total_meters))
         except ObjectDoesNotExist:
             pass
     if getattr(obj, 'recipe_id', None):
@@ -212,7 +215,6 @@ class ShiftNoteSerializer(serializers.ModelSerializer):
 
 
 class ShiftSerializer(serializers.ModelSerializer):
-    status = serializers.SerializerMethodField()
     user_name = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
     line_label = serializers.SerializerMethodField()
@@ -237,9 +239,6 @@ class ShiftSerializer(serializers.ModelSerializer):
             except ObjectDoesNotExist:
                 return None
         return None
-
-    def get_status(self, obj):
-        return obj.status
 
     def get_line_name(self, obj):
         return _line_display_name(obj)
@@ -405,8 +404,125 @@ class ProductionBatchSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductionBatch
-        fields = ('id', 'order', 'order_product', 'product', 'quantity', 'operator', 'date', 'otk_status')
+        fields = (
+            'id', 'order', 'order_product', 'profile', 'recipe', 'line', 'shift',
+            'product', 'pieces', 'length_per_piece', 'total_meters', 'quantity',
+            'operator', 'date', 'produced_at', 'comment', 'otk_status',
+            'material_cost_total', 'cost_per_meter', 'cost_per_piece',
+        )
         extra_kwargs = {'operator': {'allow_null': True}}
+
+
+class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
+    """Создание/правка партии профиля: total_meters только с сервера."""
+
+    total_meters = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True)
+
+    class Meta:
+        model = ProductionBatch
+        fields = (
+            'id', 'profile', 'recipe', 'line', 'product',
+            'pieces', 'length_per_piece', 'total_meters',
+            'date', 'produced_at', 'comment',
+        )
+        extra_kwargs = {
+            'product': {'required': False, 'allow_blank': True},
+            'produced_at': {'required': False, 'allow_null': True},
+        }
+
+    def validate(self, attrs):
+        request = self.context['request']
+        user = request.user
+        line = attrs.get('line')
+        if line is None and self.instance is not None:
+            line = self.instance.line
+        if line is None:
+            raise serializers.ValidationError({'line': 'Укажите линию'})
+
+        shift = Shift.objects.filter(
+            user=user,
+            line=line,
+            closed_at__isnull=True,
+            status=Shift.STATUS_OPEN,
+        ).first()
+        if not shift:
+            raise serializers.ValidationError(
+                {'shift': 'Нет активной открытой смены на этой линии (не на паузе и не закрыта).'},
+            )
+        if shift.line_id and line is not None and shift.line_id != line.pk:
+            raise serializers.ValidationError({'line': 'Смена привязана к другой линии'})
+
+        profile = attrs.get('profile')
+        if profile is None and self.instance is not None:
+            profile = self.instance.profile
+        recipe = attrs.get('recipe')
+        if recipe is None and self.instance is not None:
+            recipe = self.instance.recipe
+        if profile is None or recipe is None:
+            raise serializers.ValidationError({'profile': 'Нужны profile и recipe'})
+        if recipe.profile_id and recipe.profile_id != profile.pk:
+            raise serializers.ValidationError({'recipe': 'Рецепт не относится к выбранному профилю'})
+        if not recipe.components.exists():
+            raise serializers.ValidationError({'recipe': 'У рецепта нет компонентов'})
+
+        pieces = attrs.get('pieces', getattr(self.instance, 'pieces', None))
+        length = attrs.get('length_per_piece', getattr(self.instance, 'length_per_piece', None))
+        if pieces is not None and int(pieces) <= 0:
+            raise serializers.ValidationError({'pieces': 'Должно быть > 0'})
+        if length is not None and Decimal(str(length)) <= 0:
+            raise serializers.ValidationError({'length_per_piece': 'Должно быть > 0'})
+
+        attrs['_shift'] = shift
+        return attrs
+
+    def create(self, validated_data):
+        from django.utils import timezone
+
+        shift = validated_data.pop('_shift')
+        validated_data['shift'] = shift
+        validated_data['operator'] = self.context['request'].user
+        prof = validated_data['profile']
+        if not (validated_data.get('product') or '').strip():
+            validated_data['product'] = (prof.name or '')[:255]
+        if validated_data.get('date') is None:
+            validated_data['date'] = timezone.now().date()
+        if validated_data.get('produced_at') is None:
+            validated_data['produced_at'] = timezone.now()
+        validated_data['otk_status'] = ProductionBatch.OTK_PENDING
+        with transaction.atomic():
+            batch = ProductionBatch.objects.create(**validated_data)
+            apply_production_batch_stock_and_cost(batch)
+        return batch
+
+    def update(self, instance, validated_data):
+        if RecipeRun.objects.filter(production_batch=instance).exists():
+            raise serializers.ValidationError(
+                {'non_field_errors': 'Партия связана с замесом (recipe-run): изменение состава через замес.'},
+            )
+        if instance.otk_status != ProductionBatch.OTK_PENDING:
+            raise serializers.ValidationError({'otk_status': 'Можно менять только партию в статусе «ожидает ОТК»'})
+
+        shift = validated_data.pop('_shift', None)
+        if shift is not None:
+            validated_data['shift'] = shift
+
+        old_recipe = instance.recipe
+        old_tm = Decimal(str(instance.total_meters))
+
+        with transaction.atomic():
+            reverse_production_batch_stock(
+                batch_id=instance.pk,
+                recipe=old_recipe,
+                total_meters=old_tm,
+            )
+            for k, v in validated_data.items():
+                setattr(instance, k, v)
+            prof = instance.profile
+            if prof and not (getattr(instance, 'product', None) or '').strip():
+                instance.product = (prof.name or '')[:255]
+            instance.save()
+            apply_production_batch_stock_and_cost(instance)
+        return instance
 
 
 class BatchListSerializer(serializers.ModelSerializer):
@@ -416,9 +532,9 @@ class BatchListSerializer(serializers.ModelSerializer):
     otk_defect_reason, otk_comment, otk_inspector, otk_checked_at.
     Дополнительно: recipe_name, recipe_output_quantity (норма по рецепту, справочно для ОТК).
     """
-    order_name = serializers.CharField(source='order.product', read_only=True)
+    order_name = serializers.SerializerMethodField()
     product_name = serializers.CharField(source='product', read_only=True)
-    released = serializers.DecimalField(source='quantity', max_digits=14, decimal_places=4, read_only=True)
+    released = serializers.DecimalField(source='total_meters', max_digits=14, decimal_places=4, read_only=True)
     operator_name = serializers.SerializerMethodField()
     created_at = serializers.DateField(source='date', read_only=True)
     otk_accepted = serializers.SerializerMethodField()
@@ -443,19 +559,30 @@ class BatchListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionBatch
         fields = (
-            'id', 'order', 'order_name', 'product', 'product_name', 'quantity', 'released',
+            'id', 'order', 'order_name', 'profile', 'recipe', 'line', 'shift',
+            'product', 'product_name', 'pieces', 'length_per_piece', 'total_meters',
+            'quantity', 'released',
             'operator', 'operator_name', 'date', 'created_at',
             'otk_status', 'otk_status_display', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
             'otk_comment', 'otk_inspector', 'otk_checked_at',
             'recipe_name', 'recipe_label', 'recipe_name_snapshot', 'former_recipe_id',
             'recipe_output_quantity', 'recipe_output_unit_kind',
             'line_name', 'line_label', 'height', 'width', 'angle_deg',
+            'material_cost_total', 'cost_per_meter', 'cost_per_piece',
         )
 
     def _last_check(self, obj):
         if not hasattr(obj, '_last_otk_check'):
             obj._last_otk_check = obj.otk_checks.select_related('inspector').order_by('-checked_date').first()
         return obj._last_otk_check
+
+    def get_order_name(self, obj):
+        if not obj.order_id:
+            return None
+        try:
+            return obj.order.product
+        except ObjectDoesNotExist:
+            return None
 
     def get_operator_name(self, obj):
         return obj.operator.name if obj.operator_id else None
@@ -487,6 +614,8 @@ class BatchListSerializer(serializers.ModelSerializer):
         return None
 
     def get_recipe_name(self, obj):
+        if getattr(obj, 'recipe_id', None):
+            return _recipe_display_name(obj)
         if not obj.order_id:
             return None
         return _recipe_display_name(obj.order)
@@ -495,33 +624,56 @@ class BatchListSerializer(serializers.ModelSerializer):
         return self.get_recipe_name(obj)
 
     def get_recipe_name_snapshot(self, obj):
+        if getattr(obj, 'recipe_id', None):
+            try:
+                return (obj.recipe.recipe or '').strip() or None
+            except ObjectDoesNotExist:
+                pass
         if not obj.order_id:
             return None
         return obj.order.recipe_name_snapshot or None
 
     def get_former_recipe_id(self, obj):
+        if getattr(obj, 'recipe_id', None):
+            return None
         if not obj.order_id:
             return None
         return obj.order.former_recipe_id
 
     def get_recipe_output_quantity(self, obj):
-        if not obj.order_id or not getattr(obj.order, 'recipe_id', None):
+        rec = None
+        if getattr(obj, 'recipe_id', None):
+            try:
+                rec = obj.recipe
+            except ObjectDoesNotExist:
+                rec = None
+        elif obj.order_id and getattr(obj.order, 'recipe_id', None):
+            try:
+                rec = obj.order.recipe
+            except ObjectDoesNotExist:
+                rec = None
+        if rec is None:
             return None
-        try:
-            rq = obj.order.recipe.output_quantity
-            if rq is not None:
-                return format_decimal_plain(rq)
-        except ObjectDoesNotExist:
-            pass
+        rq = getattr(rec, 'output_quantity', None)
+        if rq is not None:
+            return format_decimal_plain(rq)
         return None
 
     def get_recipe_output_unit_kind(self, obj):
-        if not obj.order_id or not getattr(obj.order, 'recipe_id', None):
+        rec = None
+        if getattr(obj, 'recipe_id', None):
+            try:
+                rec = obj.recipe
+            except ObjectDoesNotExist:
+                rec = None
+        elif obj.order_id and getattr(obj.order, 'recipe_id', None):
+            try:
+                rec = obj.order.recipe
+            except ObjectDoesNotExist:
+                rec = None
+        if rec is None:
             return None
-        try:
-            return obj.order.recipe.output_unit_kind
-        except ObjectDoesNotExist:
-            return None
+        return getattr(rec, 'output_unit_kind', None)
 
     def get_otk_status_display(self, obj):
         return obj.get_otk_status_display()
@@ -536,6 +688,8 @@ class BatchListSerializer(serializers.ModelSerializer):
         return float(obj.shift_angle_deg) if obj.shift_angle_deg is not None else None
 
     def get_line_name(self, obj):
+        if getattr(obj, 'line_id', None):
+            return _line_display_name(obj)
         if not obj.order_id:
             return None
         return _line_display_name(obj.order)
@@ -1035,14 +1189,13 @@ class RecipeRunWriteSerializer(serializers.Serializer):
             if not raw_batches:
                 raise serializers.ValidationError({'batches': 'Нужна хотя бы одна партия'})
         elif 'batches' in self.initial_data:
-            # При передаче batches списание сырья/химии пересчитывается (reverse + apply).
-            # Без ключа batches в PATCH расход и остатки не трогаются — менять состав только через batches.
+            # Состав ёмкостей — только план замеса; остатки не меняются (списание у ProductionBatch).
             raw_batches = self.initial_data.get('batches')
             if not raw_batches:
                 raise serializers.ValidationError({
                     'batches': (
                         'Нужна хотя бы одна партия. Чтобы убрать все партии, удалите запуск: '
-                        'DELETE /api/chemistry/recipe-runs/{id}/'
+                        'DELETE /api/production/recipe-runs/{id}/'
                     ),
                 })
 
@@ -1078,7 +1231,6 @@ class RecipeRunWriteSerializer(serializers.Serializer):
             line=validated_data['line'],
         )
         self._create_batches(run, batches_data)
-        apply_recipe_run_stock(run)
         return run
 
     def update(self, instance, validated_data):
@@ -1089,9 +1241,7 @@ class RecipeRunWriteSerializer(serializers.Serializer):
             instance.line = validated_data['line']
         instance.save()
         if batches_data is not None:
-            reverse_recipe_run_stock(instance)
             self._sync_batches(instance, batches_data)
-            apply_recipe_run_stock(instance)
         return instance
 
     def _create_batches(self, run, batches_data):

@@ -100,10 +100,14 @@ class SaleSerializer(serializers.ModelSerializer):
         model = Sale
         fields = (
             'id', 'order_number', 'client', 'client_name', 'warehouse_batch', 'warehouse_batch_id',
-            'product', 'quantity', 'quantity_input', 'quantity_unit', 'price', 'date', 'comment',
+            'product', 'quantity', 'sale_mode', 'sold_pieces', 'sold_packages',
+            'length_per_piece', 'total_meters',
+            'quantity_input', 'quantity_unit', 'price', 'revenue', 'cost', 'date', 'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
         )
-        read_only_fields = ('profit', 'inventory_form', 'quantity_unit', 'warehouse_batch_id')
+        read_only_fields = (
+            'profit', 'revenue', 'cost', 'total_meters', 'inventory_form', 'quantity_unit', 'warehouse_batch_id',
+        )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
         }
@@ -132,6 +136,8 @@ class SaleSerializer(serializers.ModelSerializer):
             qu = data.get('quantity_unit')
             if (su is None or str(su).strip() == '') and qu is not None and str(qu).strip() != '':
                 data['sale_unit'] = qu
+            if data.get('sold_pieces') in (None, '') and data.get('quantity') not in (None, ''):
+                data['sold_pieces'] = data.get('quantity')
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -150,7 +156,19 @@ class SaleSerializer(serializers.ModelSerializer):
         if 'sale_unit' in attrs:
             attrs['sale_unit'] = _normalize_sale_unit(attrs['sale_unit'])
 
+        mode = attrs.get('sale_mode') or (self.instance.sale_mode if self.instance else Sale.MODE_PIECES)
+        if mode not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+            mode = Sale.MODE_PIECES
+        attrs['sale_mode'] = mode
+
         wb = attrs.get('warehouse_batch')
+        if wb is not None and attrs.get('length_per_piece') is None:
+            try:
+                if wb.length_per_piece is not None:
+                    attrs['length_per_piece'] = wb.length_per_piece
+            except ObjectDoesNotExist:
+                pass
+
         link_warehouse_first_time = wb is not None and (
             self.instance is None or self.instance.warehouse_batch_id is None
         )
@@ -221,8 +239,44 @@ class SaleSerializer(serializers.ModelSerializer):
             ret.pop('quantity_input', None)
         return ret
 
+    def _apply_finance(self, validated_data):
+        mode = validated_data.get('sale_mode') or Sale.MODE_PIECES
+        wb = validated_data.get('warehouse_batch')
+        price = validated_data.get('price') or Decimal('0')
+        if mode == Sale.MODE_PACKAGES:
+            spk = validated_data.get('sold_packages') or Decimal('0')
+            ppp = None
+            if wb:
+                try:
+                    ppp = wb.pieces_per_package
+                except ObjectDoesNotExist:
+                    ppp = None
+            if ppp and Decimal(str(ppp)) > 0:
+                validated_data['sold_pieces'] = (Decimal(str(spk)) * Decimal(str(ppp))).quantize(Decimal('0.0001'))
+            validated_data['revenue'] = (Decimal(str(price)) * Decimal(str(spk))).quantize(Decimal('0.01'))
+        else:
+            sp = validated_data.get('sold_pieces')
+            if sp is None:
+                sp = validated_data.get('quantity') or Decimal('0')
+                validated_data['sold_pieces'] = sp
+            validated_data['revenue'] = (Decimal(str(price)) * Decimal(str(sp))).quantize(Decimal('0.01'))
+        spieces = Decimal(str(validated_data.get('sold_pieces') or 0))
+        validated_data['quantity'] = spieces
+        lp = validated_data.get('length_per_piece')
+        if lp is not None:
+            validated_data['total_meters'] = (spieces * Decimal(str(lp))).quantize(Decimal('0.0001'))
+        cpp = Decimal('0')
+        if wb:
+            try:
+                cpp = Decimal(str(wb.cost_per_piece or 0))
+            except ObjectDoesNotExist:
+                cpp = Decimal('0')
+        validated_data['cost'] = (spieces * cpp).quantize(Decimal('0.01'))
+        validated_data['profit'] = (validated_data['revenue'] - validated_data['cost']).quantize(Decimal('0.01'))
+
     def create(self, validated_data):
         validated_data = self._fill_quantity_input(validated_data)
+        self._apply_finance(validated_data)
         if not validated_data.get('order_number'):
             today = timezone.now().date()
             year = today.year
@@ -243,12 +297,6 @@ class SaleSerializer(serializers.ModelSerializer):
 
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
-
-        price = validated_data.get('price')
-        if price is not None:
-            validated_data['profit'] = (price * validated_data['quantity']).quantize(Decimal('0.01'))
-        else:
-            validated_data['profit'] = Decimal('0')
 
         wb = validated_data.get('warehouse_batch')
         wb_pk = wb.pk if wb else None
@@ -272,6 +320,12 @@ class SaleSerializer(serializers.ModelSerializer):
         wb_pk = validated_data['warehouse_batch'].pk if attaching_wb else None
 
         from apps.warehouse.stock_ops import apply_sale_to_warehouse_batch
+
+        merged = {**{f: getattr(instance, f) for f in (
+            'sale_mode', 'sold_pieces', 'sold_packages', 'length_per_piece', 'price', 'warehouse_batch',
+        )}, **validated_data}
+        self._apply_finance(merged)
+        validated_data.update({k: merged[k] for k in ('sold_pieces', 'sold_packages', 'quantity', 'length_per_piece', 'total_meters', 'revenue', 'cost', 'profit') if k in merged})
 
         with transaction.atomic():
             instance = super().update(instance, validated_data)

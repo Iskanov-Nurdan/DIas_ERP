@@ -6,12 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
-from django.db.models import F, Q, Sum
-from django.db import models
+from django.db.models import Q, Sum
 
-from apps.materials.models import Incoming
+from apps.materials.models import MaterialBatch
 
 
 @dataclass
@@ -29,7 +28,8 @@ class Period:
         return q
 
     def incoming_q(self) -> Q:
-        return self._date_field_q('date')
+        """Партии прихода — бизнес-дата received_at."""
+        return self._date_field_q('received_at')
 
     def batch_q(self) -> Q:
         return self._date_field_q('date')
@@ -121,15 +121,11 @@ def parse_period(request) -> Period:
 
 def material_avg_unit_prices() -> dict[int, Decimal]:
     """
-    Средневзвешенная цена закупки по каждому сырью (по всем приходам).
-    Используется как оценка стоимости списаний.
+    Средневзвешенная цена закупки по каждому сырью (по сумме партий прихода).
     """
-    rows = (
-        Incoming.objects.values('material_id')
-        .annotate(
-            tq=Sum('quantity'),
-            tv=Sum(F('quantity') * F('price_per_unit'), output_field=models.DecimalField()),
-        )
+    rows = MaterialBatch.objects.values('material_id').annotate(
+        tq=Sum('quantity_initial'),
+        tv=Sum('total_price'),
     )
     out: dict[int, Decimal] = {}
     for r in rows:
@@ -139,16 +135,3 @@ def material_avg_unit_prices() -> dict[int, Decimal]:
         if tq and tq > 0:
             out[mid] = (tv / tq).quantize(Decimal('0.0001'))
     return out
-
-
-def estimate_writeoff_value(writeoffs_qs, prices: dict[int, Decimal]) -> Tuple[Decimal, int]:
-    """Оценка стоимости списаний по средней цене закупки (только строки, где цена известна)."""
-    total = Decimal('0')
-    n = 0
-    for w in writeoffs_qs.only('id', 'material_id', 'quantity').iterator():
-        p = prices.get(w.material_id)
-        if p is None:
-            continue
-        total += (w.quantity or Decimal('0')) * p
-        n += 1
-    return total, n

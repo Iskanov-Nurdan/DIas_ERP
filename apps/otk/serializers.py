@@ -5,4 +5,8 @@ from .models import OtkCheck
 class OtkCheckSerializer(serializers.ModelSerializer):
     class Meta:
         model = OtkCheck
-        fields = ('id', 'batch', 'accepted', 'rejected', 'reject_reason', 'inspector', 'checked_date')
+        fields = (
+            'id', 'batch', 'profile', 'pieces', 'length_per_piece', 'total_meters',
+            'check_status', 'accepted', 'rejected', 'reject_reason', 'comment',
+            'inspector', 'checked_date',
+        )
