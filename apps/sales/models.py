@@ -85,6 +85,12 @@ class Sale(models.Model):
         max_length=40,
         blank=True,
     )
+    stock_quality = models.CharField(
+        'Качество склада на момент продажи',
+        max_length=10,
+        blank=True,
+        default='',
+    )
 
     class Meta:
         db_table = 'sales'

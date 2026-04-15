@@ -14,7 +14,7 @@ from config.permissions import IsAdminOrHasAccess
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
 from .filters import WarehouseBatchFilter
 from .models import WarehouseBatch
-from .packaging import compute_pieces_per_package, plan_fifo_pack
+from .packaging import effective_unit_meters
 from .serializers import WarehouseBatchSerializer
 
 logger = logging.getLogger(__name__)
@@ -143,70 +143,26 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
         """
         POST /api/warehouse/batches/package/
 
-        Контракт фронта: приоритет объёма = pieces_per_package × packages_count (шт задаёт пользователь).
-        Геометрия: shift_height (или unit_meters), shift_width или width_meters, angle_deg — обязательны.
-        product_id — ключ продукта (= поле product на строке склада).
-
-        Если задан package_total_meters — проверяется согласованность с pieces_per_package × unit_meters (допуск 1 мм).
-        Без pieces_per_package: обратная совместимость — расчёт штук из package_total_meters / unit_meters (floor).
+        Тело: warehouse_batch_id (обяз.), pieces_per_package, packages_count, comment (опц.).
+        Длина штуки / м на ед. берётся из строки склада (unit_meters / смена исходной партии / length_per_piece).
+        Качество новой строки = quality исходной строки; смешивание партий и смена качества через API запрещены.
         """
         d = request.data
 
-        def _req_dec(key):
-            v = d.get(key)
-            if v is None or v == '':
-                raise KeyError(key)
-            return Decimal(str(v))
-
-        product_id = d.get('product_id')
-        if product_id is None or str(product_id).strip() == '':
+        wb_id = d.get('warehouse_batch_id') if d.get('warehouse_batch_id') not in (None, '') else d.get('batchId')
+        if wb_id in (None, ''):
             return _err(
                 'validation_error',
-                'Обязательное поле product_id (ключ продукта, как в поле product строки склада)',
-                errors=[{'field': 'product_id', 'message': 'Обязательное поле'}],
+                'Обязательное поле warehouse_batch_id',
+                errors=[{'field': 'warehouse_batch_id', 'message': 'Обязательное поле'}],
             )
-        product_key = str(product_id).strip()
-
         try:
-            if d.get('shift_height') not in (None, ''):
-                unit_meters = Decimal(str(d['shift_height']))
-            elif d.get('unit_meters') not in (None, ''):
-                unit_meters = Decimal(str(d['unit_meters']))
-            else:
-                return _err(
-                    'validation_error',
-                    'Укажите shift_height или unit_meters (высота одной штуки, м)',
-                    errors=[{'field': 'shift_height', 'message': 'Обязательное поле'}],
-                )
-            if d.get('shift_width') not in (None, ''):
-                width_req = Decimal(str(d['shift_width']))
-            elif d.get('width_meters') not in (None, ''):
-                width_req = Decimal(str(d['width_meters']))
-            else:
-                return _err(
-                    'validation_error',
-                    'Укажите shift_width или width_meters',
-                    errors=[{'field': 'shift_width', 'message': 'Обязательное поле'}],
-                )
-            if d.get('angle_deg') in (None, ''):
-                return _err(
-                    'validation_error',
-                    'Обязательное поле angle_deg',
-                    errors=[{'field': 'angle_deg', 'message': 'Обязательное поле'}],
-                )
-            angle_req = Decimal(str(d['angle_deg']))
-        except (InvalidOperation, TypeError, ValueError):
+            wb_id = int(wb_id)
+        except (TypeError, ValueError):
             return _err(
                 'validation_error',
-                'Некорректные числовые значения геометрии',
-                errors=[{'field': 'body', 'message': 'Должны быть числами'}],
-            )
-
-        if unit_meters <= 0:
-            return _err(
-                'validation_error',
-                'shift_height / unit_meters должно быть > 0',
-                errors=[{'field': 'shift_height', 'message': '> 0'}],
+                'Некорректный warehouse_batch_id',
+                errors=[{'field': 'warehouse_batch_id', 'message': 'Целое число'}],
             )
 
         pc_raw = d.get('packages_count')
@@ -232,155 +188,123 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         ppp_raw = d.get('pieces_per_package')
-        package_total_meters = None
-        if ppp_raw not in (None, ''):
-            try:
-                pieces_int = int(Decimal(str(ppp_raw)))
-            except (InvalidOperation, TypeError, ValueError):
-                return _err(
-                    'validation_error',
-                    'pieces_per_package — целое число ≥ 1',
-                    errors=[{'field': 'pieces_per_package', 'message': 'Целое число'}],
-                )
-            if pieces_int < 1:
-                return _err(
-                    'validation_error',
-                    'pieces_per_package должно быть ≥ 1',
-                    errors=[{'field': 'pieces_per_package', 'message': 'Минимум 1'}],
-                )
-            pieces_per_package = Decimal(pieces_int)
-            expected_m = pieces_per_package * unit_meters
-            pkg_in = d.get('package_total_meters')
-            if pkg_in not in (None, ''):
-                try:
-                    package_total_meters = Decimal(str(pkg_in))
-                except (InvalidOperation, TypeError, ValueError):
-                    return _err(
-                        'validation_error',
-                        'Некорректное package_total_meters',
-                        errors=[{'field': 'package_total_meters', 'message': 'Число'}],
-                    )
-                if (package_total_meters - expected_m).copy_abs() > Decimal('0.0001'):
-                    return _err(
-                        'validation_error',
-                        'package_total_meters не согласован с pieces_per_package × shift_height (допуск 0,0001 м)',
-                        errors=[{'field': 'package_total_meters', 'message': 'Пересчитайте или уберите поле'}],
-                    )
-            else:
-                package_total_meters = expected_m.quantize(Decimal('0.0001'))
-        else:
-            try:
-                package_total_meters = _req_dec('package_total_meters')
-            except KeyError:
-                return _err(
-                    'validation_error',
-                    'Укажите pieces_per_package или (для старого сценария) package_total_meters',
-                    errors=[{'field': 'pieces_per_package', 'message': 'Обязательное поле'}],
-                )
-            except (InvalidOperation, TypeError, ValueError):
-                return _err(
-                    'validation_error',
-                    'Некорректное package_total_meters',
-                    errors=[{'field': 'package_total_meters', 'message': 'Число'}],
-                )
-            try:
-                pieces_int = compute_pieces_per_package(unit_meters, package_total_meters)
-            except ValueError as e:
-                code = str(e)
-                if code == 'pkg_lt_unit':
-                    msg = 'package_total_meters не может быть меньше unit_meters'
-                elif code == 'ppp_lt_1':
-                    msg = 'Из метража следует меньше 1 штуки в упаковке'
-                else:
-                    msg = 'Некорректные параметры длины/метража'
-                return _err('validation_error', msg, errors=[{'field': 'package_total_meters', 'message': msg}])
-            pieces_per_package = Decimal(pieces_int)
-
-        need = (pieces_per_package * Decimal(packages_count)).quantize(Decimal('0.0001'))
-
-        base_ids = list(
-            WarehouseBatch.objects.filter(
-                inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
-                status=WarehouseBatch.STATUS_AVAILABLE,
-                product=product_key,
-            )
-            .order_by('id')
-            .values_list('id', flat=True)
-        )
-
-        if not base_ids:
+        if ppp_raw is None or ppp_raw == '':
             return _err(
-                'conflict',
-                'Нет строк «не упаковано» с указанным продуктом',
-                http_status=status.HTTP_409_CONFLICT,
+                'validation_error',
+                'Обязательное поле pieces_per_package',
+                errors=[{'field': 'pieces_per_package', 'message': 'Обязательное поле'}],
             )
+        try:
+            pieces_int = int(Decimal(str(ppp_raw)))
+        except (InvalidOperation, TypeError, ValueError):
+            return _err(
+                'validation_error',
+                'pieces_per_package — целое число ≥ 1',
+                errors=[{'field': 'pieces_per_package', 'message': 'Целое число'}],
+            )
+        if pieces_int < 1:
+            return _err(
+                'validation_error',
+                'pieces_per_package должно быть ≥ 1',
+                errors=[{'field': 'pieces_per_package', 'message': 'Минимум 1'}],
+            )
+        pieces_per_package = Decimal(pieces_int)
+
+        extra_comment = (d.get('comment') or '').strip()
 
         created = []
         with transaction.atomic():
-            rows = list(
+            row = (
                 WarehouseBatch.objects.select_for_update()
                 .select_related('source_batch')
-                .filter(pk__in=base_ids)
-                .order_by('id')
+                .filter(pk=wb_id)
+                .first()
             )
+            if row is None:
+                return _err('not_found', 'Строка склада не найдена', http_status=status.HTTP_404_NOT_FOUND)
+            if row.inventory_form != WarehouseBatch.INVENTORY_UNPACKED:
+                return _err(
+                    'bad_request',
+                    'Упаковка только для строк в форме «не упаковано»',
+                    errors=[{'field': 'warehouse_batch_id', 'message': 'Неверная форма учёта'}],
+                )
+            if row.status != WarehouseBatch.STATUS_AVAILABLE:
+                return _err(
+                    'bad_request',
+                    'Строка недоступна для упаковки (не в статусе «доступна»)',
+                    errors=[{'field': 'warehouse_batch_id', 'message': 'Недоступна'}],
+                )
 
-            takes, err = plan_fifo_pack(rows, need, unit_meters, width_req, angle_req)
-            if err == 'no_matching_lines':
+            unit_m = effective_unit_meters(row)
+            if unit_m is None or unit_m <= 0:
+                if row.length_per_piece is not None:
+                    unit_m = Decimal(str(row.length_per_piece))
+            if unit_m is None or unit_m <= 0:
+                return _err(
+                    'validation_error',
+                    'У строки нет длины штуки (м) для расчёта упаковки',
+                    errors=[{'field': 'warehouse_batch_id', 'message': 'Заполните unit_meters / length_per_piece у партии'}],
+                )
+
+            need = (pieces_per_package * Decimal(packages_count)).quantize(Decimal('0.0001'))
+            row_qty = Decimal(str(row.quantity))
+            if need > row_qty:
                 return _err(
                     'conflict',
-                    'Нет строк с формой «не упаковано», совпадающих по длине штуки и (если заданы) ширине/углу смены',
-                    http_status=status.HTTP_409_CONFLICT,
-                )
-            if err == 'insufficient':
-                return _err(
-                    'conflict',
-                    f'Недостаточно подходящего остатка для упаковки (нужно {need} шт.)',
+                    f'Недостаточно штук на строке (нужно {need}, доступно {row_qty})',
                     http_status=status.HTTP_409_CONFLICT,
                 )
 
-            first_row = None
-            for pt in takes:
-                row = next(r for r in rows if r.pk == pt.row_id)
-                if first_row is None:
-                    first_row = row
-                row.quantity -= pt.take
-                if row.quantity <= 0:
-                    row.delete()
-                else:
-                    row.save(update_fields=['quantity'])
+            package_total_meters = (pieces_per_package * unit_m).quantize(Decimal('0.0001'))
 
-            pb = first_row.source_batch if first_row else None
+            row.quantity = row_qty - need
+            if row.quantity <= 0:
+                row.delete()
+            else:
+                row.save(update_fields=['quantity'])
+
+            pb = row.source_batch
             check = None
             if pb is not None:
                 check = pb.otk_checks.order_by('-checked_date', '-id').first()
-            otk_acc = first_row.otk_accepted if first_row and first_row.otk_accepted is not None else (check.accepted if check else None)
-            otk_def = first_row.otk_defect if first_row and first_row.otk_defect is not None else (check.rejected if check else None)
-            ins_name = (first_row.otk_inspector_name or '') if first_row else ''
+            otk_acc = row.otk_accepted if row.otk_accepted is not None else (check.accepted if check else None)
+            otk_def = row.otk_defect if row.otk_defect is not None else (check.rejected if check else None)
+            ins_name = row.otk_inspector_name or ''
             if not ins_name and check and check.inspector_id:
                 ins_name = (getattr(check.inspector, 'name', None) or '')[:255]
-            chk_at = (first_row.otk_checked_at if first_row else None) or (check.checked_date if check else None)
-            otk_st = (first_row.otk_status if first_row else '') or (pb.otk_status if pb else '')
-            reason = (first_row.otk_defect_reason if first_row else '') or (check.reject_reason if check else '') or ''
-            comment = (first_row.otk_comment if first_row else '') or (check.comment if check else '') or ''
+            chk_at = row.otk_checked_at or (check.checked_date if check else None)
+            otk_st = (row.otk_status or '') or (pb.otk_status if pb else '')
+            reason = row.otk_defect_reason or (check.reject_reason if check else '') or ''
+            base_comment = row.otk_comment or (check.comment if check else '') or ''
+            if extra_comment:
+                merged_comment = (base_comment + ('\n' if base_comment else '') + extra_comment).strip()
+            else:
+                merged_comment = base_comment
 
             wb = WarehouseBatch.objects.create(
-                product=product_key,
+                profile_id=row.profile_id,
+                product=row.product,
+                length_per_piece=row.length_per_piece,
+                cost_per_piece=row.cost_per_piece,
+                cost_per_meter=row.cost_per_meter,
                 quantity=need,
+                quality=row.quality,
+                defect_reason=row.defect_reason or '',
                 status=WarehouseBatch.STATUS_AVAILABLE,
                 date=date.today(),
                 source_batch=pb,
                 inventory_form=WarehouseBatch.INVENTORY_PACKED,
-                unit_meters=unit_meters,
+                unit_meters=unit_m,
                 package_total_meters=package_total_meters,
                 pieces_per_package=pieces_per_package,
                 packages_count=Decimal(packages_count),
                 otk_accepted=otk_acc,
                 otk_defect=otk_def,
                 otk_defect_reason=reason,
-                otk_comment=comment,
+                otk_comment=merged_comment,
                 otk_inspector_name=ins_name,
                 otk_checked_at=chk_at,
-                otk_status=otk_st or '',
+                otk_status=(otk_st or '')[:20],
             )
             created.append(wb)
 
@@ -395,7 +319,7 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
                 after_instance=wb,
                 payload_extra={
                     'endpoint': 'POST /api/warehouse/batches/package/',
-                    'product_id': product_key,
+                    'warehouse_batch_id': wb_id,
                     'packages_count': packages_count,
                 },
             )

@@ -20,6 +20,13 @@ class WarehouseBatch(models.Model):
         (INVENTORY_OPEN_PACKAGE, 'Открытая упаковка'),
     ]
 
+    QUALITY_GOOD = 'good'
+    QUALITY_DEFECT = 'defect'
+    QUALITY_CHOICES = [
+        (QUALITY_GOOD, 'Годный'),
+        (QUALITY_DEFECT, 'Брак'),
+    ]
+
     profile = models.ForeignKey(
         'recipes.PlasticProfile',
         on_delete=models.PROTECT,
@@ -65,6 +72,15 @@ class WarehouseBatch(models.Model):
     otk_checked_at = models.DateTimeField('Дата проверки ОТК', null=True, blank=True)
     otk_status = models.CharField('Статус ОТК (снимок)', max_length=20, blank=True)
 
+    quality = models.CharField(
+        'Качество партии',
+        max_length=10,
+        choices=QUALITY_CHOICES,
+        default=QUALITY_GOOD,
+        db_index=True,
+    )
+    defect_reason = models.TextField('Причина брака (строка партии)', blank=True, default='')
+
     class Meta:
         db_table = 'warehouse_batches'
         verbose_name = 'Партия ГП'
@@ -73,6 +89,9 @@ class WarehouseBatch(models.Model):
 
     def save(self, *args, **kwargs):
         from decimal import Decimal
+
+        if self.quality == self.QUALITY_GOOD and (self.defect_reason or '').strip():
+            self.defect_reason = ''
 
         if self.length_per_piece is not None and self.quantity is not None:
             self.total_meters = (Decimal(str(self.quantity)) * Decimal(str(self.length_per_piece))).quantize(

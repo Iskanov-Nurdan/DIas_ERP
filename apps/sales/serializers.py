@@ -135,11 +135,11 @@ class SaleSerializer(serializers.ModelSerializer):
             'quantity_input', 'quantity_unit', 'price', 'revenue', 'cost', 'cost_total', 'date', 'sale_date',
             'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
-            'profile_name',
+            'profile_name', 'stock_quality',
         )
         read_only_fields = (
             'profit', 'revenue', 'cost', 'cost_total', 'total_meters', 'inventory_form', 'quantity_unit',
-            'warehouse_batch_id', 'profile_name', 'sale_date',
+            'warehouse_batch_id', 'profile_name', 'sale_date', 'stock_quality',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
@@ -357,6 +357,8 @@ class SaleSerializer(serializers.ModelSerializer):
             validated_data['date'] = timezone.now().date()
 
         wb = validated_data.get('warehouse_batch')
+        if wb is not None:
+            validated_data['stock_quality'] = wb.quality
         wb_pk = wb.pk if wb else None
         qty = validated_data['quantity']
         stock_sf = validated_data.get('stock_form') or ''
@@ -387,6 +389,8 @@ class SaleSerializer(serializers.ModelSerializer):
             'sold_pieces', 'sold_packages', 'quantity', 'length_per_piece', 'total_meters',
             'revenue', 'cost', 'profit',
         ) if k in merged})
+        if attaching_wb and validated_data.get('warehouse_batch') is not None:
+            validated_data['stock_quality'] = validated_data['warehouse_batch'].quality
 
         with transaction.atomic():
             instance = super().update(instance, validated_data)

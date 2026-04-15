@@ -11,6 +11,15 @@ from .models import WarehouseBatch
 from .packaging import q4
 
 
+def _normalize_stock_quality(quality: str) -> str:
+    q = (quality or '').strip()
+    if q not in (WarehouseBatch.QUALITY_GOOD, WarehouseBatch.QUALITY_DEFECT):
+        raise ValueError(
+            f'quality must be {WarehouseBatch.QUALITY_GOOD!r} or {WarehouseBatch.QUALITY_DEFECT!r}, got {quality!r}'
+        )
+    return q
+
+
 def _close_warehouse_row_after_full_sale(b: WarehouseBatch) -> None:
     """Остаток исчерпан — строка не удаляется, статус «отгружено/продано»."""
     b.quantity = Decimal('0')
@@ -63,26 +72,33 @@ def normalize_piece_pick(value):
     return s
 
 
-def loose_quantity_for_packaging(pb) -> Decimal:
+def loose_quantity_for_packaging(pb, *, quality: str) -> Decimal:
     """
-    Объём (шт), доступный для операции упаковки с производственной партии pb:
-    сначала строки unpacked; иначе legacy: принято ОТК минус всё уже на складе по этой партии.
+    Объём (шт) указанного качества для упаковки с производственной партии pb:
+    сначала unpacked этого quality; иначе cap из ОТК минус всё уже на складе этого quality.
     """
     from apps.production.models import ProductionBatch
 
+    q = _normalize_stock_quality(quality)
     if pb.otk_status != ProductionBatch.OTK_ACCEPTED:
         return Decimal('0')
     check = pb.otk_checks.order_by('-checked_date', '-id').first()
     if not check:
         return Decimal('0')
-    unpacked_sum = WarehouseBatch.objects.filter(
+    cap = (
+        Decimal(str(check.accepted or 0))
+        if q == WarehouseBatch.QUALITY_GOOD
+        else Decimal(str(check.rejected or 0))
+    )
+    unpacked = WarehouseBatch.objects.filter(
         source_batch=pb,
         inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        quality=q,
     ).aggregate(s=Sum('quantity'))['s']
-    if unpacked_sum is not None and Decimal(str(unpacked_sum)) > 0:
-        return Decimal(str(unpacked_sum))
-    total_wh = WarehouseBatch.objects.filter(source_batch=pb).aggregate(s=Sum('quantity'))['s'] or 0
-    left = Decimal(str(check.accepted)) - Decimal(str(total_wh))
+    if unpacked is not None and Decimal(str(unpacked)) > 0:
+        return Decimal(str(unpacked))
+    on_wh = WarehouseBatch.objects.filter(source_batch=pb, quality=q).aggregate(s=Sum('quantity'))['s'] or 0
+    left = cap - Decimal(str(on_wh))
     return left if left > 0 else Decimal('0')
 
 
@@ -93,10 +109,14 @@ def _duplicate_warehouse_batch(
     packages_count: Decimal | None,
     inventory_form: str,
 ) -> WarehouseBatch:
-    """Копия строки склада с тем же продуктом/партией/геометрией/снимком ОТК."""
+    """Копия строки склада с тем же продуктом/партией/геометрией/качеством/снимком ОТК."""
     pc = q4(packages_count) if packages_count is not None else None
     return WarehouseBatch.objects.create(
+        profile_id=template.profile_id,
         product=template.product,
+        length_per_piece=template.length_per_piece,
+        cost_per_piece=template.cost_per_piece,
+        cost_per_meter=template.cost_per_meter,
         quantity=q4(quantity),
         status=template.status,
         date=template.date,
@@ -106,6 +126,8 @@ def _duplicate_warehouse_batch(
         package_total_meters=template.package_total_meters,
         pieces_per_package=template.pieces_per_package,
         packages_count=pc,
+        quality=template.quality,
+        defect_reason=template.defect_reason or '',
         otk_accepted=template.otk_accepted,
         otk_defect=template.otk_defect,
         otk_defect_reason=template.otk_defect_reason or '',
@@ -150,14 +172,19 @@ def _maybe_split_legacy_combined_open_row(b: WarehouseBatch) -> None:
     b.save(update_fields=['packages_count', 'quantity'])
 
 
-def deduct_unpacked_quantity(pb, qty: Decimal) -> None:
-    """Списывает qty со строк unpacked по партии pb (FIFO по id)."""
+def deduct_unpacked_quantity(pb, qty: Decimal, *, quality: str) -> None:
+    """Списывает qty со строк unpacked по партии pb (FIFO по id) для указанного quality."""
+    q = _normalize_stock_quality(quality)
     remaining = qty
     if remaining <= 0:
         return
     qs = (
         WarehouseBatch.objects.select_for_update()
-        .filter(source_batch=pb, inventory_form=WarehouseBatch.INVENTORY_UNPACKED)
+        .filter(
+            source_batch=pb,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+            quality=q,
+        )
         .order_by('id')
     )
     for row in qs:

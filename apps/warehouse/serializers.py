@@ -89,6 +89,8 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             'otk_inspector_name',
             'otk_checked_at',
             'otk_status',
+            'quality',
+            'defect_reason',
         )
 
     def get_product_id(self, obj):

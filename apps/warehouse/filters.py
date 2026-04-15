@@ -37,6 +37,8 @@ class WarehouseBatchFilter(django_filters.FilterSet):
     def filter_packaging_status(self, queryset, name, value):
         return self.filter_inventory_form(queryset, name, value)
 
+    quality = django_filters.CharFilter(field_name='quality', lookup_expr='exact')
+
     class Meta:
         model = WarehouseBatch
-        fields = ['status', 'product']
+        fields = ['status', 'product', 'quality']

@@ -842,30 +842,18 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             batch.save(update_fields=[
                 'otk_status', 'lifecycle_status', 'sent_to_otk', 'in_otk_queue',
             ])
-            if accepted > 0:
-                from apps.warehouse.models import WarehouseBatch
+            from apps.warehouse.receipt import create_warehouse_batches_from_otk
 
-                ins_name = inspector_name_stored
-                WarehouseBatch.objects.create(
-                    profile_id=batch.profile_id,
-                    product=batch.product,
-                    quantity=accepted,
-                    length_per_piece=batch.length_per_piece,
-                    cost_per_piece=batch.cost_per_piece,
-                    cost_per_meter=batch.cost_per_meter,
-                    status=WarehouseBatch.STATUS_AVAILABLE,
-                    date=date.today(),
-                    source_batch=batch,
-                    inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
-                    unit_meters=batch.length_per_piece,
-                    otk_accepted=accepted,
-                    otk_defect=rejected,
-                    otk_defect_reason=defect_reason or '',
-                    otk_comment=comment or '',
-                    otk_inspector_name=ins_name or '',
-                    otk_checked_at=checked_at,
-                    otk_status=batch.otk_status,
-                )
+            create_warehouse_batches_from_otk(
+                batch,
+                accepted=accepted,
+                rejected=rejected,
+                defect_reason=defect_reason or '',
+                comment=comment or '',
+                inspector_name=inspector_name_stored,
+                checked_at=checked_at,
+                otk_status_snapshot=batch.otk_status,
+            )
             if batch.order_id:
                 Order.objects.filter(pk=batch.order_id).update(status=Order.STATUS_DONE)
 
