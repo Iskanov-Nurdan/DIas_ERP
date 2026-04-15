@@ -145,6 +145,12 @@ class SaleSerializer(serializers.ModelSerializer):
             'product': {'required': False, 'allow_blank': True},
         }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        wb = self.fields.get('warehouse_batch')
+        if wb is not None:
+            wb.queryset = WarehouseBatch.objects.filter(status=WarehouseBatch.STATUS_AVAILABLE)
+
     def get_profile_name(self, obj):
         if not obj.warehouse_batch_id:
             return None

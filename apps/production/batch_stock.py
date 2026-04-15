@@ -9,9 +9,9 @@ from django.db import transaction
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.materials.fifo import fifo_deduct, material_stock_kg, reverse_stock_deductions
-from apps.materials.models import RawMaterial
+from apps.materials.models import MaterialStockDeduction, RawMaterial
 from apps.chemistry.fifo import fifo_deduct_chemistry, chemistry_stock_kg, reverse_chemistry_deductions
-from apps.chemistry.models import ChemistryCatalog
+from apps.chemistry.models import ChemistryCatalog, ChemistryStockDeduction
 from apps.recipes.models import Recipe, RecipeComponent
 from apps.production.models import ProductionBatch
 
@@ -152,3 +152,91 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             'material_cost_total', 'total_meters', 'quantity', 'cost_per_meter', 'cost_per_piece', 'cost_price',
         ],
     )
+
+
+def production_batch_has_positive_material_requirement(batch: ProductionBatch) -> bool:
+    """Нужен ли ненулевой расход сырья/химии по рецепту и total_meters партии."""
+    if not batch.recipe_id:
+        return False
+    tm = _q(batch.total_meters)
+    if tm <= 0:
+        return False
+    try:
+        recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)
+    except Recipe.DoesNotExist:
+        return False
+    raw_agg, chem_agg = aggregate_consumption_for_recipe(recipe, tm)
+    return any(q > 0 for q in raw_agg.values()) or any(q > 0 for q in chem_agg.values())
+
+
+def assert_production_batch_ready_for_otk_pipeline(batch: ProductionBatch) -> None:
+    """
+    Партия должна иметь рецепт с компонентами, положительный выпуск и (при ненулевой норме расхода)
+    ненулевую material_cost_total после apply_production_batch_stock_and_cost.
+    """
+    if not batch.recipe_id:
+        raise DRFValidationError(
+            {'code': 'BATCH_INCOMPLETE', 'detail': 'У партии нет рецепта', 'error': 'У партии нет рецепта'},
+        )
+    tm = _q(batch.total_meters)
+    if tm <= 0:
+        raise DRFValidationError(
+            {
+                'code': 'BATCH_INCOMPLETE',
+                'detail': 'Выпуск партии (total_meters) должен быть > 0',
+                'error': 'Выпуск партии (total_meters) должен быть > 0',
+            },
+        )
+    try:
+        recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)
+    except Recipe.DoesNotExist:
+        raise DRFValidationError(
+            {
+                'code': 'BATCH_INCOMPLETE',
+                'detail': 'Рецепт партии удалён из справочника — ОТК недоступен',
+                'error': 'Рецепт партии удалён из справочника — ОТК недоступен',
+            },
+        )
+    if not recipe.components.exists():
+        raise DRFValidationError(
+            {
+                'code': 'INVALID_RECIPE',
+                'detail': 'Рецепт без компонентов — партия не может идти в ОТК',
+                'error': 'Рецепт без компонентов — партия не может идти в ОТК',
+            },
+        )
+    if production_batch_has_positive_material_requirement(batch):
+        cost = batch.material_cost_total or Decimal('0')
+        has_raw_mov = MaterialStockDeduction.objects.filter(
+            reason=PRODUCTION_BATCH_REASON, reference_id=batch.pk
+        ).exists()
+        has_chem_mov = ChemistryStockDeduction.objects.filter(
+            reason=PRODUCTION_BATCH_REASON, reference_id=batch.pk
+        ).exists()
+        if cost <= 0 and not has_raw_mov and not has_chem_mov:
+            raise DRFValidationError(
+                {
+                    'code': 'INCOMPLETE_PRODUCTION_COST',
+                    'detail': (
+                        'Партия не прошла расчёт материального расхода: нет списаний сырья/химии '
+                        'и нулевая material_cost_total при ненулевой норме рецепта.'
+                    ),
+                    'error': 'Нет списания / себестоимости производства для партии с расходом по рецепту',
+                },
+            )
+
+
+@transaction.atomic
+def resync_production_batch_consumption(
+    batch: ProductionBatch,
+    *,
+    previous_recipe: Optional[Recipe],
+    previous_total_meters: Decimal,
+) -> None:
+    """Откат списаний по старым метрам/рецепту и повторное FIFO-списание по текущему состоянию партии."""
+    reverse_production_batch_stock(
+        batch_id=batch.pk,
+        recipe=previous_recipe,
+        total_meters=previous_total_meters,
+    )
+    apply_production_batch_stock_and_cost(batch)

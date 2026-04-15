@@ -86,6 +86,18 @@ def produce_chemistry(
             }
         )
 
+    any_positive_need = any(
+        (_d(line.quantity_per_unit) * qty_kg).quantize(Decimal('0.0001')) > 0 for line in lines
+    )
+    if not any_positive_need:
+        raise ValidationError(
+            {
+                'code': 'EMPTY_CHEMISTRY_RECIPE',
+                'detail': 'При данном количестве выпуска расход сырья по составу равен нулю',
+                'error': 'При данном количестве выпуска расход сырья по составу равен нулю',
+            }
+        )
+
     batch = ChemistryBatch.objects.create(
         chemistry=cat,
         quantity_produced=qty_kg,

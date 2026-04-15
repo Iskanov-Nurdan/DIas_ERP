@@ -12,7 +12,7 @@ from apps.accounts.models import User
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
 from apps.recipes.serializers import RecipeSerializer
 from config.exceptions import LineShiftPausedForRecipeRun
-from .batch_stock import apply_production_batch_stock_and_cost, reverse_production_batch_stock
+from .batch_stock import apply_production_batch_stock_and_cost, resync_production_batch_consumption
 from .shift_state import (
     line_current_shift_open_event,
     line_current_shift_params_event,
@@ -599,18 +599,17 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
         old_tm = Decimal(str(instance.total_meters))
 
         with transaction.atomic():
-            reverse_production_batch_stock(
-                batch_id=instance.pk,
-                recipe=old_recipe,
-                total_meters=old_tm,
-            )
             for k, v in validated_data.items():
                 setattr(instance, k, v)
             prof = instance.profile
             if prof and not (getattr(instance, 'product', None) or '').strip():
                 instance.product = (prof.name or '')[:255]
             instance.save()
-            apply_production_batch_stock_and_cost(instance)
+            resync_production_batch_consumption(
+                instance,
+                previous_recipe=old_recipe,
+                previous_total_meters=old_tm,
+            )
         return instance
 
 

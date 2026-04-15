@@ -100,6 +100,19 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
                         f'Количество превышает доступный остаток ({batch.quantity})',
                         errors=[{'field': 'quantity', 'message': f'Максимум: {batch.quantity}'}])
 
+        if q != batch.quantity:
+            return _err(
+                'validation_error',
+                'Резерв выполняется только на полный остаток строки склада: передайте quantity, равное доступному количеству.',
+                errors=[
+                    {
+                        'field': 'quantity',
+                        'message': f'Ожидается quantity={batch.quantity} (вся строка переходит в статус «зарезервировано»).',
+                    },
+                ],
+                http_status=status.HTTP_400_BAD_REQUEST,
+            )
+
         before = instance_to_snapshot(batch)
         batch.status = WarehouseBatch.STATUS_RESERVED
         batch.save(update_fields=['status'])

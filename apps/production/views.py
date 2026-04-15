@@ -55,7 +55,12 @@ from .serializers import (
 )
 from apps.recipes.models import RecipeComponent
 
-from .batch_stock import reverse_production_batch_stock
+from .batch_stock import (
+    assert_production_batch_ready_for_otk_pipeline,
+    apply_production_batch_stock_and_cost,
+    resync_production_batch_consumption,
+    reverse_production_batch_stock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -676,7 +681,9 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from django.utils import timezone as dj_tz
 
         with transaction.atomic():
-            batch = ProductionBatch.objects.select_for_update().select_related('line').get(
+            batch = ProductionBatch.objects.select_for_update().select_related(
+                'line', 'recipe', 'profile',
+            ).get(
                 pk=self.kwargs['pk'],
             )
             if batch.lifecycle_status == ProductionBatch.LIFECYCLE_OTK:
@@ -699,6 +706,10 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     'Партия уже обработана ОТК',
                     http_status=status.HTTP_409_CONFLICT,
                 )
+            try:
+                assert_production_batch_ready_for_otk_pipeline(batch)
+            except DRFValidationError as exc:
+                return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
             now = dj_tz.now()
             line = batch.line
             if line:
@@ -721,6 +732,10 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         before_batch = instance_to_snapshot(batch)
         if batch.otk_status != ProductionBatch.OTK_PENDING:
             return _err('bad_request', 'Партия уже прошла ОТК-проверку')
+        try:
+            assert_production_batch_ready_for_otk_pipeline(batch)
+        except DRFValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
 
         accepted_raw = request.data.get('otk_accepted') or request.data.get('accepted')
         rejected_raw = request.data.get('otk_defect') or request.data.get('rejected')
@@ -1413,10 +1428,10 @@ def _recipe_run_otk_quantity(
 
 def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=None):
     """
-    Создаёт заказ + ProductionBatch (otk_status=pending), связывает с RecipeRun.
-    Списание склада и FIFO не выполняются — только POST /api/batches/.
-    Повторный вызов (pending): пересчитывает quantity из тела, из нормы рецепта (× output_scale) или
-    оставляет прежнее на партии; не использует сумму/число ёмкостей замеса.
+    Создаёт заказ + ProductionBatch (pending) и связывает с RecipeRun.
+    Списание сырья/химии и material_cost_total — только через apply_production_batch_stock_and_cost
+    (единая логика с POST /api/batches/).
+    При изменении объёма у pending-партии: reverse по старым метрам + повторный apply.
     """
     from django.utils import timezone
 
@@ -1427,6 +1442,8 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                 pk=run_locked.production_batch_id
             )
             if batch.otk_status == ProductionBatch.OTK_PENDING:
+                old_recipe = batch.recipe if batch.recipe_id else None
+                old_tm = Decimal(str(batch.total_meters))
                 try:
                     qty = _recipe_run_otk_quantity(
                         run_locked,
@@ -1458,6 +1475,11 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
                     if order.quantity != qty:
                         order.quantity = qty
                         order.save(update_fields=['quantity'])
+                resync_production_batch_consumption(
+                    batch,
+                    previous_recipe=old_recipe,
+                    previous_total_meters=old_tm,
+                )
             return (
                 ProductionBatch.objects.select_related('order', 'operator')
                 .prefetch_related('otk_checks__inspector')
@@ -1480,49 +1502,69 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
             })
         recipe = run_locked.recipe
         line = run_locked.line
-        if recipe is not None:
-            product = (recipe.product or recipe.recipe or '').strip() or recipe.recipe
-        else:
-            product = (run_locked.recipe_name_snapshot or '').strip() or '—'
-        now_d = timezone.now().date()
-        operator = user if getattr(user, 'is_authenticated', False) else None
-        order_kwargs = {
-            'recipe': recipe,
-            'line': line,
-            'quantity': qty,
-            'product': product,
-            'operator': operator,
-            'date': now_d,
-            'status': Order.STATUS_IN_PROGRESS,
-        }
-        if line is None:
-            order_kwargs['line_name_snapshot'] = run_locked.line_name_snapshot or ''
-            order_kwargs['former_line_id'] = run_locked.former_line_id
         if recipe is None:
-            order_kwargs['recipe_name_snapshot'] = run_locked.recipe_name_snapshot or ''
-            order_kwargs['former_recipe_id'] = run_locked.former_recipe_id
-        order = Order.objects.create(**order_kwargs)
-        shift_open = None
-        if line is not None and operator is not None:
-            shift_open = (
-                Shift.objects.filter(
-                    user=operator,
-                    line=line,
-                    closed_at__isnull=True,
-                    status=Shift.STATUS_OPEN,
-                )
-                .order_by('-opened_at')
-                .first()
+            raise DRFValidationError(
+                {
+                    'recipe_id': (
+                        'Для создания партии производства у замеса должен быть рецепт (FK). '
+                        'Партия без рецепта не может пройти FIFO и себестоимость.'
+                    ),
+                },
             )
-        prof_id = None
-        rec_id = None
-        if recipe is not None:
-            rec_id = recipe.pk
-            prof_id = getattr(recipe, 'profile_id', None)
+        if not recipe.components.exists():
+            raise DRFValidationError({'recipe': 'У рецепта нет компонентов'})
+        if line is None:
+            raise DRFValidationError(
+                {'line_id': 'Укажите линию замеса: партия производства привязана к линии и смене.'},
+            )
+        operator = user if getattr(user, 'is_authenticated', False) else None
+        if operator is None:
+            raise DRFValidationError({'detail': 'Нужен авторизованный пользователь для создания партии.'})
+        hist_map = prefetch_line_histories_map([line.pk])
+        hist = hist_map.get(line.pk)
+        if getattr(line, 'is_active', True) is False:
+            raise DRFValidationError({'line': 'Линия неактивна'})
+        if not line_shift_is_open(line, histories=hist):
+            raise DRFValidationError({'line': 'На линии нет открытой смены'})
+        if line_shift_is_paused(line, histories=hist):
+            raise DRFValidationError(
+                {'line': 'Смена на линии остановлена (пауза). Возобновите смену или выберите другую линию.'},
+            )
+        shift_open = (
+            Shift.objects.filter(
+                user=operator,
+                line=line,
+                closed_at__isnull=True,
+                status=Shift.STATUS_OPEN,
+            )
+            .order_by('-opened_at')
+            .first()
+        )
+        if not shift_open:
+            raise DRFValidationError(
+                {
+                    'shift': 'Нет активной открытой смены на этой линии для текущего пользователя '
+                    '(как при POST /api/batches/).',
+                },
+            )
+
+        product = (recipe.product or recipe.recipe or '').strip() or recipe.recipe
+        now_d = timezone.now().date()
+        now_ts = timezone.now()
+        order = Order.objects.create(
+            recipe=recipe,
+            line=line,
+            quantity=qty,
+            product=product,
+            operator=operator,
+            date=now_d,
+            status=Order.STATUS_IN_PROGRESS,
+        )
+        prof_id = recipe.profile_id
         batch = ProductionBatch(
             order=order,
             profile_id=prof_id,
-            recipe_id=rec_id,
+            recipe_id=recipe.pk,
             line=line,
             shift=shift_open,
             product=product,
@@ -1532,13 +1574,18 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
             total_meters=qty,
             operator=operator,
             date=now_d,
+            produced_at=now_ts,
             otk_status=ProductionBatch.OTK_PENDING,
+            lifecycle_status=ProductionBatch.LIFECYCLE_PENDING,
+            sent_to_otk=False,
+            in_otk_queue=False,
             cost_price=0,
             material_cost_total=0,
         )
         _apply_shift_snapshot_to_batch(batch, line)
         batch.save()
         RecipeRun.objects.filter(pk=run_locked.pk).update(production_batch=batch)
+        apply_production_batch_stock_and_cost(batch)
 
     return (
         ProductionBatch.objects.select_related('order', 'operator')
@@ -1549,12 +1596,15 @@ def submit_recipe_run_to_otk(run, user, quantity_override=None, output_scale=Non
 
 class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     """
-    Замес до партии ОТК: ёмкости и строки расхода (план/факт замеса). FIFO и себестоимость — у ProductionBatch.
+    Замес (план): ёмкости и строки расхода для интерфейса. Не альтернатива производству.
 
-    POST   /api/production/recipe-runs/ — создать замес и поставить партию в очередь ОТК (норма × scale или quantity).
-    POST   /api/production/recipe-runs/{id}/submit-to-otk/ — создать/обновить партию pending.
-    PATCH  — состав ёмкостей (без движения остатков); при смене объёма ОТК используйте submit-to-otk или PATCH с quantity.
-    DELETE — при pending-партии: удаление партии и заказа (списание FIFO только у партий из POST /api/batches/).
+    Связанная ProductionBatch создаётся тем же FIFO/себестоимостью, что и POST /api/batches/
+    (apply_production_batch_stock_and_cost сразу после сохранения партии).
+
+    POST   /api/production/recipe-runs/ — замес + партия pending + списание по рецепту.
+    POST   /api/production/recipe-runs/{id}/submit-to-otk/ — создать/обновить партию pending с пересчётом списания.
+    PATCH  — состав ёмкостей (план); при смене объёма партии — submit-to-otk или PATCH с quantity.
+    DELETE — при pending-партии: откат списаний (reverse) и удаление партии/заказа.
     """
 
     permission_classes = [IsAdminOrHasProductionOrOtk]
