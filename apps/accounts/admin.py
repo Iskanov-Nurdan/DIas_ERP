@@ -17,11 +17,8 @@ class UserAccessInline(admin.TabularInline):
 
 @admin.register(Role)
 class RoleAdmin(admin.ModelAdmin):
-    list_display = ('name', 'description')
+    list_display = ('name', 'description', 'is_system')
     inlines = [RoleAccessInline]
-
-    def get_queryset(self, request):
-        return super().get_queryset(request).filter(is_system=False)
 
     def has_change_permission(self, request, obj=None):
         if obj is not None and getattr(obj, 'is_system', False):

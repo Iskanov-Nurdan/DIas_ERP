@@ -15,9 +15,11 @@ class RoleAccessSerializer(serializers.ModelSerializer):
 
 
 class RoleSerializer(serializers.ModelSerializer):
+    is_system = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = Role
-        fields = ('id', 'name')
+        fields = ('id', 'name', 'is_system')
 
     def validate_name(self, value):
         reserved = (value or '').strip() == SYSTEM_ADMIN_ROLE_NAME

@@ -220,11 +220,12 @@ class RoleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     search_fields = ['name']
     ordering_fields = ['id', 'name']
 
-    def get_queryset(self):
-        return super().get_queryset().filter(is_system=False)
+    def perform_destroy(self, instance):
+        if getattr(instance, 'is_system', False):
+            raise PermissionDenied('Системную роль нельзя удалить.')
+        return super().perform_destroy(instance)
 
-    def get_object(self):
-        pk = self.kwargs.get('pk')
-        if pk is not None and Role.objects.filter(pk=pk, is_system=True).exists():
-            raise PermissionDenied('Системная роль защищена от доступа через API.')
-        return super().get_object()
+    def perform_update(self, serializer):
+        if getattr(serializer.instance, 'is_system', False):
+            raise PermissionDenied('Системную роль нельзя изменить.')
+        return super().perform_update(serializer)
