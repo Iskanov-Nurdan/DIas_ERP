@@ -16,6 +16,8 @@ def _expected_access_keys_for_role(role):
     """Список ключей для известных сидовых ролей; для остальных — None (не трогаем)."""
     if role is None:
         return None
+    if getattr(role, 'is_system', False):
+        return list(getattr(settings, 'ACCESS_KEYS', ()))
     admin_name = getattr(settings, 'USERS_SUPERUSER_ROLE_NAME', 'Админ')
     planner_name = getattr(settings, 'USERS_DEFAULT_ROLE_NAME', 'Планировщик')
     if role.name == admin_name:
@@ -56,6 +58,9 @@ def ensure_user_role_for_tab_accesses(user) -> bool:
     Возвращает True, если поле role было выставлено и нужен save/update в БД.
     """
     from .models import Role
+
+    if getattr(user, 'is_system', False):
+        return False
 
     if user.role_id:
         return False

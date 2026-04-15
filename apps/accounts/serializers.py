@@ -1,7 +1,9 @@
 from django.conf import settings
-from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from rest_framework import serializers
+
 from .models import Role, RoleAccess, UserAccess
+from .system_constants import SYSTEM_ADMIN_ROLE_NAME, SYSTEM_ADMIN_USERNAME
 
 User = get_user_model()
 
@@ -17,11 +19,19 @@ class RoleSerializer(serializers.ModelSerializer):
         model = Role
         fields = ('id', 'name')
 
+    def validate_name(self, value):
+        reserved = (value or '').strip() == SYSTEM_ADMIN_ROLE_NAME
+        if reserved and not (self.instance and getattr(self.instance, 'is_system', False)):
+            raise serializers.ValidationError('Название зарезервировано за системной ролью.')
+        return value
+
     def create(self, validated_data):
         role = Role.objects.create(**validated_data)
         return role
 
     def update(self, instance, validated_data):
+        if getattr(instance, 'is_system', False):
+            raise serializers.ValidationError('Системная роль недоступна для изменения.')
         for k, v in validated_data.items():
             setattr(instance, k, v)
         instance.save()
@@ -43,6 +53,10 @@ class UserSerializer(serializers.ModelSerializer):
         return obj.get_access_keys()
 
     def validate_name(self, value):
+        if (value or '').strip() == SYSTEM_ADMIN_USERNAME and not (
+            self.instance and getattr(self.instance, 'is_system', False)
+        ):
+            raise serializers.ValidationError('Имя зарезервировано для системного пользователя.')
         qs = User.objects.filter(name=value)
         if self.instance is not None:
             qs = qs.exclude(pk=self.instance.pk)
@@ -61,6 +75,8 @@ class UserSerializer(serializers.ModelSerializer):
         return user
 
     def update(self, instance, validated_data):
+        if getattr(instance, 'is_system', False):
+            raise serializers.ValidationError('Системный пользователь недоступен для изменения.')
         password = validated_data.pop('password', None)
         for k, v in validated_data.items():
             setattr(instance, k, v)
@@ -82,6 +98,11 @@ class UserAccessPatchSerializer(serializers.Serializer):
     """PATCH users/:id/access/ — полная замена UserAccess для пользователя."""
 
     access_keys = serializers.ListField(child=serializers.CharField())
+
+    def validate(self, attrs):
+        if self.instance is not None and getattr(self.instance, 'is_system', False):
+            raise serializers.ValidationError('Системному пользователю нельзя менять доступы через API.')
+        return attrs
 
     def validate_access_keys(self, value):
         return _validate_access_keys_list(value)

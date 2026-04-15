@@ -13,6 +13,8 @@ def assign_default_role_for_new_user(sender, instance, created, raw, **kwargs):
     """
     if not created or raw:
         return
+    if getattr(instance, 'is_system', False):
+        return
 
     if ensure_user_role_for_tab_accesses(instance):
         User.objects.filter(pk=instance.pk).update(role_id=instance.role_id)

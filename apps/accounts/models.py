@@ -6,11 +6,19 @@ from django.db import models
 class Role(models.Model):
     name = models.CharField('Название', max_length=100)
     description = models.TextField('Описание', blank=True)
+    is_system = models.BooleanField('Системная', default=False, db_index=True)
 
     class Meta:
         db_table = 'roles'
         verbose_name = 'Роль'
         verbose_name_plural = 'Роли'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('is_system',),
+                condition=models.Q(is_system=True),
+                name='role_single_system_flag',
+            ),
+        ]
 
     def __str__(self):
         return self.name
@@ -66,6 +74,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     name = models.CharField('Имя', max_length=255)
     email = models.EmailField('Email', unique=True)
     role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, blank=True, related_name='users')
+    is_system = models.BooleanField('Системный пользователь', default=False, db_index=True)
     is_active = models.BooleanField('Активен', default=True)
     is_staff = models.BooleanField('Персонал', default=False)
     date_joined = models.DateTimeField(auto_now_add=True)
@@ -79,6 +88,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         db_table = 'users'
         verbose_name = 'Пользователь'
         verbose_name_plural = 'Пользователи'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('is_system',),
+                condition=models.Q(is_system=True),
+                name='user_single_system_flag',
+            ),
+        ]
 
     def __str__(self):
         return self.email

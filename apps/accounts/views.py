@@ -4,6 +4,7 @@ from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema, inline_serializer
 from rest_framework import serializers, viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
@@ -167,6 +168,15 @@ class UserViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     search_fields = ['name', 'email']
     ordering_fields = ['id', 'name', 'email', 'date_joined']
 
+    def get_queryset(self):
+        return super().get_queryset().filter(is_system=False)
+
+    def get_object(self):
+        pk = self.kwargs.get('pk')
+        if pk is not None and User.objects.filter(pk=pk, is_system=True).exists():
+            raise PermissionDenied('Системный пользователь защищён от доступа через API.')
+        return super().get_object()
+
     @extend_schema(
         tags=['auth'],
         summary='Доступы к разделам (UserAccess)',
@@ -209,3 +219,12 @@ class RoleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     filterset_fields = []
     search_fields = ['name']
     ordering_fields = ['id', 'name']
+
+    def get_queryset(self):
+        return super().get_queryset().filter(is_system=False)
+
+    def get_object(self):
+        pk = self.kwargs.get('pk')
+        if pk is not None and Role.objects.filter(pk=pk, is_system=True).exists():
+            raise PermissionDenied('Системная роль защищена от доступа через API.')
+        return super().get_object()

@@ -278,7 +278,10 @@ class ShiftComplaintListSerializer(serializers.ModelSerializer):
         return {'id': u.pk, 'name': u.name, 'username': u.email}
 
     def get_mentioned_users(self, obj):
-        return [{'id': u.pk, 'name': u.name, 'username': u.email} for u in obj.mentioned_users.all()]
+        return [
+            {'id': u.pk, 'name': u.name, 'username': u.email}
+            for u in obj.mentioned_users.filter(is_system=False)
+        ]
 
 
 class ShiftComplaintCreateSerializer(serializers.ModelSerializer):
@@ -315,7 +318,9 @@ class ShiftComplaintCreateSerializer(serializers.ModelSerializer):
         ids = [i for i in ids if i != request.user.pk]
         attrs['mentioned_user_ids'] = ids
         if ids:
-            found = set(User.objects.filter(pk__in=ids).values_list('pk', flat=True))
+            found = set(
+                User.objects.filter(pk__in=ids, is_system=False).values_list('pk', flat=True),
+            )
             missing = [i for i in ids if i not in found]
             if missing:
                 raise serializers.ValidationError(
