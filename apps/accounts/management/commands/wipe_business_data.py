@@ -1,8 +1,10 @@
 """
-Удаление всех прикладных данных, сохранение сотрудников (accounts.User, Role, RoleAccess).
+Полная очистка бизнес-данных и прикладных пользователей/ролей.
 
-Также сохраняются: django.contrib.auth (Permission, Group), contenttypes, миграции.
-Сессии, JWT blacklist и admin LogEntry очищаются.
+Сохраняются: записи с is_system=True (системный Admin и роль Администратор),
+RoleAccess/UserAccess системной пары после ensure_system_admin_entities.
+
+Не трогаются: схема БД, миграции, django.contrib.auth.Permission/Group, contenttypes.
 """
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
@@ -32,6 +34,7 @@ _DELETE_MODEL_LABELS = [
     ('production', 'Order'),
     ('recipes', 'RecipeComponent'),
     ('recipes', 'Recipe'),
+    ('recipes', 'PlasticProfile'),
     ('materials', 'MaterialStockDeduction'),
     ('materials', 'MaterialBatch'),
     ('chemistry', 'ChemistryStockDeduction'),
@@ -47,7 +50,7 @@ _DELETE_MODEL_LABELS = [
 
 
 class Command(BaseCommand):
-    help = 'Удалить все данные приложения, кроме сотрудников (пользователи, роли, доступы ролей).'
+    help = 'Полная очистка бизнес-данных; системный Admin и роль Администратор восстанавливаются через ensure_system_admin_entities.'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -61,8 +64,8 @@ class Command(BaseCommand):
         if not options['confirm']:
             raise CommandError('Добавьте флаг --yes для подтверждения полной очистки.')
 
+        total = 0
         with transaction.atomic():
-            total = 0
             for app_label, model_name in _DELETE_MODEL_LABELS:
                 try:
                     model = apps.get_model(app_label, model_name)
@@ -76,11 +79,25 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(f'{app_label}.{model_name}: {deleted} объектов')
 
-        users_left = apps.get_model('accounts', 'User').objects.count()
-        roles_left = apps.get_model('accounts', 'Role').objects.count()
+        User = apps.get_model('accounts', 'User')
+        Role = apps.get_model('accounts', 'Role')
+        with transaction.atomic():
+            u_del, u_det = User.objects.filter(is_system=False).delete()
+            r_del, r_det = Role.objects.filter(is_system=False).delete()
+            total += u_del + r_del
+            self.stdout.write(f'accounts.User (не системные): {u_del} — {u_det}')
+            self.stdout.write(f'accounts.Role (не системные): {r_del} — {r_det}')
+
+        from apps.accounts.system_bootstrap import ensure_system_admin_entities
+
+        ensure_system_admin_entities()
+
+        users_left = User.objects.count()
+        roles_left = Role.objects.count()
         self.stdout.write(
             self.style.SUCCESS(
                 f'Готово. Удалено записей (сумма каскадов): {total}. '
-                f'Осталось пользователей: {users_left}, ролей: {roles_left}.'
+                f'Осталось пользователей: {users_left}, ролей: {roles_left}. '
+                f'Системный Admin и доступы синхронизированы.'
             )
         )
