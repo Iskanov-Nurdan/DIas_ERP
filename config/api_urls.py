@@ -27,7 +27,11 @@ from apps.otk.views import OtkPendingView
 from apps.analytics.views import (
     AnalyticsSummaryView,
     AnalyticsRevenueDetailsView,
-    AnalyticsExpenseDetailsView,
+    AnalyticsSalesCostDetailsView,
+    AnalyticsProductionCostDetailsView,
+    AnalyticsPurchaseDetailsView,
+    AnalyticsProfitDetailsView,
+    AnalyticsOtkDetailsView,
     AnalyticsWriteoffDetailsView,
 )
 from apps.activity.views import (
@@ -59,7 +63,15 @@ router.register(r'sales', SaleViewSet, basename='sale')
 router.register(r'otk/pending', OtkPendingView, basename='otk-pending')
 router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-summary')
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')
-router.register(r'analytics/expense-details', AnalyticsExpenseDetailsView, basename='analytics-expense-details')
+router.register(r'analytics/sales-cost-details', AnalyticsSalesCostDetailsView, basename='analytics-sales-cost-details')
+router.register(
+    r'analytics/production-cost-details',
+    AnalyticsProductionCostDetailsView,
+    basename='analytics-production-cost-details',
+)
+router.register(r'analytics/purchase-details', AnalyticsPurchaseDetailsView, basename='analytics-purchase-details')
+router.register(r'analytics/profit-details', AnalyticsProfitDetailsView, basename='analytics-profit-details')
+router.register(r'analytics/otk-details', AnalyticsOtkDetailsView, basename='analytics-otk-details')
 router.register(r'analytics/writeoff-details', AnalyticsWriteoffDetailsView, basename='analytics-writeoff-details')
 router.register(r'shifts', ShiftViewSet, basename='shift')
 
