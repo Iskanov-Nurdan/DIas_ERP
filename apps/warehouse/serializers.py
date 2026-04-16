@@ -3,6 +3,8 @@ from decimal import Decimal
 from django.core.exceptions import ObjectDoesNotExist
 from rest_framework import serializers
 
+from config.api_numbers import api_decimal_str
+
 from .models import WarehouseBatch
 from .packaging import warehouse_packaging_breakdown
 
@@ -15,36 +17,14 @@ def _packaging_int_field(value):
     return int(q.to_integral_value())
 
 
-def _packaging_status_api(obj: WarehouseBatch) -> str:
-    """UI-синонимы: not_packed / packed / opened."""
-    if obj.inventory_form == WarehouseBatch.INVENTORY_UNPACKED:
-        return 'not_packed'
-    if obj.inventory_form == WarehouseBatch.INVENTORY_PACKED:
-        return 'packed'
-    if obj.inventory_form == WarehouseBatch.INVENTORY_OPEN_PACKAGE:
-        return 'opened'
-    return obj.inventory_form
-
-
 class WarehouseBatchSerializer(serializers.ModelSerializer):
-    package_opened = serializers.SerializerMethodField()
-    open_package = serializers.SerializerMethodField()
-    stock_form = serializers.CharField(source='inventory_form', read_only=True)
-    packaging_status = serializers.SerializerMethodField()
+    """Склад ГП: один канон `inventory_form`, без дублей габаритов и алиасов упаковки."""
     line_name = serializers.SerializerMethodField()
     height = serializers.SerializerMethodField()
     width = serializers.SerializerMethodField()
     angle_deg = serializers.SerializerMethodField()
-    shift_height = serializers.SerializerMethodField()
-    shift_width = serializers.SerializerMethodField()
-    shift_angle_deg = serializers.SerializerMethodField()
-    product_name = serializers.CharField(source='product', read_only=True)
-    product_id = serializers.SerializerMethodField()
-    product_detail = serializers.SerializerMethodField()
-    available_quantity = serializers.SerializerMethodField()
     sealed_packages_count = serializers.SerializerMethodField()
     open_package_pieces = serializers.SerializerMethodField()
-    pieces_in_open_package = serializers.SerializerMethodField()
     sealed_pieces = serializers.SerializerMethodField()
     packaging_quantity_consistent = serializers.SerializerMethodField()
 
@@ -53,33 +33,21 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'product',
-            'product_name',
-            'product_id',
-            'product_detail',
             'quantity',
-            'available_quantity',
             'status',
             'date',
             'source_batch',
             'inventory_form',
-            'stock_form',
-            'packaging_status',
             'line_name',
             'height',
             'width',
             'angle_deg',
-            'shift_height',
-            'shift_width',
-            'shift_angle_deg',
-            'package_opened',
-            'open_package',
             'unit_meters',
             'package_total_meters',
             'pieces_per_package',
             'packages_count',
             'sealed_packages_count',
             'open_package_pieces',
-            'pieces_in_open_package',
             'sealed_pieces',
             'packaging_quantity_consistent',
             'otk_accepted',
@@ -91,23 +59,52 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             'otk_status',
             'quality',
             'defect_reason',
+            'length_per_piece',
+            'cost_per_piece',
+            'cost_per_meter',
+            'total_meters',
         )
 
-    def get_product_id(self, obj):
-        """Ключ продукта на строке = наименование (как в фильтре/упаковке)."""
-        return (obj.product or '').strip() or None
-
-    def get_product_detail(self, obj):
-        """Вложенный объект продукта (на строке склада нет FK — id = тот же ключ, что product_id)."""
-        name = (obj.product or '').strip()
-        if not name:
+    def get_line_name(self, obj):
+        pb = obj.source_batch
+        if pb is None or not pb.order_id:
             return None
-        return {'id': name, 'name': name}
+        try:
+            order = pb.order
+        except ObjectDoesNotExist:
+            return None
+        if getattr(order, 'line_id', None):
+            try:
+                n = (order.line.name or '').strip()
+                if n:
+                    return n
+            except ObjectDoesNotExist:
+                pass
+        snap = (getattr(order, 'line_name_snapshot', None) or '').strip()
+        return snap or None
 
-    def get_available_quantity(self, obj):
-        if obj.status == WarehouseBatch.STATUS_AVAILABLE:
-            return float(obj.quantity) if obj.quantity is not None else None
+    def _unit_meters_dec(self, obj):
+        if obj.unit_meters is not None:
+            return Decimal(str(obj.unit_meters))
+        pb = obj.source_batch
+        if pb is not None and pb.shift_height is not None:
+            return Decimal(str(pb.shift_height))
         return None
+
+    def get_height(self, obj):
+        return api_decimal_str(self._unit_meters_dec(obj))
+
+    def get_width(self, obj):
+        pb = obj.source_batch
+        if pb is None or pb.shift_width is None:
+            return None
+        return api_decimal_str(pb.shift_width)
+
+    def get_angle_deg(self, obj):
+        pb = obj.source_batch
+        if pb is None or pb.shift_angle_deg is None:
+            return None
+        return api_decimal_str(pb.shift_angle_deg)
 
     def _packaging_breakdown(self, obj: WarehouseBatch) -> dict:
         cache = getattr(self, '_wh_breakdown_cache', None)
@@ -143,9 +140,6 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             return None
         return self._packaging_breakdown(obj)['open_package_pieces']
 
-    def get_pieces_in_open_package(self, obj):
-        return self.get_open_package_pieces(obj)
-
     def get_sealed_pieces(self, obj):
         inv = obj.inventory_form
         if inv not in (
@@ -164,108 +158,39 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             return None
         return self._packaging_breakdown(obj)['packaging_quantity_consistent']
 
-    def get_packaging_status(self, obj):
-        return _packaging_status_api(obj)
-
-    def get_line_name(self, obj):
-        pb = obj.source_batch
-        if pb is None or not pb.order_id:
-            return None
-        try:
-            order = pb.order
-        except ObjectDoesNotExist:
-            return None
-        if getattr(order, 'line_id', None):
-            try:
-                n = (order.line.name or '').strip()
-                if n:
-                    return n
-            except ObjectDoesNotExist:
-                pass
-        snap = (getattr(order, 'line_name_snapshot', None) or '').strip()
-        return snap or None
-
-    def _shift_height_val(self, obj):
-        if obj.unit_meters is not None:
-            return float(obj.unit_meters)
-        pb = obj.source_batch
-        if pb is not None and pb.shift_height is not None:
-            return float(pb.shift_height)
-        return None
-
-    def get_shift_height(self, obj):
-        return self._shift_height_val(obj)
-
-    def get_height(self, obj):
-        v = self._shift_height_val(obj)
-        if v is not None:
-            return v
-        pb = obj.source_batch
-        if pb is not None and pb.shift_height is not None:
-            return float(pb.shift_height)
-        return None
-
-    def get_shift_width(self, obj):
-        pb = obj.source_batch
-        if pb is None or pb.shift_width is None:
-            return None
-        return float(pb.shift_width)
-
-    def get_width(self, obj):
-        return self.get_shift_width(obj)
-
-    def get_shift_angle_deg(self, obj):
-        pb = obj.source_batch
-        if pb is None or pb.shift_angle_deg is None:
-            return None
-        return float(pb.shift_angle_deg)
-
-    def get_angle_deg(self, obj):
-        return self.get_shift_angle_deg(obj)
-
-    def get_package_opened(self, obj):
-        return obj.inventory_form == WarehouseBatch.INVENTORY_OPEN_PACKAGE
-
-    def get_open_package(self, obj):
-        return obj.inventory_form == WarehouseBatch.INVENTORY_OPEN_PACKAGE
-
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        dim_keys = ('unit_meters', 'package_total_meters')
-        for k in dim_keys:
-            if ret.get(k) is None:
+        for k in ('quantity', 'length_per_piece', 'total_meters', 'cost_per_piece', 'cost_per_meter'):
+            v = ret.get(k)
+            if v is not None:
+                ret[k] = api_decimal_str(v)
+        for k in ('unit_meters', 'package_total_meters', 'pieces_per_package', 'packages_count'):
+            v = ret.get(k)
+            if v is None:
                 ret.pop(k, None)
+            elif k in ('pieces_per_package', 'packages_count') and ret.get('inventory_form') in (
+                WarehouseBatch.INVENTORY_PACKED,
+                WarehouseBatch.INVENTORY_OPEN_PACKAGE,
+            ):
+                ret[k] = _packaging_int_field(v) if v is not None else None
+            else:
+                ret[k] = api_decimal_str(v)
 
         inv = instance.inventory_form
-        packaging_row = inv in (
+        if inv not in (
             WarehouseBatch.INVENTORY_PACKED,
             WarehouseBatch.INVENTORY_OPEN_PACKAGE,
-        )
-        if packaging_row:
-            ppp = _packaging_int_field(instance.pieces_per_package)
-            pc = _packaging_int_field(instance.packages_count)
-            ret['pieces_per_package'] = ppp
-            ret['packages_count'] = pc
-            # Алиасы счёта упаковок = только запечатанные (как packages_count в БД), не «все штуки / ppp».
-            bd = self._packaging_breakdown(instance)
-            s_cnt = bd['sealed_packages_count']
-            ret['pieces_in_package'] = ppp
-            ret['pieces_per_pack'] = ppp
-            ret['packs_count'] = s_cnt if s_cnt is not None else pc
-            ret['pack_count'] = s_cnt if s_cnt is not None else pc
-            ret['package_count'] = s_cnt if s_cnt is not None else pc
-            ret['num_packages'] = s_cnt if s_cnt is not None else pc
-        else:
+        ):
             for k in (
                 'pieces_per_package',
                 'packages_count',
                 'sealed_packages_count',
                 'open_package_pieces',
-                'pieces_in_open_package',
                 'sealed_pieces',
                 'packaging_quantity_consistent',
             ):
                 ret.pop(k, None)
+
         otk_keys = (
             'otk_accepted',
             'otk_defect',
@@ -279,6 +204,6 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             v = ret.get(k)
             if v is None or v == '':
                 ret.pop(k, None)
-        if ret.get('product_detail') is None:
-            ret.pop('product_detail', None)
+            elif k in ('otk_accepted', 'otk_defect'):
+                ret[k] = api_decimal_str(v)
         return ret

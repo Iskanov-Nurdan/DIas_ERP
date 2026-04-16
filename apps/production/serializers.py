@@ -5,12 +5,13 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from rest_framework import serializers
 
+from config.api_numbers import api_decimal_str
 from config.decimal_format import format_decimal_plain
 from config.fields import CleanDecimalField
 
 from apps.accounts.models import User
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
-from apps.recipes.serializers import RecipeSerializer
+from apps.recipes.serializers import PlasticProfileNestedSerializer, RecipeSerializer
 from config.exceptions import LineShiftPausedForRecipeRun
 from .batch_stock import apply_production_batch_stock_and_cost, resync_production_batch_consumption
 from .shift_state import (
@@ -54,6 +55,21 @@ def _line_display_name(obj) -> Optional[str]:
             pass
     snap = (getattr(obj, 'line_name_snapshot', None) or '').strip()
     return snap or None
+
+
+def _batch_plastic_profile(obj: ProductionBatch) -> Optional[PlasticProfile]:
+    """Профиль партии: FK партии, иначе профиль рецепта (старые строки без profile_id)."""
+    if getattr(obj, 'profile_id', None):
+        try:
+            return obj.profile
+        except ObjectDoesNotExist:
+            pass
+    if getattr(obj, 'recipe_id', None):
+        try:
+            return obj.recipe.profile
+        except ObjectDoesNotExist:
+            pass
+    return None
 
 
 def _recipe_run_display_recipe(run) -> Optional[str]:
@@ -195,12 +211,11 @@ class LineSerializer(serializers.ModelSerializer):
         opener = ev_open.user.name if ev_open.user_id else None
         cmt = (ev_params.comment or '').strip() or None
         return {
-            'height': float(ev_params.height) if ev_params.height is not None else None,
-            'width': float(ev_params.width) if ev_params.width is not None else None,
-            'angle_deg': float(ev_params.angle_deg) if ev_params.angle_deg is not None else None,
+            'height': api_decimal_str(ev_params.height),
+            'width': api_decimal_str(ev_params.width),
+            'angle_deg': api_decimal_str(ev_params.angle_deg),
             'comment': cmt,
             'opened_by': opener,
-            'opened_by_name': opener,
             'opened_at': opened_at.isoformat(),
             'session_title': ev_open.session_title or None,
             'is_paused': line_shift_is_paused(obj, histories=hist),
@@ -210,9 +225,7 @@ class LineSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         if instance is None:
             return None
-        ret = super().to_representation(instance)
-        ret['comment'] = ret.get('notes') or ''
-        return ret
+        return super().to_representation(instance)
 
 
 class ShiftNoteSerializer(serializers.ModelSerializer):
@@ -226,20 +239,16 @@ class ShiftNoteSerializer(serializers.ModelSerializer):
 class ShiftSerializer(serializers.ModelSerializer):
     user_name = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
-    line_label = serializers.SerializerMethodField()
     notes_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = Shift
         fields = (
-            'id', 'line', 'line_name', 'line_label', 'line_name_snapshot', 'former_line_id',
+            'id', 'line', 'line_name', 'line_name_snapshot', 'former_line_id',
             'user', 'user_name',
             'opened_at', 'closed_at', 'status', 'comment', 'notes_count',
         )
         read_only_fields = ('line_name_snapshot', 'former_line_id',)
-
-    def get_line_label(self, obj):
-        return self.get_line_name(obj)
 
     def get_user_name(self, obj):
         if obj.user_id:
@@ -362,7 +371,6 @@ class LineShiftPauseSerializer(serializers.Serializer):
 
 class LineHistorySerializer(serializers.ModelSerializer):
     line_name = serializers.SerializerMethodField()
-    line_label = serializers.SerializerMethodField()
     date = serializers.DateField(format='%Y-%m-%d')
     time = serializers.TimeField(format='%H:%M')
     height = serializers.SerializerMethodField()
@@ -370,18 +378,17 @@ class LineHistorySerializer(serializers.ModelSerializer):
     angle_deg = serializers.SerializerMethodField()
     session_title = serializers.SerializerMethodField()
     reason = serializers.SerializerMethodField()
-    pause_reason = serializers.SerializerMethodField()
     opened_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = LineHistory
         fields = (
-            'id', 'line_id', 'date', 'time', 'line_name', 'line_label',
+            'id', 'line_id', 'date', 'time', 'line_name',
             'line_name_snapshot', 'former_line_id',
             'action',
             'user',
             'height', 'width', 'angle_deg', 'comment', 'session_title',
-            'reason', 'pause_reason',
+            'reason',
             'opened_by_name',
         )
         read_only_fields = ('line_name_snapshot', 'former_line_id')
@@ -389,17 +396,14 @@ class LineHistorySerializer(serializers.ModelSerializer):
     def get_line_name(self, obj):
         return _line_display_name(obj)
 
-    def get_line_label(self, obj):
-        return self.get_line_name(obj)
-
     def get_height(self, obj):
-        return float(obj.height) if obj.height is not None else None
+        return api_decimal_str(obj.height)
 
     def get_width(self, obj):
-        return float(obj.width) if obj.width is not None else None
+        return api_decimal_str(obj.width)
 
     def get_angle_deg(self, obj):
-        return float(obj.angle_deg) if obj.angle_deg is not None else None
+        return api_decimal_str(obj.angle_deg)
 
     def get_session_title(self, obj):
         if obj.action != LineHistory.ACTION_OPEN:
@@ -411,9 +415,6 @@ class LineHistorySerializer(serializers.ModelSerializer):
             return None
         s = (obj.comment or '').strip()
         return s or None
-
-    def get_pause_reason(self, obj):
-        return self.get_reason(obj)
 
     def get_opened_by_name(self, obj):
         if obj.action != LineHistory.ACTION_OPEN:
@@ -619,15 +620,16 @@ class ProductionBatchCreateUpdateSerializer(serializers.ModelSerializer):
 
 
 class BatchListSerializer(serializers.ModelSerializer):
-    """
-    Контракт GET /api/batches/: id, order_name, product_name, quantity/released,
-    operator_name, date, created_at, otk_status, otk_accepted, otk_defect,
-    otk_defect_reason, otk_comment, otk_inspector, otk_checked_at.
-    Дополнительно: recipe_name, recipe_output_quantity (норма по рецепту, справочно для ОТК).
-    """
+    """GET /api/batches/, ОТК: числа строками Decimal (без float)."""
+    profile = serializers.SerializerMethodField()
+    profile_id = serializers.SerializerMethodField()
+    profile_name = serializers.SerializerMethodField()
     order_name = serializers.SerializerMethodField()
-    product_name = serializers.CharField(source='product', read_only=True)
-    released = serializers.DecimalField(source='total_meters', max_digits=14, decimal_places=4, read_only=True)
+    total_meters = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, coerce_to_string=True)
+    length_per_piece = serializers.DecimalField(max_digits=14, decimal_places=4, read_only=True, coerce_to_string=True)
+    material_cost_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True, coerce_to_string=True)
+    cost_per_meter = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, coerce_to_string=True)
+    cost_per_piece = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, coerce_to_string=True)
     operator_name = serializers.SerializerMethodField()
     created_at = serializers.DateField(source='date', read_only=True)
     otk_accepted = serializers.SerializerMethodField()
@@ -638,13 +640,11 @@ class BatchListSerializer(serializers.ModelSerializer):
     otk_inspector_name = serializers.SerializerMethodField()
     otk_checked_at = serializers.SerializerMethodField()
     recipe_name = serializers.SerializerMethodField()
-    recipe_label = serializers.SerializerMethodField()
     recipe_name_snapshot = serializers.SerializerMethodField()
     former_recipe_id = serializers.SerializerMethodField()
     recipe_output_quantity = serializers.SerializerMethodField()
     recipe_output_unit_kind = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
-    line_label = serializers.SerializerMethodField()
     height = serializers.SerializerMethodField()
     width = serializers.SerializerMethodField()
     angle_deg = serializers.SerializerMethodField()
@@ -653,15 +653,14 @@ class BatchListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionBatch
         fields = (
-            'id', 'order', 'order_name', 'profile', 'recipe', 'line', 'shift',
-            'product', 'product_name', 'pieces', 'length_per_piece', 'total_meters',
-            'quantity', 'released',
+            'id', 'order', 'order_name', 'profile', 'profile_id', 'profile_name', 'recipe', 'line', 'shift',
+            'product', 'pieces', 'length_per_piece', 'total_meters',
             'operator', 'operator_name', 'date', 'created_at',
             'otk_status', 'otk_status_display', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
             'otk_comment', 'otk_inspector', 'otk_inspector_name', 'otk_checked_at',
-            'recipe_name', 'recipe_label', 'recipe_name_snapshot', 'former_recipe_id',
+            'recipe_name', 'recipe_name_snapshot', 'former_recipe_id',
             'recipe_output_quantity', 'recipe_output_unit_kind',
-            'line_name', 'line_label', 'height', 'width', 'angle_deg',
+            'line_name', 'height', 'width', 'angle_deg',
             'material_cost_total', 'cost_per_meter', 'cost_per_piece',
             'lifecycle_status', 'sent_to_otk', 'in_otk_queue', 'otk_submitted_at',
         )
@@ -670,6 +669,20 @@ class BatchListSerializer(serializers.ModelSerializer):
         if not hasattr(obj, '_last_otk_check'):
             obj._last_otk_check = obj.otk_checks.select_related('inspector').order_by('-checked_date').first()
         return obj._last_otk_check
+
+    def get_profile(self, obj):
+        p = _batch_plastic_profile(obj)
+        return PlasticProfileNestedSerializer(p).data if p else None
+
+    def get_profile_id(self, obj):
+        p = _batch_plastic_profile(obj)
+        return p.pk if p else None
+
+    def get_profile_name(self, obj):
+        p = _batch_plastic_profile(obj)
+        if not p:
+            return None
+        return (p.name or '').strip() or None
 
     def get_order_name(self, obj):
         if not obj.order_id:
@@ -684,11 +697,11 @@ class BatchListSerializer(serializers.ModelSerializer):
 
     def get_otk_accepted(self, obj):
         c = self._last_check(obj)
-        return float(c.accepted) if c else None
+        return api_decimal_str(c.accepted) if c else None
 
     def get_otk_defect(self, obj):
         c = self._last_check(obj)
-        return float(c.rejected) if c else None
+        return api_decimal_str(c.rejected) if c else None
 
     def get_otk_defect_reason(self, obj):
         c = self._last_check(obj)
@@ -728,9 +741,6 @@ class BatchListSerializer(serializers.ModelSerializer):
         if not obj.order_id:
             return None
         return _recipe_display_name(obj.order)
-
-    def get_recipe_label(self, obj):
-        return self.get_recipe_name(obj)
 
     def get_recipe_name_snapshot(self, obj):
         if getattr(obj, 'recipe_id', None):
@@ -788,13 +798,13 @@ class BatchListSerializer(serializers.ModelSerializer):
         return obj.get_otk_status_display()
 
     def get_height(self, obj):
-        return float(obj.shift_height) if obj.shift_height is not None else None
+        return api_decimal_str(obj.shift_height)
 
     def get_width(self, obj):
-        return float(obj.shift_width) if obj.shift_width is not None else None
+        return api_decimal_str(obj.shift_width)
 
     def get_angle_deg(self, obj):
-        return float(obj.shift_angle_deg) if obj.shift_angle_deg is not None else None
+        return api_decimal_str(obj.shift_angle_deg)
 
     def get_line_name(self, obj):
         if getattr(obj, 'line_id', None):
@@ -802,9 +812,6 @@ class BatchListSerializer(serializers.ModelSerializer):
         if not obj.order_id:
             return None
         return _line_display_name(obj.order)
-
-    def get_line_label(self, obj):
-        return self.get_line_name(obj)
 
 
 # ——— Запуски по рецепту (Химия → Элементы) ———
@@ -975,15 +982,12 @@ class RecipeRunBatchSerializer(serializers.ModelSerializer):
 class RecipeRunListSerializer(serializers.ModelSerializer):
     recipe = serializers.SerializerMethodField()
     recipe_name = serializers.SerializerMethodField()
-    recipe_label = serializers.SerializerMethodField()
     effective_recipe_id = serializers.SerializerMethodField()
     line = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
-    line_label = serializers.SerializerMethodField()
     batches = RecipeRunBatchSerializer(many=True, read_only=True)
     batches_count = serializers.IntegerField(read_only=True)
     total_quantity = serializers.SerializerMethodField()
-    output_quantity = serializers.SerializerMethodField()
     recipe_output_quantity = serializers.SerializerMethodField()
     output_unit_kind = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
@@ -991,12 +995,12 @@ class RecipeRunListSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecipeRun
         fields = (
-            'id', 'recipe', 'recipe_name', 'recipe_label', 'effective_recipe_id',
+            'id', 'recipe', 'recipe_name', 'effective_recipe_id',
             'recipe_name_snapshot', 'former_recipe_id',
-            'line', 'line_name', 'line_label',
+            'line', 'line_name',
             'line_name_snapshot', 'former_line_id',
             'batches', 'batches_count',
-            'total_quantity', 'output_quantity', 'recipe_output_quantity', 'output_unit_kind',
+            'total_quantity', 'recipe_output_quantity', 'output_unit_kind',
             'created_at', 'summary', 'production_batch_id',
         )
         read_only_fields = (
@@ -1036,24 +1040,15 @@ class RecipeRunListSerializer(serializers.ModelSerializer):
     def get_recipe_name(self, obj):
         return _recipe_run_display_recipe(obj)
 
-    def get_recipe_label(self, obj):
-        return self.get_recipe_name(obj)
-
     def get_effective_recipe_id(self, obj):
         return obj.recipe_id or obj.former_recipe_id
 
     def get_line_name(self, obj):
         return _recipe_run_display_line(obj)
 
-    def get_line_label(self, obj):
-        return self.get_line_name(obj)
-
     def get_total_quantity(self, obj):
         q = _recipe_run_release_qty_decimal(obj)
         return format_decimal_plain(q) if q is not None else None
-
-    def get_output_quantity(self, obj):
-        return self.get_total_quantity(obj)
 
     def get_recipe_output_quantity(self, obj):
         return _recipe_norm_output_str(obj)
@@ -1074,17 +1069,14 @@ class RecipeRunListSerializer(serializers.ModelSerializer):
 class RecipeRunDetailSerializer(serializers.ModelSerializer):
     recipe = serializers.SerializerMethodField()
     recipe_name = serializers.SerializerMethodField()
-    recipe_label = serializers.SerializerMethodField()
     recipe_snapshot = serializers.SerializerMethodField()
     line = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
-    line_label = serializers.SerializerMethodField()
     line_snapshot = serializers.SerializerMethodField()
     effective_recipe_id = serializers.SerializerMethodField()
     batches = RecipeRunBatchSerializer(many=True, read_only=True)
     batches_count = serializers.SerializerMethodField()
     total_quantity = serializers.SerializerMethodField()
-    output_quantity = serializers.SerializerMethodField()
     recipe_output_quantity = serializers.SerializerMethodField()
     output_unit_kind = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
@@ -1093,12 +1085,12 @@ class RecipeRunDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecipeRun
         fields = (
-            'id', 'recipe', 'recipe_name', 'recipe_label', 'recipe_snapshot',
+            'id', 'recipe', 'recipe_name', 'recipe_snapshot',
             'recipe_name_snapshot', 'former_recipe_id', 'effective_recipe_id',
-            'line', 'line_name', 'line_label', 'line_snapshot',
+            'line', 'line_name', 'line_snapshot',
             'line_name_snapshot', 'former_line_id',
             'batches', 'batches_count',
-            'total_quantity', 'output_quantity', 'recipe_output_quantity', 'output_unit_kind',
+            'total_quantity', 'recipe_output_quantity', 'output_unit_kind',
             'created_at', 'summary', 'production_batch_id', 'production_batch',
         )
         read_only_fields = (
@@ -1138,14 +1130,8 @@ class RecipeRunDetailSerializer(serializers.ModelSerializer):
     def get_recipe_name(self, obj):
         return _recipe_run_display_recipe(obj)
 
-    def get_recipe_label(self, obj):
-        return self.get_recipe_name(obj)
-
     def get_line_name(self, obj):
         return _recipe_run_display_line(obj)
-
-    def get_line_label(self, obj):
-        return self.get_line_name(obj)
 
     def get_recipe_snapshot(self, obj):
         if obj.recipe_id:
@@ -1198,9 +1184,6 @@ class RecipeRunDetailSerializer(serializers.ModelSerializer):
     def get_total_quantity(self, obj):
         q = _recipe_run_release_qty_decimal(obj)
         return format_decimal_plain(q) if q is not None else None
-
-    def get_output_quantity(self, obj):
-        return self.get_total_quantity(obj)
 
     def get_recipe_output_quantity(self, obj):
         return _recipe_norm_output_str(obj)

@@ -581,7 +581,6 @@ class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'open': ser(open_row).data,
             'updates': ser(updates_qs, many=True).data,
             'pause_resume': pause_data,
-            'pauseResume': pause_data,
         }
         if close_row:
             payload['close'] = ser(close_row).data
@@ -615,7 +614,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     """
     queryset = ProductionBatch.objects.select_related(
         'order', 'order__recipe', 'order__line', 'operator',
-        'profile', 'recipe', 'line', 'shift',
+        'profile', 'recipe', 'recipe__profile', 'line', 'shift',
     ).prefetch_related('otk_checks__inspector').all()
     serializer_class = BatchListSerializer
     permission_classes = [IsAdminOrHasProductionOrOtk]
@@ -1790,6 +1789,8 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 order_pk = pb.order_id
                 RecipeRun.objects.filter(pk=run.pk).update(production_batch_id=None)
                 ProductionBatch.objects.filter(pk=pb.pk).delete()
-                if order_pk and not Order.objects.filter(pk=order_pk).first().batches.exists():
-                    Order.objects.filter(pk=order_pk).delete()
+                if order_pk:
+                    ord_row = Order.objects.filter(pk=order_pk).first()
+                    if ord_row is not None and not ord_row.batches.exists():
+                        Order.objects.filter(pk=order_pk).delete()
         super().perform_destroy(instance)
