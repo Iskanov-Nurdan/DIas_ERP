@@ -2,6 +2,9 @@ import os
 from pathlib import Path
 
 from corsheaders.defaults import default_headers
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -90,17 +93,33 @@ else:
         },
     }
 
-# PostgreSQL: задайте DB_NAME (и при необходимости DB_USER, DB_PASSWORD, DB_HOST, DB_PORT).
-# Без DB_NAME используется SQLite в корне проекта — для локального запуска без Postgres.
-if os.getenv('DB_NAME'):
+
+def _env_first(*names: str, default: str = '') -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+FRONTEND_PORT = _env_first('FRONTEND_PORT', default='3000')
+FRONTEND_HOSTS = [
+    f'http://localhost:{FRONTEND_PORT}',
+    f'http://127.0.0.1:{FRONTEND_PORT}',
+]
+
+# PostgreSQL: поддерживаем и DB_* и стандартные PG* переменные.
+# Без имени БД используется SQLite в корне проекта — для локального запуска без Postgres.
+db_name = _env_first('DB_NAME', 'PGDATABASE')
+if db_name:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ['DB_NAME'],
-            'USER': os.getenv('DB_USER', 'postgres'),
-            'PASSWORD': os.getenv('DB_PASSWORD', ''),
-            'HOST': os.getenv('DB_HOST', 'localhost'),
-            'PORT': os.getenv('DB_PORT', '5432'),
+            'NAME': db_name,
+            'USER': _env_first('DB_USER', 'PGUSER', default='postgres'),
+            'PASSWORD': _env_first('DB_PASSWORD', 'PGPASSWORD'),
+            'HOST': _env_first('DB_HOST', 'PGHOST', default='localhost'),
+            'PORT': _env_first('DB_PORT', 'PGPORT', default='5432'),
         }
     }
 else:
@@ -182,12 +201,12 @@ SIMPLE_JWT = {
 # ——— CORS (по окружениям) ———
 _raw_cors_origins = os.environ.get(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000',
+    ','.join(FRONTEND_HOSTS),
 ).split(',')
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _raw_cors_origins if o.strip()]
 if DEBUG and not os.environ.get('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOW_ALL_ORIGINS = False
-    CORS_ALLOWED_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000']
+    CORS_ALLOWED_ORIGINS = FRONTEND_HOSTS
 
 # Кастомные заголовки: расширяем default_headers (а не подменяем целиком).
 CORS_ALLOW_HEADERS = list(default_headers) + [

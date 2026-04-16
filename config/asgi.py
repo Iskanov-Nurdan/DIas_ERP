@@ -28,10 +28,14 @@ def _websocket_allowed_origins():
     explicit = getattr(settings, 'CHANNELS_WS_ALLOWED_ORIGINS', None) or []
     if explicit:
         return list(explicit)
-    cors = list(getattr(settings, 'CORS_ALLOWED_ORIGINS', []))
-    if cors:
-        return cors
-    return ['http://localhost:3000', 'http://127.0.0.1:3000']
+    cors = list(getattr(settings, 'CORS_ALLOWED_ORIGINS', []))
+    if cors:
+        return cors
+    frontend_port = os.environ.get('FRONTEND_PORT', '3000')
+    return [
+        f'http://localhost:{frontend_port}',
+        f'http://127.0.0.1:{frontend_port}',
+    ]
 
 
 application = ProtocolTypeRouter({
@@ -43,4 +47,4 @@ application = ProtocolTypeRouter({
         allowed_origins=_websocket_allowed_origins(),
     ),
 })
-
+
