@@ -146,6 +146,8 @@ class MeView(APIView):
     description='Идемпотентно: при невалидном refresh просто возвращает OK.',
 )
 class LogoutView(APIView):
+    permission_classes = []
+
     def post(self, request):
         refresh_token = request.data.get('refresh')
         if refresh_token:
