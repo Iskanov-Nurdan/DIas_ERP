@@ -283,14 +283,6 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                     {'warehouse_batch': 'Нет целых упаковок (packages_count)'}
                 )
             sold = q4(Decimal(str(quantity)))
-            if sold > ppc:
-                raise drf_serializers.ValidationError(
-                    {
-                        'quantity': (
-                            f'Нельзя списать больше штук, чем в одной упаковке ({ppc})'
-                        ),
-                    }
-                )
             old_pc = int(q4(Decimal(str(b.packages_count))).to_integral_value())
             expected_qty = q4(Decimal(old_pc) * ppc)
             if q4(Decimal(str(b.quantity)) - expected_qty).copy_abs() > q4(Decimal('0.0001')):
@@ -302,11 +294,17 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                         ),
                     }
                 )
+            if sold > expected_qty:
+                raise drf_serializers.ValidationError(
+                    {'quantity': f'Недостаточно остатка на партии (доступно {expected_qty})'}
+                )
 
-            sealed_after = old_pc - 1
-            tail = q4(ppc - sold)
+            k_full = int(sold // ppc)
+            remainder = q4(sold - q4(Decimal(k_full) * ppc))
+            zero_eps = q4(Decimal('0.0001'))
 
-            if sold == ppc:
+            if remainder.copy_abs() <= zero_eps:
+                sealed_after = old_pc - k_full
                 b.packages_count = q4(Decimal(sealed_after))
                 b.quantity = q4(Decimal(sealed_after) * ppc)
                 if b.quantity <= 0:
@@ -315,7 +313,10 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                     b.save(update_fields=['quantity', 'packages_count'])
                 return
 
-            # Частичное вскрытие: запечатанные остаются на этой строке (packed), хвост — новая строка open_package.
+            packages_to_remove = k_full + 1
+            sealed_after = old_pc - packages_to_remove
+            tail = q4(ppc - remainder)
+
             if sealed_after > 0:
                 b.packages_count = q4(Decimal(sealed_after))
                 b.quantity = q4(Decimal(sealed_after) * ppc)

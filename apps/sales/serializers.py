@@ -6,6 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
+from config.api_numbers import api_decimal_str
 from apps.warehouse.models import WarehouseBatch
 from apps.warehouse.stock_ops import (
     PIECE_FROM_OPEN,
@@ -48,15 +49,12 @@ def _derive_quantity_input_packages(qty: Decimal, wb: WarehouseBatch) -> Optiona
 def _quantity_input_api_value(v):
     if v is None:
         return None
-    d = Decimal(str(v))
-    if d == d.to_integral_value():
-        return int(d)
-    return float(d)
+    return api_decimal_str(Decimal(str(v)))
 
 
 class ClientSerializer(serializers.ModelSerializer):
-    contact_person = serializers.CharField(source='contact', required=False, allow_blank=True)
-    whatsapp_telegram = serializers.CharField(source='messenger', required=False, allow_blank=True)
+    contact_person = serializers.CharField(source='contact', required=False, allow_blank=True, write_only=True)
+    whatsapp_telegram = serializers.CharField(source='messenger', required=False, allow_blank=True, write_only=True)
     sales_count = serializers.IntegerField(read_only=True, required=False, default=0)
     sales_total = serializers.DecimalField(
         max_digits=20, decimal_places=2, read_only=True, required=False, coerce_to_string=False,
@@ -97,18 +95,17 @@ class ClientSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        ret['second_phone'] = ret.get('phone_alt') or ''
-        ret['comment'] = ret.get('notes') or ''
         st = ret.get('sales_total')
-        if st is None:
-            ret['sales_total'] = Decimal('0')
+        if st is not None:
+            ret['sales_total'] = api_decimal_str(Decimal(str(st)))
+        else:
+            ret['sales_total'] = '0'
         return ret
 
 
 class SaleSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source='client.name', read_only=True, allow_null=True, default='')
     inventory_form = serializers.SerializerMethodField()
-    quantity_unit = serializers.SerializerMethodField()
     order_number = serializers.CharField(required=False, allow_blank=True)
     date = serializers.DateField(required=False, allow_null=True)
     client = serializers.PrimaryKeyRelatedField(
@@ -123,8 +120,6 @@ class SaleSerializer(serializers.ModelSerializer):
     stock_form = serializers.CharField(required=False, allow_blank=True, max_length=20, default='')
     piece_pick = serializers.CharField(required=False, allow_blank=True, max_length=40, default='')
     profile_name = serializers.SerializerMethodField()
-    sale_date = serializers.SerializerMethodField()
-    cost_total = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
@@ -132,14 +127,14 @@ class SaleSerializer(serializers.ModelSerializer):
             'id', 'order_number', 'client', 'client_name', 'warehouse_batch', 'warehouse_batch_id',
             'product', 'quantity', 'sale_mode', 'sold_pieces', 'sold_packages',
             'length_per_piece', 'total_meters',
-            'quantity_input', 'quantity_unit', 'price', 'revenue', 'cost', 'cost_total', 'date', 'sale_date',
+            'quantity_input', 'price', 'revenue', 'cost', 'date',
             'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
             'profile_name', 'stock_quality',
         )
         read_only_fields = (
-            'profit', 'revenue', 'cost', 'cost_total', 'total_meters', 'inventory_form', 'quantity_unit',
-            'warehouse_batch_id', 'profile_name', 'sale_date', 'stock_quality',
+            'profit', 'revenue', 'cost', 'total_meters', 'inventory_form',
+            'warehouse_batch_id', 'profile_name', 'stock_quality',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
@@ -162,12 +157,6 @@ class SaleSerializer(serializers.ModelSerializer):
             pass
         return None
 
-    def get_sale_date(self, obj):
-        return obj.date.isoformat() if obj.date else None
-
-    def get_cost_total(self, obj):
-        return obj.cost
-
     def get_inventory_form(self, obj):
         if obj.warehouse_batch_id:
             try:
@@ -176,10 +165,6 @@ class SaleSerializer(serializers.ModelSerializer):
                 pass
         sf = (obj.stock_form or '').strip()
         return sf or None
-
-    def get_quantity_unit(self, obj):
-        s = (obj.sale_unit or '').strip()
-        return s if s else None
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
@@ -192,6 +177,7 @@ class SaleSerializer(serializers.ModelSerializer):
             qu = data.get('quantity_unit')
             if (su is None or str(su).strip() == '') and qu is not None and str(qu).strip() != '':
                 data['sale_unit'] = qu
+            data.pop('quantity_unit', None)
             if data.get('sold_pieces') in (None, '') and data.get('quantity') not in (None, ''):
                 data['sold_pieces'] = data.get('quantity')
             if data.get('date') in (None, '') and data.get('sale_date') not in (None, ''):
@@ -282,6 +268,9 @@ class SaleSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
+        for key in ('quantity', 'sold_pieces', 'sold_packages', 'length_per_piece', 'total_meters', 'price', 'revenue', 'cost', 'profit'):
+            if key in ret and ret[key] is not None:
+                ret[key] = api_decimal_str(Decimal(str(ret[key])))
         if _sale_unit_is_package(instance.sale_unit):
             qi = instance.quantity_input
             if qi is None and instance.warehouse_batch_id:

@@ -4,7 +4,10 @@ from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Prefetch
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+
+from config.api_numbers import api_decimal_str
 
 from apps.activity.mixins import ActivityLoggingMixin
 from apps.chemistry.fifo import chemistry_stock_kg
@@ -247,46 +250,78 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='availability')
     def availability(self, request, pk=None):
         recipe = self.get_object()
-        lines = []
+        qp = request.query_params
+        mode = (qp.get('mode') or 'per_meter').strip().lower()
+        if mode not in ('per_meter', 'for_production'):
+            raise ValidationError({'mode': 'Допустимо: per_meter, for_production'})
+
+        tm_raw = qp.get('total_meters')
+        pieces_raw = qp.get('pieces')
+        len_raw = qp.get('length_per_piece')
+        has_prod = tm_raw not in (None, '') or (
+            pieces_raw not in (None, '') and len_raw not in (None, '')
+        )
+        if mode == 'for_production' and not has_prod:
+            raise ValidationError({'detail': 'Укажите total_meters или pieces и length_per_piece'})
+        if has_prod:
+            if tm_raw not in (None, ''):
+                total_meters = Decimal(str(tm_raw))
+            else:
+                total_meters = (Decimal(str(pieces_raw)) * Decimal(str(len_raw))).quantize(Decimal('0.0001'))
+            eff_mode = 'for_production'
+        else:
+            total_meters = Decimal('1')
+            eff_mode = 'per_meter'
+
+        if total_meters <= 0:
+            raise ValidationError({'total_meters': 'Должно быть > 0'})
+
+        q_step = Decimal('0.0001')
+        components_out = []
         all_ok = True
-        qs = recipe.components.select_related('raw_material', 'chemistry').all()
-        for comp in qs:
-            line_ok = True
+        for comp in recipe.components.select_related('raw_material', 'chemistry').order_by('id'):
+            qpm = Decimal(str(comp.quantity_per_meter or 0))
+            need = (qpm * total_meters).quantize(q_step)
             if comp.type == RecipeComponent.TYPE_RAW and comp.raw_material_id:
-                req = float(comp.quantity_per_meter)
-                avail = float(material_stock_kg(comp.raw_material_id))
-                line_ok = avail + 1e-9 >= req
-                lines.append({
-                    'type': 'raw_material',
-                    'component_id': comp.id,
-                    'material_id': comp.raw_material_id,
-                    'name': comp.raw_material.name,
-                    'quantity_per_meter_kg': req,
-                    'available_kg': avail,
-                    'ok': line_ok,
-                })
+                rm = comp.raw_material
+                avail = material_stock_kg(comp.raw_material_id)
+                unit = rm.unit or 'kg'
+                name = rm.name
+                cid = comp.id
+                ctype = 'raw_material'
+                mid = comp.raw_material_id
+                chid = None
             elif comp.type == RecipeComponent.TYPE_CHEM and comp.chemistry_id:
-                req = float(comp.quantity_per_meter)
-                avail = float(chemistry_stock_kg(comp.chemistry_id))
-                line_ok = avail + 1e-9 >= req
-                lines.append({
-                    'type': 'chemistry',
-                    'component_id': comp.id,
-                    'chemistry_id': comp.chemistry_id,
-                    'name': comp.chemistry.name,
-                    'quantity_per_meter_kg': req,
-                    'available_kg': avail,
-                    'ok': line_ok,
-                })
-            all_ok = all_ok and line_ok
-        n_ok = sum(1 for ln in lines if ln.get('ok'))
+                ch = comp.chemistry
+                avail = chemistry_stock_kg(comp.chemistry_id)
+                unit = ch.unit or 'kg'
+                name = ch.name
+                cid = comp.id
+                ctype = 'chemistry'
+                mid = None
+                chid = comp.chemistry_id
+            else:
+                continue
+            shortage = (need - avail).quantize(q_step) if need > avail else Decimal('0')
+            ok = avail >= need
+            all_ok = all_ok and ok
+            components_out.append({
+                'id': cid,
+                'component_type': ctype,
+                'material_id': mid,
+                'chemistry_id': chid,
+                'name': name,
+                'unit': unit,
+                'norm_per_meter_kg': api_decimal_str(qpm),
+                'required_total_kg': api_decimal_str(need),
+                'available_kg': api_decimal_str(avail),
+                'shortage_kg': api_decimal_str(shortage),
+                'sufficient': ok,
+            })
+
         return Response({
-            'ok': all_ok,
-            'per_meter': {'all_ok': all_ok, 'unit': 'kg'},
-            'lines': lines,
-            'summary': {
-                'lines_total': len(lines),
-                'lines_ok': n_ok,
-                'lines_missing': len(lines) - n_ok,
-            },
+            'mode': eff_mode,
+            'total_meters': api_decimal_str(total_meters),
+            'all_sufficient': all_ok,
+            'components': components_out,
         })

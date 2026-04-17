@@ -4,6 +4,7 @@ from django.db import transaction
 from rest_framework import serializers
 
 from apps.materials.models import RawMaterial
+from config.api_numbers import api_decimal_str
 from apps.materials.serializers import kg_to_display_unit
 
 from .fifo import chemistry_stock_kg
@@ -64,7 +65,7 @@ class ChemistryCatalogListSerializer(serializers.ModelSerializer):
             b = chemistry_stock_kg(obj.pk)
         else:
             b = Decimal(str(b))
-        return float(kg_to_display_unit(b, obj.unit))
+        return api_decimal_str(kg_to_display_unit(b, obj.unit))
 
     def get_deletable(self, obj):
         if (getattr(obj, 'batches_count', 0) or 0) > 0:
@@ -218,12 +219,10 @@ class ChemistryBatchSerializer(serializers.ModelSerializer):
     unit = serializers.CharField(source='chemistry.unit', read_only=True)
     produced_by_name = serializers.SerializerMethodField()
     produced_at = serializers.DateTimeField(source='created_at', read_only=True)
-    unit_cost = serializers.DecimalField(
-        source='cost_per_unit', max_digits=16, decimal_places=4, read_only=True, coerce_to_string=False
-    )
-    total_cost = serializers.DecimalField(
-        source='cost_total', max_digits=16, decimal_places=2, read_only=True, coerce_to_string=False
-    )
+    quantity_produced = serializers.DecimalField(max_digits=14, decimal_places=4, read_only=True, coerce_to_string=True)
+    quantity_remaining = serializers.DecimalField(max_digits=14, decimal_places=4, read_only=True, coerce_to_string=True)
+    cost_total = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True, coerce_to_string=True)
+    cost_per_unit = serializers.DecimalField(max_digits=16, decimal_places=4, read_only=True, coerce_to_string=True)
 
     class Meta:
         model = ChemistryBatch
@@ -236,8 +235,6 @@ class ChemistryBatchSerializer(serializers.ModelSerializer):
             'unit',
             'cost_total',
             'cost_per_unit',
-            'unit_cost',
-            'total_cost',
             'created_at',
             'produced_at',
             'produced_by',
@@ -258,6 +255,6 @@ class ChemistryBatchSerializer(serializers.ModelSerializer):
         mat = instance.chemistry
         qp = kg_to_display_unit(Decimal(str(instance.quantity_produced)), mat.unit)
         qr = kg_to_display_unit(Decimal(str(instance.quantity_remaining)), mat.unit)
-        ret['quantity_produced'] = float(qp)
-        ret['quantity_remaining'] = float(qr)
+        ret['quantity_produced'] = api_decimal_str(qp)
+        ret['quantity_remaining'] = api_decimal_str(qr)
         return ret

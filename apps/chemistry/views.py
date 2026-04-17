@@ -90,7 +90,7 @@ class ChemistryCatalogViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         )
         return qs
 
-    def partial_update(self, request, *args, **kwargs):
+    def update(self, request, *args, **kwargs):
         instance = self.get_object()
         if 'unit' in request.data:
             new_u = request.data.get('unit')
@@ -101,10 +101,7 @@ class ChemistryCatalogViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         {'detail': msg, 'error': msg},
                         status=status.HTTP_409_CONFLICT,
                     )
-        return super().partial_update(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
+        return super().update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()

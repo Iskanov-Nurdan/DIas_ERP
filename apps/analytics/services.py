@@ -11,6 +11,32 @@ from typing import Any, Optional
 from django.db.models import Q, Sum
 
 from apps.materials.models import MaterialBatch
+from apps.production.models import ProductionBatch
+
+_OTK_STATUS_FILTER_VALUES = {c[0] for c in ProductionBatch.OTK_STATUS_CHOICES}
+
+
+def _qp_first(qp, key: str) -> Optional[str]:
+    v = qp.get(key)
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else None
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s != '' else None
+
+
+def _analytics_batch_status_filter(qp) -> Optional[str]:
+    """Только реальные otk_status партии; иначе фронт передаёт status=available и т.п. — всё обнуляется."""
+    raw = _qp_first(qp, 'otk_status') or _qp_first(qp, 'status')
+    if raw is None:
+        return None
+    low = raw.lower()
+    if low in _OTK_STATUS_FILTER_VALUES:
+        return low
+    return None
 
 
 @dataclass
@@ -28,8 +54,13 @@ class Period:
         return q
 
     def incoming_q(self) -> Q:
-        """Партии прихода — бизнес-дата received_at."""
-        return self._date_field_q('received_at')
+        """Партии прихода — календарная дата прихода (без сдвига TZ на datetime)."""
+        q = Q(received_at__date__year=self.year)
+        if self.month is not None:
+            q &= Q(received_at__date__month=self.month)
+        if self.day is not None:
+            q &= Q(received_at__date__day=self.day)
+        return q
 
     def batch_q(self) -> Q:
         return self._date_field_q('date')
@@ -38,44 +69,44 @@ class Period:
         return self._date_field_q('date')
 
     def writeoff_q(self) -> Q:
-        """Списания сырья фиксируются по времени записи."""
-        q = Q(created_at__year=self.year)
+        """Списания сырья — по календарной дате created_at."""
+        q = Q(created_at__date__year=self.year)
         if self.month is not None:
-            q &= Q(created_at__month=self.month)
+            q &= Q(created_at__date__month=self.month)
         if self.day is not None:
-            q &= Q(created_at__day=self.day)
+            q &= Q(created_at__date__day=self.day)
         return q
 
     def shift_opened_q(self) -> Q:
-        q = Q(opened_at__year=self.year)
+        q = Q(opened_at__date__year=self.year)
         if self.month is not None:
-            q &= Q(opened_at__month=self.month)
+            q &= Q(opened_at__date__month=self.month)
         if self.day is not None:
-            q &= Q(opened_at__day=self.day)
+            q &= Q(opened_at__date__day=self.day)
         return q
 
     def recipe_run_q(self) -> Q:
-        q = Q(created_at__year=self.year)
+        q = Q(created_at__date__year=self.year)
         if self.month is not None:
-            q &= Q(created_at__month=self.month)
+            q &= Q(created_at__date__month=self.month)
         if self.day is not None:
-            q &= Q(created_at__day=self.day)
+            q &= Q(created_at__date__day=self.day)
         return q
 
     def activity_q(self) -> Q:
-        q = Q(created_at__year=self.year)
+        q = Q(created_at__date__year=self.year)
         if self.month is not None:
-            q &= Q(created_at__month=self.month)
+            q &= Q(created_at__date__month=self.month)
         if self.day is not None:
-            q &= Q(created_at__day=self.day)
+            q &= Q(created_at__date__day=self.day)
         return q
 
     def complaint_q(self) -> Q:
-        q = Q(created_at__year=self.year)
+        q = Q(created_at__date__year=self.year)
         if self.month is not None:
-            q &= Q(created_at__month=self.month)
+            q &= Q(created_at__date__month=self.month)
         if self.day is not None:
-            q &= Q(created_at__day=self.day)
+            q &= Q(created_at__date__day=self.day)
         return q
 
     def shipment_by_sale_q(self) -> Q:
@@ -99,9 +130,10 @@ class Period:
 
 
 def parse_period(request) -> Period:
-    year_raw = request.query_params.get('year')
-    month_raw = request.query_params.get('month')
-    day_raw = request.query_params.get('day')
+    qp = request.query_params
+    year_raw = _qp_first(qp, 'year')
+    month_raw = _qp_first(qp, 'month')
+    day_raw = _qp_first(qp, 'day')
     try:
         year = int(year_raw) if year_raw else datetime.now().year
     except (ValueError, TypeError):
@@ -109,11 +141,11 @@ def parse_period(request) -> Period:
     month: Optional[int]
     day: Optional[int]
     try:
-        month = int(month_raw) if month_raw not in (None, '') else None
+        month = int(month_raw) if month_raw is not None else None
     except (ValueError, TypeError):
         month = None
     try:
-        day = int(day_raw) if day_raw not in (None, '') else None
+        day = int(day_raw) if day_raw is not None else None
     except (ValueError, TypeError):
         day = None
     return Period(year=year, month=month, day=day)
@@ -123,7 +155,10 @@ def _parse_iso_date(raw) -> Optional[date]:
     if raw in (None, ''):
         return None
     try:
-        return datetime.strptime(str(raw)[:10], '%Y-%m-%d').date()
+        s = str(raw).strip()[:10]
+        if len(s) < 10:
+            return None
+        return datetime.strptime(s, '%Y-%m-%d').date()
     except (ValueError, TypeError):
         return None
 
@@ -149,7 +184,7 @@ class AnalyticsScope:
     profile_id: Optional[int] = None
     recipe_id: Optional[int] = None
     batch_id: Optional[int] = None
-    status: Optional[str] = None
+    otk_status: Optional[str] = None
 
     def _range_q(self, field: str) -> Q:
         if not self.date_from and not self.date_to:
@@ -180,6 +215,22 @@ class AnalyticsScope:
     def writeoff_q(self) -> Q:
         if not self.date_from and not self.date_to:
             return self.period.writeoff_q()
+        q = Q()
+        if self.date_from:
+            q &= Q(created_at__date__gte=self.date_from)
+        if self.date_to:
+            q &= Q(created_at__date__lte=self.date_to)
+        return q
+
+    def chemistry_writeoff_q(self) -> Q:
+        """Списания химии — по календарной дате created_at."""
+        if not self.date_from and not self.date_to:
+            q = Q(created_at__date__year=self.period.year)
+            if self.period.month is not None:
+                q &= Q(created_at__date__month=self.period.month)
+            if self.period.day is not None:
+                q &= Q(created_at__date__day=self.period.day)
+            return q
         q = Q()
         if self.date_from:
             q &= Q(created_at__date__gte=self.date_from)
@@ -249,7 +300,7 @@ class AnalyticsScope:
         d['profile_id'] = self.profile_id
         d['recipe_id'] = self.recipe_id
         d['batch_id'] = self.batch_id
-        d['status'] = self.status
+        d['otk_status'] = self.otk_status
         return d
 
 
@@ -261,6 +312,8 @@ def sale_scope_q(scope: AnalyticsScope) -> Q:
         q &= Q(warehouse_batch__source_batch__line_id=scope.line_id)
     if scope.profile_id:
         q &= Q(warehouse_batch__profile_id=scope.profile_id)
+    if scope.recipe_id:
+        q &= Q(warehouse_batch__source_batch__recipe_id=scope.recipe_id)
     if scope.batch_id:
         q &= Q(warehouse_batch__source_batch_id=scope.batch_id)
     return q
@@ -276,8 +329,8 @@ def production_batch_scope_q(scope: AnalyticsScope) -> Q:
         q &= Q(recipe_id=scope.recipe_id)
     if scope.batch_id:
         q &= Q(id=scope.batch_id)
-    if scope.status:
-        q &= Q(otk_status=scope.status)
+    if scope.otk_status:
+        q &= Q(otk_status=scope.otk_status)
     return q
 
 
@@ -293,20 +346,34 @@ def recipe_run_scope_q(scope: AnalyticsScope) -> Q:
 def parse_analytics_scope(request) -> AnalyticsScope:
     p = parse_period(request)
     qp = request.query_params
-    st = qp.get('status')
-    if st == '':
-        st = None
+    st = _analytics_batch_status_filter(qp)
     return AnalyticsScope(
         period=p,
-        date_from=_parse_iso_date(qp.get('date_from')),
-        date_to=_parse_iso_date(qp.get('date_to')),
-        line_id=_parse_int_param(qp.get('line_id')),
-        client_id=_parse_int_param(qp.get('client_id')),
-        profile_id=_parse_int_param(qp.get('profile_id')),
-        recipe_id=_parse_int_param(qp.get('recipe_id')),
-        batch_id=_parse_int_param(qp.get('batch_id')),
-        status=st,
+        date_from=_parse_iso_date(_qp_first(qp, 'date_from')),
+        date_to=_parse_iso_date(_qp_first(qp, 'date_to')),
+        line_id=_parse_int_param(_qp_first(qp, 'line_id')),
+        client_id=_parse_int_param(_qp_first(qp, 'client_id')),
+        profile_id=_parse_int_param(_qp_first(qp, 'profile_id')),
+        recipe_id=_parse_int_param(_qp_first(qp, 'recipe_id')),
+        batch_id=_parse_int_param(_qp_first(qp, 'batch_id')),
+        otk_status=st,
     )
+
+
+def warehouse_batches_scope_qs(scope: AnalyticsScope):
+    """Снимок склада ГП: фильтры по профилю / линии / рецепту / партии производства (не по клиенту)."""
+    from apps.warehouse.models import WarehouseBatch
+
+    qs = WarehouseBatch.objects.all()
+    if scope.profile_id:
+        qs = qs.filter(profile_id=scope.profile_id)
+    if scope.line_id:
+        qs = qs.filter(source_batch__line_id=scope.line_id)
+    if scope.recipe_id:
+        qs = qs.filter(source_batch__recipe_id=scope.recipe_id)
+    if scope.batch_id:
+        qs = qs.filter(source_batch_id=scope.batch_id)
+    return qs
 
 
 def material_avg_unit_prices() -> dict[int, Decimal]:

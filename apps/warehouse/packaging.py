@@ -136,11 +136,10 @@ def plan_fifo_pack(
 
 
 def _api_piece_number(d: Decimal):
-    """Целые штуки в JSON как int, дробные как float."""
-    d = q4(d)
-    if d == d.to_integral_value():
-        return int(d)
-    return float(d)
+    """Стабильная строка для UI (без int/float)."""
+    from config.decimal_format import format_decimal_plain
+
+    return format_decimal_plain(q4(d)) or '0'
 
 
 def warehouse_packaging_breakdown(row: WarehouseBatch) -> dict:

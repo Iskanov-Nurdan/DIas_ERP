@@ -33,5 +33,6 @@ class OtkPendingView(viewsets.ViewSet):
             )
             .select_related('order', 'order__recipe', 'order__line', 'operator', 'profile', 'recipe', 'line')
             .prefetch_related('otk_checks__inspector')
+            .order_by('-otk_submitted_at', '-id')
         )
         return Response({'items': BatchListSerializer(qs, many=True).data})

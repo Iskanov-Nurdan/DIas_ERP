@@ -98,22 +98,12 @@ class RecipeComponentSerializer(serializers.ModelSerializer):
     quantity_per_meter = CleanDecimalField(
         max_digits=14, decimal_places=6, read_only=True, coerce_to_string=True,
     )
-    material_name = serializers.SerializerMethodField()
-    element_name = serializers.SerializerMethodField()
     name = serializers.SerializerMethodField()
-    raw_material_name = serializers.SerializerMethodField()
-    chemistry_name = serializers.SerializerMethodField()
 
     def get_type(self, obj):
         if obj.type == RecipeComponent.TYPE_RAW:
             return 'raw_material'
         return 'chemistry'
-
-    def get_material_name(self, obj):
-        return obj.raw_material.name if obj.raw_material_id else None
-
-    def get_element_name(self, obj):
-        return obj.chemistry.name if obj.chemistry_id else None
 
     def get_name(self, obj):
         if obj.raw_material_id:
@@ -122,21 +112,10 @@ class RecipeComponentSerializer(serializers.ModelSerializer):
             return obj.chemistry.name
         return None
 
-    def get_raw_material_name(self, obj):
-        return self.get_material_name(obj)
-
-    def get_chemistry_name(self, obj):
-        return self.get_element_name(obj)
-
     class Meta:
         model = RecipeComponent
         fields = (
-            'id', 'type',
-            'material_id', 'material_name',
-            'chemistry_id', 'element_name',
-            'name',
-            'quantity_per_meter', 'unit',
-            'raw_material_name', 'chemistry_name',
+            'id', 'type', 'material_id', 'chemistry_id', 'name', 'quantity_per_meter', 'unit',
         )
 
 
@@ -214,20 +193,6 @@ class RecipeSerializer(_NullableRecipeModelSerializer):
         allow_null=True,
         allow_blank=True,
     )
-    yield_quantity = CleanDecimalField(
-        max_digits=14,
-        decimal_places=4,
-        read_only=True,
-        allow_null=True,
-        coerce_to_string=True,
-        source='output_quantity',
-    )
-    output_measure = serializers.CharField(
-        read_only=True,
-        allow_null=True,
-        allow_blank=True,
-        source='output_unit_kind',
-    )
     deletable = serializers.SerializerMethodField()
 
     class Meta:
@@ -243,8 +208,6 @@ class RecipeSerializer(_NullableRecipeModelSerializer):
             'components',
             'output_quantity',
             'output_unit_kind',
-            'yield_quantity',
-            'output_measure',
             'comment',
             'is_active',
             'deletable',
