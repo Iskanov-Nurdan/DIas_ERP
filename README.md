@@ -55,4 +55,5 @@ python manage.py runserver
 - `DJANGO_SECRET_KEY`
 - `ALLOWED_HOSTS` — через запятую
 - `CORS_ALLOWED_ORIGINS` — через запятую
+- `FRONTEND_PORTS` — локальные порты фронта для CORS/WS, по умолчанию `3000,5173`
 - PostgreSQL: `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGHOST`, `PGPORT`

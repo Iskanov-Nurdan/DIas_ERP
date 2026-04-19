@@ -103,10 +103,18 @@ def _env_first(*names: str, default: str = '') -> str:
 
 
 FRONTEND_PORT = _env_first('FRONTEND_PORT', default='3000')
-FRONTEND_HOSTS = [
-    f'http://localhost:{FRONTEND_PORT}',
-    f'http://127.0.0.1:{FRONTEND_PORT}',
+_frontend_ports_env = os.environ.get('FRONTEND_PORTS', '').strip()
+FRONTEND_PORTS = [
+    p.strip()
+    for p in (_frontend_ports_env.split(',') if _frontend_ports_env else [FRONTEND_PORT, '5173'])
+    if p.strip()
 ]
+FRONTEND_HOSTS = []
+for port in dict.fromkeys(FRONTEND_PORTS):
+    FRONTEND_HOSTS.extend([
+        f'http://localhost:{port}',
+        f'http://127.0.0.1:{port}',
+    ])
 
 # PostgreSQL: поддерживаем и DB_* и стандартные PG* переменные.
 # Без имени БД используется SQLite в корне проекта — для локального запуска без Postgres.

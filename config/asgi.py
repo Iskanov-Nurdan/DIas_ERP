@@ -31,11 +31,19 @@ def _websocket_allowed_origins():
     cors = list(getattr(settings, 'CORS_ALLOWED_ORIGINS', []))
     if cors:
         return cors
-    frontend_port = os.environ.get('FRONTEND_PORT', '3000')
-    return [
-        f'http://localhost:{frontend_port}',
-        f'http://127.0.0.1:{frontend_port}',
+    frontend_ports = os.environ.get('FRONTEND_PORTS', '').strip()
+    ports = [
+        p.strip()
+        for p in (frontend_ports.split(',') if frontend_ports else [os.environ.get('FRONTEND_PORT', '3000'), '5173'])
+        if p.strip()
     ]
+    origins = []
+    for port in dict.fromkeys(ports):
+        origins.extend([
+            f'http://localhost:{port}',
+            f'http://127.0.0.1:{port}',
+        ])
+    return origins
 
 
 application = ProtocolTypeRouter({
