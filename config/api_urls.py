@@ -22,7 +22,15 @@ from apps.production.views import (
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
 )
 from apps.warehouse.views import WarehouseBatchViewSet
-from apps.sales.views import ClientViewSet, SaleViewSet
+from apps.sales.views import (
+    ClientViewSet,
+    DefectRecordViewSet,
+    OrderViewSet,
+    PaymentViewSet,
+    ReturnViewSet,
+    ReworkRequestViewSet,
+    SaleViewSet,
+)
 from apps.otk.views import OtkPendingView
 from apps.analytics.views import (
     AnalyticsSummaryView,
@@ -60,6 +68,11 @@ router.register(r'batches', BatchViewSet, basename='batch')
 router.register(r'warehouse/batches', WarehouseBatchViewSet, basename='warehouse-batch')
 router.register(r'clients', ClientViewSet, basename='client')
 router.register(r'sales', SaleViewSet, basename='sale')
+router.register(r'orders', OrderViewSet, basename='order')
+router.register(r'payments', PaymentViewSet, basename='payment')
+router.register(r'returns', ReturnViewSet, basename='return')
+router.register(r'defects', DefectRecordViewSet, basename='defect')
+router.register(r'rework-requests', ReworkRequestViewSet, basename='rework-request')
 router.register(r'otk/pending', OtkPendingView, basename='otk-pending')
 router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-summary')
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')

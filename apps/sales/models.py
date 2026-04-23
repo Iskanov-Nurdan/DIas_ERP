@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -28,6 +29,155 @@ class Client(models.Model):
         return self.name
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ЗАЯВКА (Order)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Order(models.Model):
+    """Заявка клиента — намерение, не перемещение склада."""
+
+    SOURCE_CASHIER = 'cashier'
+    SOURCE_MANAGER = 'manager'
+    SOURCE_BOSS = 'boss'
+    SOURCE_OTHER = 'other'
+    SOURCE_CHOICES = [
+        (SOURCE_CASHIER, 'Кассир'),
+        (SOURCE_MANAGER, 'Менеджер'),
+        (SOURCE_BOSS, 'Руководитель'),
+        (SOURCE_OTHER, 'Другое'),
+    ]
+
+    STATUS_NEW = 'new'
+    STATUS_CONFIRMED = 'confirmed'
+    STATUS_IN_PROGRESS = 'in_progress'
+    STATUS_PARTIALLY_SHIPPED = 'partially_shipped'
+    STATUS_SHIPPED = 'shipped'
+    STATUS_CLOSED = 'closed'
+    STATUS_CANCELED = 'canceled'
+    STATUS_CHOICES = [
+        (STATUS_NEW, 'Новая'),
+        (STATUS_CONFIRMED, 'Подтверждена'),
+        (STATUS_IN_PROGRESS, 'В работе'),
+        (STATUS_PARTIALLY_SHIPPED, 'Частично отгружена'),
+        (STATUS_SHIPPED, 'Отгружена'),
+        (STATUS_CLOSED, 'Закрыта'),
+        (STATUS_CANCELED, 'Отменена'),
+    ]
+
+    order_number = models.CharField('Номер заявки', max_length=100, unique=True)
+    date = models.DateField('Дата')
+    client = models.ForeignKey(
+        Client, on_delete=models.PROTECT, related_name='orders', null=True, blank=True,
+    )
+    source_type = models.CharField(
+        'Тип источника заявки', max_length=20, choices=SOURCE_CHOICES, default=SOURCE_MANAGER,
+    )
+    comment = models.TextField('Комментарий', blank=True, default='')
+    status = models.CharField(
+        'Статус', max_length=25, choices=STATUS_CHOICES, default=STATUS_NEW, db_index=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_orders',
+        verbose_name='Создал',
+    )
+    responsible_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='responsible_orders',
+        verbose_name='Ответственный',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+
+    class Meta:
+        db_table = 'client_orders'
+        verbose_name = 'Заявка'
+        verbose_name_plural = 'Заявки'
+        ordering = ['-date', '-id']
+
+    def __str__(self):
+        c = self.client.name if self.client_id else '—'
+        return f'{self.order_number} — {c}'
+
+    @property
+    def total_amount(self):
+        from decimal import Decimal
+        return sum((line.line_total or Decimal('0')) for line in self.lines.all())
+
+    @property
+    def shipped_amount(self):
+        from decimal import Decimal
+        return sum((line.shipped_quantity or Decimal('0')) * (line.unit_price or Decimal('0'))
+                   for line in self.lines.all())
+
+    @property
+    def remaining_amount(self):
+        from decimal import Decimal
+        return sum((line.remaining_quantity or Decimal('0')) * (line.unit_price or Decimal('0'))
+                   for line in self.lines.all())
+
+    @property
+    def has_company_debt_by_goods(self):
+        return any(
+            (line.remaining_quantity or 0) > 0
+            for line in self.lines.all()
+        )
+
+
+class OrderLine(models.Model):
+    """Строка заявки."""
+
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='lines')
+    product = models.CharField('Товар / профиль / наименование', max_length=255)
+    product_type = models.CharField('Тип товара', max_length=100, blank=True, default='')
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='order_lines',
+        verbose_name='Профиль',
+    )
+    ordered_quantity = models.DecimalField(
+        'Заказано', max_digits=14, decimal_places=4, default=0,
+    )
+    shipped_quantity = models.DecimalField(
+        'Отгружено', max_digits=14, decimal_places=4, default=0,
+    )
+    unit_price = models.DecimalField(
+        'Цена за ед.', max_digits=14, decimal_places=2, null=True, blank=True,
+    )
+    comment = models.TextField('Комментарий строки', blank=True, default='')
+
+    class Meta:
+        db_table = 'order_lines'
+        verbose_name = 'Строка заявки'
+        verbose_name_plural = 'Строки заявок'
+        ordering = ['id']
+
+    @property
+    def remaining_quantity(self):
+        from decimal import Decimal
+        return max(Decimal('0'), (self.ordered_quantity or Decimal('0')) - (self.shipped_quantity or Decimal('0')))
+
+    @property
+    def line_total(self):
+        from decimal import Decimal
+        qty = self.ordered_quantity or Decimal('0')
+        price = self.unit_price or Decimal('0')
+        return (qty * price).quantize(Decimal('0.01'))
+
+    def __str__(self):
+        return f'{self.product} × {self.ordered_quantity}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПРОДАЖА (Sale) — расширенная, обратно совместимая
+# ─────────────────────────────────────────────────────────────────────────────
+
 class Sale(models.Model):
     MODE_PIECES = 'pieces'
     MODE_PACKAGES = 'packages'
@@ -36,7 +186,40 @@ class Sale(models.Model):
         (MODE_PACKAGES, 'По упаковкам'),
     ]
 
+    # Новые статусы
+    STATUS_DRAFT = 'draft'
+    STATUS_CONFIRMED = 'confirmed'
+    STATUS_PARTIALLY_SHIPPED = 'partially_shipped'
+    STATUS_SHIPPED = 'shipped'
+    STATUS_CLOSED = 'closed'
+    STATUS_CANCELED = 'canceled'
+    SALE_STATUS_CHOICES = [
+        (STATUS_DRAFT, 'Черновик'),
+        (STATUS_CONFIRMED, 'Подтверждена'),
+        (STATUS_PARTIALLY_SHIPPED, 'Частично отгружена'),
+        (STATUS_SHIPPED, 'Отгружена'),
+        (STATUS_CLOSED, 'Закрыта'),
+        (STATUS_CANCELED, 'Отменена'),
+    ]
+
     order_number = models.CharField('Номер заказа', max_length=100)
+    sale_number = models.CharField('Номер продажи', max_length=100, blank=True, default='')
+    invoice_number = models.CharField('Номер накладной', max_length=100, blank=True, default='')
+    receipt_number = models.CharField('Номер квитанции', max_length=100, blank=True, default='')
+    sale_status = models.CharField(
+        'Статус продажи',
+        max_length=25,
+        choices=SALE_STATUS_CHOICES,
+        default=STATUS_CLOSED,
+        db_index=True,
+    )
+    linked_order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='sales',
+        verbose_name='Заявка',
+    )
     client = models.ForeignKey(
         Client, on_delete=models.PROTECT, related_name='sales', null=True, blank=True,
     )
@@ -91,6 +274,15 @@ class Sale(models.Model):
         blank=True,
         default='',
     )
+    is_defect_sale = models.BooleanField('Продажа брака', default=False, db_index=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_sales',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True, null=True, blank=True)
 
     class Meta:
         db_table = 'sales'
@@ -101,6 +293,43 @@ class Sale(models.Model):
     def __str__(self):
         c = self.client.name if self.client_id else '—'
         return f'{self.order_number} — {c}'
+
+
+class SaleLine(models.Model):
+    """Строка многострочной продажи (новый формат)."""
+
+    sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name='sale_lines')
+    order_line = models.ForeignKey(
+        OrderLine,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='sale_lines',
+        verbose_name='Строка заявки',
+    )
+    product = models.CharField('Товар / наименование', max_length=255)
+    warehouse_batch = models.ForeignKey(
+        'warehouse.WarehouseBatch',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='sale_lines',
+        verbose_name='Партия склада ГП',
+    )
+    stock_form = models.CharField('Форма учёта', max_length=20, blank=True, default='')
+    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4, default=0)
+    unit_price = models.DecimalField('Цена за ед.', max_digits=14, decimal_places=2, null=True, blank=True)
+    line_total = models.DecimalField('Сумма строки', max_digits=16, decimal_places=2, default=0)
+    cost = models.DecimalField('Себестоимость строки', max_digits=16, decimal_places=2, default=0)
+    defect_flag = models.BooleanField('Строка брака', default=False)
+    comment = models.TextField('Комментарий', blank=True, default='')
+
+    class Meta:
+        db_table = 'sale_lines'
+        verbose_name = 'Строка продажи'
+        verbose_name_plural = 'Строки продаж'
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.product} × {self.quantity}'
 
 
 class Shipment(models.Model):
@@ -129,3 +358,317 @@ class Shipment(models.Model):
 
     def __str__(self):
         return f'Отгрузка #{self.id} — {self.get_status_display()}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ОПЛАТА (Payment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Payment(models.Model):
+    """Денежное движение по клиенту. Деньги и товар живут отдельно."""
+
+    TYPE_PREPAYMENT = 'prepayment'
+    TYPE_PAYMENT = 'payment'
+    TYPE_SURCHARGE = 'surcharge'
+    TYPE_REFUND = 'refund'
+    TYPE_CHOICES = [
+        (TYPE_PREPAYMENT, 'Предоплата'),
+        (TYPE_PAYMENT, 'Оплата'),
+        (TYPE_SURCHARGE, 'Доплата'),
+        (TYPE_REFUND, 'Возврат денег'),
+    ]
+
+    METHOD_CASH = 'cash'
+    METHOD_TRANSFER = 'transfer'
+    METHOD_CARD = 'card'
+    METHOD_OTHER = 'other'
+    METHOD_CHOICES = [
+        (METHOD_CASH, 'Наличные'),
+        (METHOD_TRANSFER, 'Перевод'),
+        (METHOD_CARD, 'Карта'),
+        (METHOD_OTHER, 'Другое'),
+    ]
+
+    payment_number = models.CharField('Номер оплаты / квитанции', max_length=100, blank=True, default='')
+    date = models.DateField('Дата')
+    client = models.ForeignKey(
+        Client, on_delete=models.PROTECT, related_name='payments', null=True, blank=True,
+    )
+    linked_order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='payments',
+        verbose_name='Заявка',
+    )
+    linked_sale = models.ForeignKey(
+        Sale,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='payments',
+        verbose_name='Продажа',
+    )
+    payment_type = models.CharField(
+        'Тип оплаты', max_length=20, choices=TYPE_CHOICES, default=TYPE_PAYMENT,
+    )
+    amount = models.DecimalField('Сумма', max_digits=16, decimal_places=2, default=0)
+    payment_method = models.CharField(
+        'Способ оплаты', max_length=20, choices=METHOD_CHOICES, default=METHOD_CASH,
+    )
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_payments',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'payments'
+        verbose_name = 'Оплата'
+        verbose_name_plural = 'Оплаты'
+        ordering = ['-date', '-id']
+
+    def __str__(self):
+        c = self.client.name if self.client_id else '—'
+        return f'{self.get_payment_type_display()} {self.amount} — {c}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ВОЗВРАТ (Return)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Return(models.Model):
+    """Возврат товара от клиента. Всегда привязан к продаже."""
+
+    return_number = models.CharField('Номер возврата', max_length=100, blank=True, default='')
+    date = models.DateField('Дата')
+    sale = models.ForeignKey(
+        Sale, on_delete=models.PROTECT, related_name='returns', verbose_name='Продажа',
+    )
+    linked_order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='returns',
+        verbose_name='Заявка',
+    )
+    invoice_number = models.CharField('Накладная', max_length=100, blank=True, default='')
+    return_reason = models.TextField('Причина возврата', blank=True, default='')
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_returns',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'returns'
+        verbose_name = 'Возврат'
+        verbose_name_plural = 'Возвраты'
+        ordering = ['-date', '-id']
+
+    def __str__(self):
+        return f'Возврат #{self.return_number or self.id} к продаже #{self.sale_id}'
+
+
+class ReturnLine(models.Model):
+    """Строка возврата."""
+
+    TARGET_WAREHOUSE = 'warehouse'
+    TARGET_DEFECT = 'defect'
+    TARGET_REWORK = 'rework'
+    TARGET_CHOICES = [
+        (TARGET_WAREHOUSE, 'На склад ГП'),
+        (TARGET_DEFECT, 'В брак'),
+        (TARGET_REWORK, 'На переделку'),
+    ]
+
+    CONDITION_GOOD = 'good'
+    CONDITION_DAMAGED = 'damaged'
+    CONDITION_DEFECT = 'defect'
+    CONDITION_CHOICES = [
+        (CONDITION_GOOD, 'Хорошее'),
+        (CONDITION_DAMAGED, 'Повреждено'),
+        (CONDITION_DEFECT, 'Брак'),
+    ]
+
+    return_doc = models.ForeignKey(Return, on_delete=models.CASCADE, related_name='lines')
+    sale_line = models.ForeignKey(
+        SaleLine,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='return_lines',
+        verbose_name='Строка продажи',
+    )
+    product = models.CharField('Товар', max_length=255, blank=True, default='')
+    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4, default=0)
+    return_target = models.CharField(
+        'Назначение возврата', max_length=20, choices=TARGET_CHOICES, default=TARGET_WAREHOUSE,
+    )
+    condition_type = models.CharField(
+        'Состояние', max_length=20, choices=CONDITION_CHOICES, default=CONDITION_GOOD,
+    )
+    comment = models.TextField('Комментарий', blank=True, default='')
+
+    class Meta:
+        db_table = 'return_lines'
+        verbose_name = 'Строка возврата'
+        verbose_name_plural = 'Строки возвратов'
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.product} × {self.quantity} → {self.get_return_target_display()}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# БРАК (DefectRecord)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DefectRecord(models.Model):
+    """Учётная единица брака. Источник — ОТК или возврат клиента."""
+
+    SOURCE_OTK = 'otk'
+    SOURCE_RETURN = 'return'
+    SOURCE_CHOICES = [
+        (SOURCE_OTK, 'ОТК'),
+        (SOURCE_RETURN, 'Возврат клиента'),
+    ]
+
+    STATUS_NEW = 'new'
+    STATUS_ON_STOCK = 'on_stock'
+    STATUS_SENT_TO_REWORK = 'sent_to_rework'
+    STATUS_REWORKED = 'reworked'
+    STATUS_SOLD = 'sold'
+    STATUS_WRITTEN_OFF = 'written_off'
+    STATUS_CHOICES = [
+        (STATUS_NEW, 'Новый'),
+        (STATUS_ON_STOCK, 'На складе брака'),
+        (STATUS_SENT_TO_REWORK, 'Передан на переработку'),
+        (STATUS_REWORKED, 'Переработан'),
+        (STATUS_SOLD, 'Продан'),
+        (STATUS_WRITTEN_OFF, 'Списан'),
+    ]
+
+    source_type = models.CharField(
+        'Источник', max_length=20, choices=SOURCE_CHOICES, default=SOURCE_OTK,
+    )
+    source_id = models.IntegerField('ID источника (otk_check или return_line)', null=True, blank=True)
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='defect_records',
+        verbose_name='Профиль',
+    )
+    product = models.CharField('Продукт / наименование', max_length=255, blank=True, default='')
+    quantity_pcs = models.DecimalField(
+        'Количество шт/м', max_digits=14, decimal_places=4, default=0,
+    )
+    quantity_kg = models.DecimalField(
+        'Количество кг', max_digits=14, decimal_places=4, null=True, blank=True,
+    )
+    kg_coefficient = models.DecimalField(
+        'Коэффициент кг/ед.', max_digits=14, decimal_places=6, null=True, blank=True,
+    )
+    defect_reason = models.TextField('Причина брака', blank=True, default='')
+    status = models.CharField(
+        'Статус', max_length=25, choices=STATUS_CHOICES, default=STATUS_NEW, db_index=True,
+    )
+    writeoff_reason = models.TextField('Причина списания', blank=True, default='')
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_defects',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+
+    class Meta:
+        db_table = 'defect_records'
+        verbose_name = 'Запись брака'
+        verbose_name_plural = 'Записи брака'
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f'Брак #{self.id} — {self.product} ({self.get_status_display()})'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПЕРЕДЕЛКА (ReworkRequest)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReworkRequest(models.Model):
+    """Запрос на переделку/перевыпуск по возврату клиента."""
+
+    STATUS_PENDING = 'pending'
+    STATUS_IN_PROGRESS = 'in_progress'
+    STATUS_COMPLETED = 'completed'
+    STATUS_CANCELED = 'canceled'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Ожидает'),
+        (STATUS_IN_PROGRESS, 'В работе'),
+        (STATUS_COMPLETED, 'Завершено'),
+        (STATUS_CANCELED, 'Отменено'),
+    ]
+
+    rework_number = models.CharField('Номер переделки', max_length=100, blank=True, default='')
+    return_doc = models.ForeignKey(
+        Return,
+        on_delete=models.PROTECT,
+        related_name='rework_requests',
+        verbose_name='Возврат',
+    )
+    defect_record = models.ForeignKey(
+        DefectRecord,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='rework_requests',
+        verbose_name='Запись брака',
+    )
+    original_sale = models.ForeignKey(
+        Sale,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='rework_requests',
+        verbose_name='Исходная продажа',
+    )
+    product = models.CharField('Продукт', max_length=255, blank=True, default='')
+    quantity_kg = models.DecimalField('Масса кг', max_digits=14, decimal_places=4, default=0)
+    status = models.CharField(
+        'Статус', max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True,
+    )
+    result_warehouse_batch = models.ForeignKey(
+        'warehouse.WarehouseBatch',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='rework_requests',
+        verbose_name='Партия ГП после переделки',
+    )
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_rework_requests',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+
+    class Meta:
+        db_table = 'rework_requests'
+        verbose_name = 'Переделка'
+        verbose_name_plural = 'Переделки'
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f'Переделка #{self.rework_number or self.id} — {self.product}'
