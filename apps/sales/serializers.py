@@ -78,8 +78,6 @@ def _quantity_input_api_value(v):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ClientSerializer(serializers.ModelSerializer):
-    contact_person = serializers.CharField(source='contact', required=False, allow_blank=True, write_only=True)
-    whatsapp_telegram = serializers.CharField(source='messenger', required=False, allow_blank=True, write_only=True)
     sales_count = serializers.IntegerField(read_only=True, required=False, default=0)
     sales_total = serializers.DecimalField(
         max_digits=20, decimal_places=2, read_only=True, required=False, coerce_to_string=False,
@@ -90,8 +88,8 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = (
-            'id', 'name', 'contact', 'contact_person', 'phone', 'phone_alt',
-            'inn', 'address', 'email', 'messenger', 'whatsapp_telegram',
+            'id', 'name', 'contact', 'phone', 'phone_alt',
+            'inn', 'address', 'email', 'messenger',
             'client_type', 'notes', 'is_active', 'status',
             'sales_count', 'sales_total', 'has_sales',
             'credit_limit', 'credit_limit_mode',
@@ -104,20 +102,6 @@ class ClientSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'sales_count'):
             return int(obj.sales_count or 0) > 0
         return obj.sales.exists()
-
-    def to_internal_value(self, data):
-        if isinstance(data, dict):
-            data = dict(data)
-            if data.get('phone_alt') in (None, '') and data.get('second_phone') not in (None, ''):
-                data['phone_alt'] = data.get('second_phone')
-            if data.get('notes') in (None, '') and data.get('comment') not in (None, ''):
-                data['notes'] = data.get('comment')
-            cp = data.get('contact_person')
-            if cp not in (None, '') and (data.get('contact') in (None, '')):
-                data['contact'] = cp
-            if data.get('messenger') in (None, '') and data.get('whatsapp_telegram') not in (None, ''):
-                data['messenger'] = data.get('whatsapp_telegram')
-        return super().to_internal_value(data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -415,21 +399,6 @@ class SaleSerializer(serializers.ModelSerializer):
         return sf or None
 
     def to_internal_value(self, data):
-        if isinstance(data, dict):
-            data = dict(data)
-            wb = data.get('warehouse_batch')
-            wb_id = data.get('warehouse_batch_id')
-            if wb in (None, '') and wb_id not in (None, ''):
-                data['warehouse_batch'] = wb_id
-            su = data.get('sale_unit')
-            qu = data.get('quantity_unit')
-            if (su is None or str(su).strip() == '') and qu is not None and str(qu).strip() != '':
-                data['sale_unit'] = qu
-            data.pop('quantity_unit', None)
-            if data.get('sold_pieces') in (None, '') and data.get('quantity') not in (None, ''):
-                data['sold_pieces'] = data.get('quantity')
-            if data.get('date') in (None, '') and data.get('sale_date') not in (None, ''):
-                data['date'] = data.get('sale_date')
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -693,21 +662,27 @@ class SaleSerializer(serializers.ModelSerializer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReturnLineSerializer(serializers.ModelSerializer):
+    sale_line_label = serializers.SerializerMethodField()
+    sale_line_sale_id = serializers.IntegerField(source='sale_line.sale_id', read_only=True)
+
     class Meta:
         model = ReturnLine
         fields = (
             'id', 'sale_line', 'product', 'quantity',
             'return_target', 'condition_type', 'comment',
+            'sale_line_label', 'sale_line_sale_id',
         )
         extra_kwargs = {
-            'sale_line': {'required': False, 'allow_null': True},
+            'sale_line': {'required': True, 'allow_null': False},
+            'product': {'read_only': True},
         }
 
     def validate(self, attrs):
         sale_line = attrs.get('sale_line')
-        if sale_line and not self.instance:
+        if sale_line is None:
+            raise serializers.ValidationError({'sale_line': 'Поле sale_line обязательно'})
+        if not self.instance:
             qty = attrs.get('quantity', Decimal('0'))
-            # Проверяем, что не возвращаем больше, чем было отгружено
             total_returned = sum(
                 rl.quantity for rl in ReturnLine.objects.filter(sale_line=sale_line)
             )
@@ -719,6 +694,12 @@ class ReturnLineSerializer(serializers.ModelSerializer):
                     )
                 })
         return attrs
+
+    def get_sale_line_label(self, obj):
+        sl = getattr(obj, 'sale_line', None)
+        if sl is None:
+            return ''
+        return f'{sl.product} × {api_decimal_str(sl.quantity)}'
 
 
 class ReturnSerializer(serializers.ModelSerializer):
@@ -763,6 +744,9 @@ class ReturnSerializer(serializers.ModelSerializer):
         with transaction.atomic():
             ret_doc = super().create(validated_data)
             for line_data in lines_data:
+                sale_line = line_data.get('sale_line')
+                if sale_line is not None:
+                    line_data['product'] = sale_line.product
                 line = ReturnLine.objects.create(return_doc=ret_doc, **line_data)
                 self._process_return_line(line, ret_doc)
         return ret_doc
@@ -784,9 +768,7 @@ class ReturnSerializer(serializers.ModelSerializer):
 
         elif line.return_target == ReturnLine.TARGET_DEFECT:
             # Создаём запись брака
-            product = line.product or (
-                line.sale_line.product if line.sale_line else ret_doc.sale.product
-            )
+            product = line.sale_line.product
             DefectRecord.objects.create(
                 source_type=DefectRecord.SOURCE_RETURN,
                 source_id=line.id,
@@ -799,9 +781,7 @@ class ReturnSerializer(serializers.ModelSerializer):
 
         elif line.return_target == ReturnLine.TARGET_REWORK:
             # Создаём заявку на переделку
-            product = line.product or (
-                line.sale_line.product if line.sale_line else ret_doc.sale.product
-            )
+            product = line.sale_line.product
             defect = DefectRecord.objects.create(
                 source_type=DefectRecord.SOURCE_RETURN,
                 source_id=line.id,
@@ -829,6 +809,7 @@ class ReturnSerializer(serializers.ModelSerializer):
 class DefectRecordSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
     profile_name = serializers.CharField(source='profile.name', read_only=True, allow_null=True, default='')
+    source_label = serializers.SerializerMethodField()
 
     class Meta:
         model = DefectRecord
@@ -837,6 +818,7 @@ class DefectRecordSerializer(serializers.ModelSerializer):
             'profile', 'profile_name', 'product',
             'quantity_pcs', 'quantity_kg', 'kg_coefficient',
             'defect_reason', 'status', 'writeoff_reason',
+            'source_label',
             'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
         read_only_fields = ('created_at', 'updated_at')
@@ -853,7 +835,25 @@ class DefectRecordSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {'writeoff_reason': 'Причина списания обязательна при статусе «списан»'}
                 )
+        if self.instance is None:
+            source_type = attrs.get('source_type', DefectRecord.SOURCE_OTK)
+            source_id = attrs.get('source_id')
+            if source_id is None:
+                raise serializers.ValidationError({'source_id': 'Поле source_id обязательно при создании'})
+            if source_type == DefectRecord.SOURCE_RETURN:
+                if not ReturnLine.objects.filter(pk=source_id).exists():
+                    raise serializers.ValidationError({'source_id': 'ReturnLine с указанным source_id не найден'})
         return attrs
+
+    def create(self, validated_data):
+        source_type = validated_data.get('source_type', DefectRecord.SOURCE_OTK)
+        source_id = validated_data.get('source_id')
+        if source_type == DefectRecord.SOURCE_RETURN and source_id is not None:
+            rl = ReturnLine.objects.select_related('sale_line').filter(pk=source_id).first()
+            if rl is not None:
+                validated_data['product'] = rl.sale_line.product
+                validated_data['quantity_pcs'] = rl.quantity
+        return super().create(validated_data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -861,6 +861,15 @@ class DefectRecordSerializer(serializers.ModelSerializer):
             if ret.get(k) is not None:
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
         return ret
+
+    def get_source_label(self, obj):
+        if obj.source_type == DefectRecord.SOURCE_RETURN and obj.source_id:
+            rl = ReturnLine.objects.filter(pk=obj.source_id).select_related('return_doc').first()
+            if rl is not None:
+                return f'ReturnLine #{rl.pk} / Return #{rl.return_doc_id}'
+        if obj.source_type == DefectRecord.SOURCE_OTK and obj.source_id:
+            return f'OTK #{obj.source_id}'
+        return ''
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -871,13 +880,19 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
     rework_loss_kg = serializers.SerializerMethodField()
     recovered_output = serializers.SerializerMethodField()
+    return_doc_number = serializers.CharField(source='return_doc.return_number', read_only=True, default='')
+    defect_status = serializers.CharField(source='defect_record.status', read_only=True, default='')
+    original_sale_number = serializers.CharField(source='original_sale.order_number', read_only=True, default='')
+    result_warehouse_batch_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ReworkRequest
         fields = (
             'id', 'rework_number', 'return_doc', 'defect_record', 'original_sale',
+            'return_doc_number', 'defect_status', 'original_sale_number',
             'product', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
             'status', 'result_warehouse_batch',
+            'result_warehouse_batch_label',
             'rework_loss_kg', 'recovered_output',
             'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
@@ -900,7 +915,26 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
         v = obj.recovered_output
         return api_decimal_str(Decimal(str(v))) if v is not None else None
 
+    def get_result_warehouse_batch_label(self, obj):
+        wb = getattr(obj, 'result_warehouse_batch', None)
+        if wb is None:
+            return ''
+        return f'#{wb.pk} {wb.product}'
+
     def create(self, validated_data):
+        if validated_data.get('defect_record') is None:
+            raise serializers.ValidationError({'defect_record': 'Поле defect_record обязательно'})
+        if validated_data.get('original_sale') is None:
+            raise serializers.ValidationError({'original_sale': 'Поле original_sale обязательно'})
+        if not (validated_data.get('product') or '').strip():
+            defect = validated_data.get('defect_record')
+            if defect is not None:
+                validated_data['product'] = defect.product
+                if (
+                    (validated_data.get('quantity_kg') in (None, Decimal('0')))
+                    and defect.quantity_kg is not None
+                ):
+                    validated_data['quantity_kg'] = defect.quantity_kg
         year = timezone.now().date().year
         last = ReworkRequest.objects.filter(rework_number__startswith=f'RWK-{year}-').order_by('-rework_number').first()
         try:

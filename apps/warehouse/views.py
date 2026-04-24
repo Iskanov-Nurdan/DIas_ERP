@@ -41,15 +41,51 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.exclude(Q(product__iexact='test') | Q(product__iexact='тест'))
         return qs
 
+    def retrieve(self, request, *args, **kwargs):
+        batch = self.get_object()
+        data = WarehouseBatchSerializer(batch, context={'request': request}).data
+        transitions = {
+            WarehouseBatch.STATUS_AVAILABLE: [WarehouseBatch.STATUS_RESERVED, WarehouseBatch.STATUS_SHIPPED],
+            WarehouseBatch.STATUS_RESERVED: [WarehouseBatch.STATUS_AVAILABLE, WarehouseBatch.STATUS_SHIPPED],
+            WarehouseBatch.STATUS_SHIPPED: [],
+        }
+        can_reserve = (
+            batch.status == WarehouseBatch.STATUS_AVAILABLE
+            and batch.quality == WarehouseBatch.QUALITY_GOOD
+        )
+        can_package = (
+            batch.status == WarehouseBatch.STATUS_AVAILABLE
+            and batch.inventory_form == WarehouseBatch.INVENTORY_UNPACKED
+            and batch.quality == WarehouseBatch.QUALITY_GOOD
+        )
+        data['linked_entities'] = {
+            'profile': (
+                {
+                    'id': batch.profile_id,
+                    'label': batch.profile.name,
+                } if batch.profile_id else None
+            ),
+            'source_batch': (
+                {
+                    'id': batch.source_batch_id,
+                    'label': f"#{batch.source_batch_id} {batch.source_batch.product}",
+                } if batch.source_batch_id else None
+            ),
+        }
+        data['available_actions'] = {
+            'reserve': can_reserve,
+            'package': can_package,
+            'trace': True,
+        }
+        data['available_status_transitions'] = transitions.get(batch.status, [])
+        return Response(data)
+
     @extend_schema(
         summary='Резерв партии склада',
         request=inline_serializer(
             name='WarehouseReserveRequest',
             fields={
-                'batch_id': serializers.IntegerField(help_text='ID партии (канон); принимается и batchId.'),
-                'batchId': serializers.IntegerField(
-                    required=False, help_text='Устаревший алиас; предпочтительно batch_id.',
-                ),
+                'batch_id': serializers.IntegerField(help_text='ID партии (канон).'),
                 'quantity': serializers.DecimalField(max_digits=24, decimal_places=8),
                 'sale_id': serializers.IntegerField(
                     required=False,
@@ -66,7 +102,7 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
     )
     @action(detail=False, methods=['post'], url_path='reserve')
     def reserve(self, request):
-        batch_id = request.data.get('batch_id') or request.data.get('batchId')
+        batch_id = request.data.get('batch_id')
         quantity_raw = request.data.get('quantity')
         sale_id = request.data.get('sale_id')
 
@@ -84,6 +120,8 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
 
         if batch.status != WarehouseBatch.STATUS_AVAILABLE:
             return _err('bad_request', 'Партия недоступна для резервирования')
+        if batch.quality != WarehouseBatch.QUALITY_GOOD:
+            return _err('bad_request', 'Резервирование разрешено только для годной партии (quality=good)')
 
         try:
             q = Decimal(str(quantity_raw))
@@ -149,7 +187,7 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
         """
         d = request.data
 
-        wb_id = d.get('warehouse_batch_id') if d.get('warehouse_batch_id') not in (None, '') else d.get('batchId')
+        wb_id = d.get('warehouse_batch_id')
         if wb_id in (None, ''):
             return _err(
                 'validation_error',
@@ -233,6 +271,12 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
                     'bad_request',
                     'Строка недоступна для упаковки (не в статусе «доступна»)',
                     errors=[{'field': 'warehouse_batch_id', 'message': 'Недоступна'}],
+                )
+            if row.quality != WarehouseBatch.QUALITY_GOOD:
+                return _err(
+                    'bad_request',
+                    'Упаковка разрешена только для годной партии (quality=good)',
+                    errors=[{'field': 'warehouse_batch_id', 'message': 'Для брака упаковка запрещена'}],
                 )
 
             unit_m = effective_unit_meters(row)

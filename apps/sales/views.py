@@ -24,8 +24,10 @@ from .models import (
     Payment,
     PriceList,
     Return,
+    ReturnLine,
     ReworkRequest,
     Sale,
+    SaleLine,
     Shipment,
 )
 from .serializers import (
@@ -226,6 +228,58 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             extra={'client_id': instance.client_id, 'status': instance.status},
         )
 
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = OrderSerializer(instance, context={'request': request}).data
+        from .state_machine import ORDER_TRANSITIONS
+        data['linked_entities'] = {
+            'client': (
+                {
+                    'id': instance.client_id,
+                    'label': instance.client.name,
+                } if instance.client_id else None
+            ),
+            'responsible_user': (
+                {
+                    'id': instance.responsible_user_id,
+                    'label': getattr(instance.responsible_user, 'name', '') or '',
+                } if instance.responsible_user_id else None
+            ),
+        }
+        data['available_status_transitions'] = ORDER_TRANSITIONS.get(instance.status, [])
+        data['available_actions'] = {
+            'set_status': bool(ORDER_TRANSITIONS.get(instance.status, [])),
+            'reserve': instance.status in (
+                Order.STATUS_NEW,
+                Order.STATUS_CONFIRMED,
+                Order.STATUS_IN_PROGRESS,
+                Order.STATUS_PARTIALLY_SHIPPED,
+            ),
+            'release_reserve': True,
+            'cancel': instance.status not in (Order.STATUS_CLOSED, Order.STATUS_CANCELED),
+            'waybill': True,
+            'history': True,
+        }
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        from apps.recipes.models import PlasticProfile
+
+        clients = list(
+            Client.objects.filter(is_active=True)
+            .order_by('name')
+            .values('id', 'name')[:200]
+        )
+        profiles = list(
+            PlasticProfile.objects.order_by('name')
+            .values('id', 'name')[:300]
+        )
+        return Response({
+            'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
+            'profiles': [{'id': p['id'], 'label': p['name']} for p in profiles],
+        })
+
     @action(detail=True, methods=['patch'], url_path='status')
     def set_status(self, request, pk=None):
         """Изменить статус заявки с валидацией переходов (централизованный state machine)."""
@@ -254,9 +308,9 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         self._broadcast(order, created=False)
         return Response(OrderSerializer(order).data)
 
-    @action(detail=True, methods=['get'], url_path='nakladnaya')
-    def nakladnaya(self, request, pk=None):
-        """HTML-накладная по заявке."""
+    @action(detail=True, methods=['get'], url_path='waybill')
+    def waybill(self, request, pk=None):
+        """HTML-накладная по заявке (канонический endpoint)."""
         order = self.get_object()
         return _order_html_response(order)
 
@@ -506,6 +560,74 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             Shipment.objects.filter(sale_id=instance.pk).delete()
             super().perform_destroy(instance)
 
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = SaleSerializer(instance, context={'request': request}).data
+        from .state_machine import SALE_TRANSITIONS
+        data['linked_entities'] = {
+            'client': (
+                {
+                    'id': instance.client_id,
+                    'label': instance.client.name,
+                } if instance.client_id else None
+            ),
+            'linked_order': (
+                {
+                    'id': instance.linked_order_id,
+                    'label': instance.linked_order.order_number,
+                } if instance.linked_order_id else None
+            ),
+            'warehouse_batch': (
+                {
+                    'id': instance.warehouse_batch_id,
+                    'label': f'#{instance.warehouse_batch_id} {instance.warehouse_batch.product}',
+                } if instance.warehouse_batch_id else None
+            ),
+        }
+        data['available_status_transitions'] = SALE_TRANSITIONS.get(instance.sale_status, [])
+        data['available_actions'] = {
+            'set_status': bool(SALE_TRANSITIONS.get(instance.sale_status, [])),
+            'credit_check': bool(instance.client_id),
+            'waybill': True,
+            'receipt': True,
+        }
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        from apps.warehouse.models import WarehouseBatch
+
+        clients = list(
+            Client.objects.filter(is_active=True)
+            .order_by('name')
+            .values('id', 'name')[:200]
+        )
+        orders_qs = Order.objects.order_by('-date', '-id')
+        client_id = request.query_params.get('client_id')
+        if client_id:
+            orders_qs = orders_qs.filter(client_id=client_id)
+        orders = list(orders_qs.values('id', 'order_number')[:200])
+        wb_qs = (
+            WarehouseBatch.objects.filter(
+                status=WarehouseBatch.STATUS_AVAILABLE,
+                quality=WarehouseBatch.QUALITY_GOOD,
+            )
+            .order_by('-date', '-id')
+            .values('id', 'product', 'quantity')
+        )
+        warehouse_batches = list(wb_qs[:300])
+        return Response({
+            'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
+            'orders': [{'id': o['id'], 'label': o['order_number']} for o in orders],
+            'warehouse_batches': [
+                {
+                    'id': b['id'],
+                    'label': f"#{b['id']} {b['product']} ({b['quantity']})",
+                }
+                for b in warehouse_batches
+            ],
+        })
+
     @staticmethod
     def _nakladnaya_html_response(sale):
         parts = [
@@ -603,16 +725,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         sale = self.get_object()
         return SaleViewSet._nakladnaya_html_response(sale)
 
-    @action(detail=True, methods=['get'], url_path='nakladnaya')
-    def nakladnaya(self, request, pk=None):
-        return self._serve_nakladnaya(request)
-
     @action(detail=True, methods=['get'], url_path='waybill')
     def waybill(self, request, pk=None):
-        return self._serve_nakladnaya(request)
-
-    @action(detail=True, methods=['get'], url_path='invoice')
-    def invoice(self, request, pk=None):
         return self._serve_nakladnaya(request)
 
     @action(detail=True, methods=['get'], url_path='credit-check')
@@ -794,9 +908,89 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             extra={'sale_id': inst.sale_id},
         ))
 
-    @action(detail=True, methods=['get'], url_path='nakladnaya')
-    def nakladnaya(self, request, pk=None):
-        """HTML-документ возврата."""
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = ReturnSerializer(instance, context={'request': request}).data
+        downstream = []
+        line_ids = list(instance.lines.values_list('id', flat=True))
+        defects = DefectRecord.objects.filter(
+            source_type=DefectRecord.SOURCE_RETURN,
+            source_id__in=line_ids,
+        ).values('id', 'status', 'source_id')
+        defect_ids = [d['id'] for d in defects]
+        reworks = ReworkRequest.objects.filter(defect_record_id__in=defect_ids).values(
+            'id', 'status', 'defect_record_id', 'result_warehouse_batch_id',
+        )
+        data['linked_entities'] = {
+            'sale': {
+                'id': instance.sale_id,
+                'label': instance.sale.order_number,
+            },
+            'client': (
+                {
+                    'id': instance.sale.client_id,
+                    'label': instance.sale.client.name,
+                } if instance.sale and instance.sale.client_id else None
+            ),
+            'linked_order': (
+                {
+                    'id': instance.linked_order_id,
+                    'label': instance.linked_order.order_number,
+                } if instance.linked_order_id else None
+            ),
+        }
+        for d in defects:
+            downstream.append({
+                'type': 'defect_record',
+                'id': d['id'],
+                'status': d['status'],
+                'source_return_line_id': d['source_id'],
+            })
+        for r in reworks:
+            downstream.append({
+                'type': 'rework_request',
+                'id': r['id'],
+                'status': r['status'],
+                'defect_record_id': r['defect_record_id'],
+                'result_warehouse_batch_id': r['result_warehouse_batch_id'],
+            })
+        data['downstream_links'] = downstream
+        data['available_status_transitions'] = []
+        data['available_actions'] = {
+            'waybill': True,
+        }
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        sale_id = request.query_params.get('sale_id')
+        sales_qs = Sale.objects.select_related('client').order_by('-date', '-id')
+        sales = list(sales_qs.values('id', 'order_number', 'client__name')[:200])
+        lines = []
+        if sale_id:
+            sale_lines = (
+                SaleLine.objects.filter(sale_id=sale_id)
+                .order_by('id')
+                .values('id', 'product', 'quantity')
+            )
+            lines = [
+                {'id': sl['id'], 'label': f"{sl['product']} × {sl['quantity']}"}
+                for sl in sale_lines
+            ]
+        return Response({
+            'sales': [
+                {
+                    'id': s['id'],
+                    'label': f"{s['order_number']} / {s['client__name'] or '—'}",
+                }
+                for s in sales
+            ],
+            'sale_lines': lines,
+        })
+
+    @action(detail=True, methods=['get'], url_path='waybill')
+    def waybill(self, request, pk=None):
+        """HTML-документ возврата (канонический endpoint)."""
         ret_doc = self.get_object()
         return _return_html_response(ret_doc)
 
@@ -882,6 +1076,55 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             entity_id=inst.pk,
             extra={'status': inst.status},
         ))
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = DefectRecordSerializer(instance, context={'request': request}).data
+        from .state_machine import DEFECT_TRANSITIONS
+        linked_source = None
+        if instance.source_type == DefectRecord.SOURCE_RETURN and instance.source_id:
+            rl = ReturnLine.objects.select_related('return_doc', 'sale_line').filter(pk=instance.source_id).first()
+            if rl is not None:
+                linked_source = {
+                    'return_line_id': rl.pk,
+                    'return_doc_id': rl.return_doc_id,
+                    'sale_line_id': rl.sale_line_id,
+                    'label': f"ReturnLine #{rl.pk}: {rl.product} × {rl.quantity}",
+                }
+        reworks = list(
+            ReworkRequest.objects.filter(defect_record=instance).values(
+                'id', 'status', 'result_warehouse_batch_id', 'original_sale_id',
+            )
+        )
+        data['linked_entities'] = {
+            'source': linked_source,
+            'rework_requests': reworks,
+        }
+        data['available_status_transitions'] = DEFECT_TRANSITIONS.get(instance.status, [])
+        data['available_actions'] = {
+            'send_to_rework': DefectRecord.STATUS_SENT_TO_REWORK in DEFECT_TRANSITIONS.get(instance.status, []),
+            'complete_rework': DefectRecord.STATUS_REWORKED in DEFECT_TRANSITIONS.get(instance.status, []),
+            'writeoff': DefectRecord.STATUS_WRITTEN_OFF in DEFECT_TRANSITIONS.get(instance.status, []),
+            'sell': instance.status in (DefectRecord.STATUS_ON_STOCK, DefectRecord.STATUS_REWORKED),
+        }
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        lines = (
+            ReturnLine.objects.select_related('return_doc')
+            .order_by('-id')
+            .values('id', 'product', 'quantity', 'return_doc_id')[:300]
+        )
+        return Response({
+            'return_lines': [
+                {
+                    'id': rl['id'],
+                    'label': f"Return #{rl['return_doc_id']} / {rl['product']} × {rl['quantity']}",
+                }
+                for rl in lines
+            ],
+        })
 
     @action(detail=True, methods=['post'], url_path='send-to-rework')
     def send_to_rework(self, request, pk=None):
@@ -1001,6 +1244,85 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             entity_id=inst.pk,
             extra={'status': inst.status},
         ))
+
+    def retrieve(self, request, *args, **kwargs):
+        rework = self.get_object()
+        data = ReworkRequestSerializer(rework, context={'request': request}).data
+        from .state_machine import REWORK_TRANSITIONS
+        data['linked_entities'] = {
+            'return_doc': (
+                {
+                    'id': rework.return_doc_id,
+                    'label': rework.return_doc.return_number or str(rework.return_doc_id),
+                } if rework.return_doc_id else None
+            ),
+            'defect_record': (
+                {
+                    'id': rework.defect_record_id,
+                    'label': f"#{rework.defect_record_id} {rework.defect_record.product}",
+                } if rework.defect_record_id else None
+            ),
+            'original_sale': (
+                {
+                    'id': rework.original_sale_id,
+                    'label': rework.original_sale.order_number,
+                } if rework.original_sale_id else None
+            ),
+            'result_warehouse_batch': (
+                {
+                    'id': rework.result_warehouse_batch_id,
+                    'label': f"#{rework.result_warehouse_batch_id} {rework.result_warehouse_batch.product}",
+                } if rework.result_warehouse_batch_id else None
+            ),
+        }
+        data['available_status_transitions'] = REWORK_TRANSITIONS.get(rework.status, [])
+        data['available_actions'] = {
+            'start': ReworkRequest.STATUS_IN_PROGRESS in REWORK_TRANSITIONS.get(rework.status, []),
+            'complete': ReworkRequest.STATUS_COMPLETED in REWORK_TRANSITIONS.get(rework.status, []),
+            'cancel': ReworkRequest.STATUS_CANCELED in REWORK_TRANSITIONS.get(rework.status, []),
+        }
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        from apps.warehouse.models import WarehouseBatch
+
+        defects = list(
+            DefectRecord.objects.order_by('-created_at', '-id')
+            .values('id', 'product', 'status')[:300]
+        )
+        sales = list(
+            Sale.objects.order_by('-date', '-id').values('id', 'order_number', 'product')[:300]
+        )
+        returns = list(
+            Return.objects.order_by('-date', '-id').values('id', 'return_number')[:300]
+        )
+        result_batches = list(
+            WarehouseBatch.objects.filter(
+                status=WarehouseBatch.STATUS_AVAILABLE,
+                quality=WarehouseBatch.QUALITY_GOOD,
+            )
+            .order_by('-date', '-id')
+            .values('id', 'product')[:300]
+        )
+        return Response({
+            'defect_records': [
+                {'id': d['id'], 'label': f"#{d['id']} {d['product']} [{d['status']}]"}
+                for d in defects
+            ],
+            'original_sales': [
+                {'id': s['id'], 'label': f"{s['order_number']} / {s['product']}"}
+                for s in sales
+            ],
+            'returns': [
+                {'id': r['id'], 'label': r['return_number'] or f"RET#{r['id']}"}
+                for r in returns
+            ],
+            'result_warehouse_batches': [
+                {'id': b['id'], 'label': f"#{b['id']} {b['product']}"}
+                for b in result_batches
+            ],
+        })
 
     @action(detail=True, methods=['post'], url_path='start')
     def start_rework(self, request, pk=None):
