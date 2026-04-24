@@ -128,3 +128,52 @@ def credit_check_result_to_dict(result: CreditCheckResult) -> dict:
         'warning': result.warning,
         'blocked': result.blocked,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARD ENFORCEMENT — вызывается из сериализатора/вью перед созданием Sale
+# ─────────────────────────────────────────────────────────────────────────────
+
+CREDIT_OVERRIDE_ACCESS_KEY = 'credit_limit_override'
+
+
+def can_override_credit_limit(user) -> bool:
+    """
+    Пользователь может обойти hard-блокировку, если у него есть
+    access_key 'credit_limit_override' (или он admin/system).
+    """
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    if getattr(user, 'is_staff', False):
+        return True
+    from apps.accounts.models import UserAccess
+    return UserAccess.objects.filter(
+        user=user, access_key=CREDIT_OVERRIDE_ACCESS_KEY,
+    ).exists()
+
+
+def enforce_credit_limit(client, additional_amount: Decimal, user=None, force_override: bool = False) -> Optional[str]:
+    """
+    Проверить лимит и:
+      - вернуть warning (str) для soft-режима
+      - поднять CreditLimitBlocked для hard-режима (если нет override)
+      - вернуть None если всё ок
+
+    Raises:
+        CreditLimitBlocked — при hard-блокировке без override.
+    """
+    result = check_credit_limit(client, additional_amount)
+    if not result.is_over_limit:
+        return None
+
+    if result.block_mode == 'hard' and not force_override:
+        if user is not None and can_override_credit_limit(user):
+            return result.warning
+        raise CreditLimitBlocked(result.warning or 'Кредитный лимит превышен (hard)')
+
+    return result.warning
+
+
+class CreditLimitBlocked(Exception):
+    """Поднимается при hard-блокировке лимита без override."""
+    pass

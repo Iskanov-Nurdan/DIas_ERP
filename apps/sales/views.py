@@ -228,29 +228,26 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['patch'], url_path='status')
     def set_status(self, request, pk=None):
-        """Изменить статус заявки с валидацией переходов."""
+        """Изменить статус заявки с валидацией переходов (централизованный state machine)."""
+        from .state_machine import validate_order_transition
+
         order = self.get_object()
         new_status = request.data.get('status')
         if not new_status:
             return _err('MISSING_STATUS', 'Укажите status')
 
-        allowed = {
-            Order.STATUS_NEW: [Order.STATUS_CONFIRMED, Order.STATUS_CANCELED],
-            Order.STATUS_CONFIRMED: [Order.STATUS_IN_PROGRESS, Order.STATUS_CANCELED],
-            Order.STATUS_IN_PROGRESS: [
-                Order.STATUS_PARTIALLY_SHIPPED, Order.STATUS_SHIPPED, Order.STATUS_CANCELED,
-            ],
-            Order.STATUS_PARTIALLY_SHIPPED: [Order.STATUS_SHIPPED, Order.STATUS_CLOSED, Order.STATUS_CANCELED],
-            Order.STATUS_SHIPPED: [Order.STATUS_CLOSED],
-            Order.STATUS_CLOSED: [],
-            Order.STATUS_CANCELED: [],
-        }
-        if new_status not in allowed.get(order.status, []):
-            return _err(
-                'INVALID_STATUS_TRANSITION',
-                f'Нельзя перейти из «{order.get_status_display()}» в «{new_status}»',
-                http_status=422,
-            )
+        try:
+            validate_order_transition(order.status, new_status)
+        except ValueError as e:
+            return _err('INVALID_STATUS_TRANSITION', str(e), http_status=422)
+
+        # Дополнительная бизнес-проверка при закрытии заявки
+        if new_status == Order.STATUS_CLOSED:
+            from .state_machine import validate_order_close
+            try:
+                validate_order_close(order)
+            except ValueError as e:
+                return _err('ORDER_CLOSE_BLOCKED', str(e), http_status=422)
 
         order.status = new_status
         order.save(update_fields=['status', 'updated_at'])
@@ -627,6 +624,54 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             return _err('NO_CLIENT', 'У продажи не указан клиент')
         result = check_credit_limit(sale.client, additional_amount=sale.revenue or Decimal('0'))
         return Response(credit_check_result_to_dict(result))
+
+    @action(detail=True, methods=['patch'], url_path='status')
+    def set_status(self, request, pk=None):
+        """
+        Изменить статус продажи через централизованный state machine.
+
+        Проверки перед shipped/closed:
+          - Кредитный лимит (hard)
+          - Наличие склада (если продажа привязана к партии)
+        Допускает force_credit_override=true для пользователей с правом credit_limit_override.
+        """
+        from .state_machine import validate_sale_transition, validate_sale_ship
+        from .credit_check import enforce_credit_limit, CreditLimitBlocked
+
+        sale = self.get_object()
+        new_status = request.data.get('status')
+        if not new_status:
+            return _err('MISSING_STATUS', 'Укажите status')
+
+        try:
+            validate_sale_transition(sale.sale_status, new_status)
+        except ValueError as e:
+            return _err('INVALID_STATUS_TRANSITION', str(e), http_status=422)
+
+        shipping_statuses = (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED)
+        if new_status in shipping_statuses:
+            # Stock / reservation check
+            try:
+                validate_sale_ship(sale)
+            except ValueError as e:
+                return _err('SHIP_BLOCKED', str(e), http_status=422)
+
+            # Hard credit limit check
+            if sale.client_id:
+                force_override = str(request.data.get('force_credit_override', '')).lower() in ('1', 'true', 'yes')
+                try:
+                    enforce_credit_limit(
+                        sale.client,
+                        Decimal('0'),
+                        user=request.user,
+                        force_override=force_override,
+                    )
+                except CreditLimitBlocked as e:
+                    return _err('CREDIT_LIMIT_BLOCKED', str(e), http_status=422)
+
+        sale.sale_status = new_status
+        sale.save(update_fields=['sale_status', 'updated_at'])
+        return Response(SaleSerializer(sale, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='receipt')
     def receipt(self, request, pk=None):

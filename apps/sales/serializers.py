@@ -496,6 +496,26 @@ class SaleSerializer(serializers.ModelSerializer):
             attrs['stock_form'] = attrs.get('stock_form', '') or ''
             attrs['piece_pick'] = attrs.get('piece_pick', '') or ''
 
+        # ── Sale-without-reservation policy ───────────────────────────────────
+        from django.conf import settings as django_settings
+        if getattr(django_settings, 'SALE_REQUIRES_RESERVATION', False):
+            linked_order = attrs.get('linked_order')
+            if linked_order is not None:
+                wb_for_policy = attrs.get('warehouse_batch')
+                if wb_for_policy is not None:
+                    has_reservation = OrderReservation.objects.filter(
+                        order_line__order=linked_order,
+                        warehouse_batch=wb_for_policy,
+                        status=OrderReservation.STATUS_ACTIVE,
+                    ).exists()
+                    if not has_reservation:
+                        raise serializers.ValidationError({
+                            'linked_order': (
+                                'Продажа без активного резерва запрещена политикой системы. '
+                                'Сначала создайте резерв через /api/orders/{id}/reserve/.'
+                            )
+                        })
+
         return attrs
 
     def _fill_quantity_input(self, validated_data):
@@ -572,6 +592,23 @@ class SaleSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data = self._fill_quantity_input(validated_data)
         self._apply_finance(validated_data)
+
+        # ── Hard credit limit enforcement ─────────────────────────────────────
+        client = validated_data.get('client')
+        if client is not None:
+            from .credit_check import enforce_credit_limit, CreditLimitBlocked
+            revenue = validated_data.get('revenue') or Decimal('0')
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            force_override = (
+                str((self.initial_data or {}).get('force_credit_override', '')).lower()
+                in ('1', 'true', 'yes')
+            )
+            try:
+                enforce_credit_limit(client, revenue, user=user, force_override=force_override)
+            except CreditLimitBlocked as exc:
+                raise serializers.ValidationError({'credit_limit': str(exc)})
+
         if not validated_data.get('order_number'):
             today = timezone.now().date()
             year = today.year
@@ -600,11 +637,25 @@ class SaleSerializer(serializers.ModelSerializer):
         qty = validated_data['quantity']
         stock_sf = validated_data.get('stock_form') or ''
         pp = validated_data.get('piece_pick') or None
+        linked_order = validated_data.get('linked_order')
 
         with transaction.atomic():
             instance = super().create(validated_data)
             if wb_pk:
                 apply_sale_to_warehouse_batch(wb_pk, Decimal(str(qty)), stock_sf, pp)
+            # ── Auto-fulfill reservations + update OrderLine.shipped_quantity ──
+            if linked_order is not None and wb_pk is not None:
+                from .reservations import auto_fulfill_for_sale
+                request = self.context.get('request')
+                user = getattr(request, 'user', None) if request else None
+                auto_fulfill_for_sale(
+                    sale=instance,
+                    order=linked_order,
+                    warehouse_batch_id=wb_pk,
+                    quantity=Decimal(str(qty)),
+                    user=user,
+                    request=request,
+                )
         return instance
 
     def update(self, instance, validated_data):
@@ -971,16 +1022,18 @@ class OrderReservationSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'order_line', 'order_line_product',
             'warehouse_batch', 'warehouse_batch_product',
-            'quantity', 'status', 'comment',
+            'quantity', 'fulfilled_quantity', 'status',
+            'sale_line', 'comment',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
-        read_only_fields = ('created_at', 'updated_at', 'status')
+        read_only_fields = ('created_at', 'updated_at', 'status', 'fulfilled_quantity', 'sale_line')
         extra_kwargs = {
             'created_by': {'required': False, 'allow_null': True},
         }
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        if ret.get('quantity') is not None:
-            ret['quantity'] = api_decimal_str(Decimal(str(ret['quantity'])))
+        for key in ('quantity', 'fulfilled_quantity'):
+            if ret.get(key) is not None:
+                ret[key] = api_decimal_str(Decimal(str(ret[key])))
         return ret

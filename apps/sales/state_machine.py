@@ -49,6 +49,42 @@ def validate_order_cancel(order) -> None:
         )
 
 
+def validate_order_close(order) -> None:
+    """
+    Проверки перед закрытием заявки.
+
+    - Все строки заявки должны быть полностью отгружены или явно сняты.
+    - Открытые активные резервы должны отсутствовать.
+    - Политика: если ordered_quantity > shipped_quantity по хотя бы одной строке
+      И есть активные резервы — запрещаем закрытие.
+    """
+    from decimal import Decimal
+    from .models import OrderReservation
+
+    # Проверяем активные резервы
+    line_ids = list(order.lines.values_list('id', flat=True))
+    active_res = OrderReservation.objects.filter(
+        order_line_id__in=line_ids,
+        status=OrderReservation.STATUS_ACTIVE,
+    ).exists()
+    if active_res:
+        raise ValueError(
+            'Нельзя закрыть заявку: по ней остались активные резервы. '
+            'Сначала снимите резервы или исполните продажи.'
+        )
+
+    # Проверяем незакрытые строки (отгружено < заказано)
+    for line in order.lines.all():
+        ordered = Decimal(str(line.ordered_quantity or 0))
+        shipped = Decimal(str(getattr(line, 'shipped_quantity', None) or 0))
+        if shipped < ordered:
+            raise ValueError(
+                f'Нельзя закрыть заявку: строка #{line.pk} ({line.product}) '
+                f'не полностью отгружена ({shipped} из {ordered}). '
+                f'Частичное закрытие разрешено только в статусе "partially_shipped".'
+            )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sale (Продажа)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,8 +110,10 @@ def validate_sale_transition(current: str, new: str) -> None:
 
 def validate_sale_ship(sale, quantity: Optional[float] = None) -> None:
     """
-    Бизнес-проверки перед отгрузкой продажи.
-    quantity — сколько собираемся отгрузить (если None — вся продажа).
+    Бизнес-проверки перед отгрузкой/закрытием продажи:
+      - партия должна быть доступна
+      - остаток партии должен покрывать количество
+      - кредитный лимит (hard) должен быть проверен вызывающей стороной отдельно
     """
     from decimal import Decimal
 

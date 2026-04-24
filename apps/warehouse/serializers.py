@@ -27,6 +27,8 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
     open_package_pieces = serializers.SerializerMethodField()
     sealed_pieces = serializers.SerializerMethodField()
     packaging_quantity_consistent = serializers.SerializerMethodField()
+    reserved_quantity = serializers.SerializerMethodField()
+    available_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = WarehouseBatch
@@ -34,6 +36,8 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             'id',
             'product',
             'quantity',
+            'reserved_quantity',
+            'available_quantity',
             'status',
             'date',
             'source_batch',
@@ -157,6 +161,41 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
         ):
             return None
         return self._packaging_breakdown(obj)['packaging_quantity_consistent']
+
+    def get_reserved_quantity(self, obj):
+        """Количество, занятое активными резервами."""
+        from django.db.models import Sum
+        from django.db.models.functions import Coalesce
+        from django.db.models import Value
+        from decimal import Decimal as D
+        try:
+            from apps.sales.models import OrderReservation
+        except ImportError:
+            return None
+        val = (
+            OrderReservation.objects
+            .filter(warehouse_batch_id=obj.pk, status=OrderReservation.STATUS_ACTIVE)
+            .aggregate(t=Coalesce(Sum('quantity'), Value(D('0'))))['t']
+        )
+        return api_decimal_str(val or D('0'))
+
+    def get_available_quantity(self, obj):
+        """Свободный остаток = physical_quantity − reserved_quantity."""
+        from decimal import Decimal as D
+        phys = D(str(obj.quantity or 0))
+        try:
+            from apps.sales.models import OrderReservation
+            from django.db.models import Sum
+            from django.db.models.functions import Coalesce
+            from django.db.models import Value
+            reserved = (
+                OrderReservation.objects
+                .filter(warehouse_batch_id=obj.pk, status=OrderReservation.STATUS_ACTIVE)
+                .aggregate(t=Coalesce(Sum('quantity'), Value(D('0'))))['t']
+            ) or D('0')
+        except ImportError:
+            reserved = D('0')
+        return api_decimal_str(max(D('0'), phys - reserved))
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)

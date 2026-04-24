@@ -843,8 +843,18 @@ class OrderReservation(models.Model):
         verbose_name='Партия склада',
     )
     quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4, default=0)
+    fulfilled_quantity = models.DecimalField(
+        'Исполнено', max_digits=14, decimal_places=4, default=0,
+    )
     status = models.CharField(
         'Статус', max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True,
+    )
+    sale_line = models.ForeignKey(
+        'SaleLine',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='fulfilled_reservations',
+        verbose_name='Строка продажи (исполнила резерв)',
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

@@ -456,20 +456,37 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             for r in reworks
         ]
 
-        # Активные резервы
-        active_reservations = (
-            OrderReservation.objects.filter(
-                warehouse_batch=wb, status='active',
-            ).select_related('order_line__order')
+        # Все резервы (активные + исполненные + снятые) — полная коммерческая цепочка
+        all_reservations = (
+            OrderReservation.objects.filter(warehouse_batch=wb)
+            .select_related('order_line__order', 'sale_line__sale')
+            .order_by('created_at')
         )
-        result['active_reservations'] = [
+        result['reservations'] = [
             {
                 'reservation_id': res.pk,
+                'status': res.status,
                 'order_line_id': res.order_line_id,
-                'order_number': res.order_line.order.order_number if res.order_line_id else None,
+                'order_number': (
+                    res.order_line.order.order_number
+                    if res.order_line_id and res.order_line.order_id
+                    else None
+                ),
                 'quantity': str(res.quantity),
+                'fulfilled_quantity': str(res.fulfilled_quantity or 0),
+                'sale_line_id': res.sale_line_id,
+                'sale_order_number': (
+                    res.sale_line.sale.order_number
+                    if res.sale_line_id and res.sale_line.sale_id
+                    else None
+                ),
+                'created_at': res.created_at.isoformat() if res.created_at else None,
             }
-            for res in active_reservations
+            for res in all_reservations
+        ]
+        # Backward-compat alias: active_reservations
+        result['active_reservations'] = [
+            r for r in result['reservations'] if r['status'] == 'active'
         ]
 
         return Response(result)
