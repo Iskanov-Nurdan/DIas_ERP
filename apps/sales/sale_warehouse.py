@@ -33,9 +33,10 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
         return False
 
     lines = list(sale.sale_lines.all())
-    mutations: list = []
+    any_line_batch = bool(lines) and any(ln.warehouse_batch_id for ln in lines)
 
-    if lines:
+    if lines and any_line_batch:
+        mutations: list = []
         with transaction.atomic():
             sale_locked = Sale.objects.select_for_update().get(pk=sale.pk)
             if sale_locked.warehouse_stock_applied:
@@ -46,21 +47,45 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
                 wb = line.warehouse_batch
                 if wb.quality == WarehouseBatch.QUALITY_DEFECT and not (sale.is_defect_sale or line.defect_flag):
                     raise ValueError('Строка продажи ссылается на партию брака при обычной продаже')
+                qty_ln = Decimal(str(line.quantity or 0))
+                if qty_ln <= 0:
+                    continue
                 sf = (line.stock_form or '').strip() or (wb.inventory_form or '')
                 pp = (line.piece_pick or '').strip() or None
                 mut = apply_sale_to_warehouse_batch(
                     line.warehouse_batch_id,
-                    Decimal(str(line.quantity)),
+                    qty_ln,
                     sf,
                     pp,
                 )
                 mutations.append(mut)
+            if not mutations:
+                return False
             sale_locked.warehouse_stock_applied = True
             sale_locked.warehouse_mutation = mutations
             sale_locked.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
         return True
 
-    if sale.warehouse_batch_id:
+    if lines and (not any_line_batch) and sale.warehouse_batch_id:
+        wb = sale.warehouse_batch
+        if wb.quality == WarehouseBatch.QUALITY_DEFECT and not sale.is_defect_sale:
+            raise ValueError('Обычная продажа не может списывать партию брака')
+        mut = apply_sale_to_warehouse_batch(
+            sale.warehouse_batch_id,
+            Decimal(str(sale.quantity)),
+            sale.stock_form or '',
+            sale.piece_pick or None,
+        )
+        with transaction.atomic():
+            s2 = Sale.objects.select_for_update().get(pk=sale.pk)
+            if s2.warehouse_stock_applied:
+                return False
+            s2.warehouse_stock_applied = True
+            s2.warehouse_mutation = [mut]
+            s2.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
+        return True
+
+    if (not lines) and sale.warehouse_batch_id:
         wb = sale.warehouse_batch
         if wb.quality == WarehouseBatch.QUALITY_DEFECT and not sale.is_defect_sale:
             raise ValueError('Обычная продажа не может списывать партию брака')

@@ -409,7 +409,11 @@
 
 ### Склад при create/update
 
-Если статус — отгрузка (`partially_shipped`, `shipped`, `closed`), вызывается `apply_warehouse_for_sale` (списание **по каждой** `sale_line` с партией; legacy — одна строка без `order_line` и партия в шапке).
+Если статус — отгрузка (`partially_shipped`, `shipped`, `closed`), сначала **`validate_sale_ship`** (обычная продажа, `is_defect_sale=false`), затем **`apply_warehouse_for_sale`**.
+
+**`validate_sale_ship` (обычная продажа):** без перехода в отгрузочные статусы, если нет партии **ни в одной** `sale_lines[].warehouse_batch`, **ни** в `Sale.warehouse_batch`. Если **хотя бы у одной** строки указана своя партия — режим «по строкам»: каждая строка с **`quantity` > 0** обязана иметь **`warehouse_batch`**; партия в статусе **`available`**, качество **`good`**; количество не больше остатка партии. **Legacy через шапку** (`Sale.warehouse_batch` + `Sale.quantity`) разрешён **только если ни у одной строки нет** `warehouse_batch`. Продажи брака (`is_defect_sale=true`) этими правилами **не** ограничиваются (в т.ч. сценарий `DefectRecord.sell`).
+
+**`apply_warehouse_for_sale`:** списание **по каждой** строке с партией и `quantity` > 0; если строки есть, но **ни одна** не несёт партии, и в шапке задана партия — одно списание по **`Sale.warehouse_batch`** и **`Sale.quantity`**.
 
 При наличии `linked_order` после отгрузки вызывается `auto_fulfill_sale_lines_after_shipping`: для каждой строки продажи с **`order_line` + `warehouse_batch`** исполняются резервы только этой строки заявки и этой партии; иначе один вызов по шапке (legacy).
 
@@ -425,9 +429,9 @@
 
 **Body:** `{ "status": "...", "force_credit_override": true|false? }` (override проверяется только как строка `1/true/yes`).
 
-**Ошибки:** `MISSING_STATUS`, `INVALID_STATUS_TRANSITION`, `SHIP_BLOCKED`, `CREDIT_LIMIT_BLOCKED`, `WAREHOUSE_APPLY`.
+**Ошибки:** `MISSING_STATUS`, `INVALID_STATUS_TRANSITION`, `SHIP_BLOCKED` (текст из `validate_sale_ship`: нет партии, неполные строки, не `available`/`good`, превышение остатка), `CREDIT_LIMIT_BLOCKED`, `WAREHOUSE_APPLY`.
 
-После смены на shipping-статусы: `apply_warehouse_for_sale`, затем при наличии `linked_order` — `auto_fulfill_sale_lines_after_shipping` (см. выше).
+Перед сменой на отгрузочные статусы вызывается **`validate_sale_ship`**; после сохранения статуса — `apply_warehouse_for_sale`, затем при наличии `linked_order` — `auto_fulfill_sale_lines_after_shipping` (см. выше).
 
 ## Select-sources — `GET /api/sales/select-sources/`
 

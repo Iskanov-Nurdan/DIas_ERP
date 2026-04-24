@@ -110,46 +110,74 @@ def validate_sale_transition(current: str, new: str) -> None:
 
 def validate_sale_ship(sale, quantity: Optional[float] = None) -> None:
     """
-    Бизнес-проверки перед отгрузкой/закрытием продажи:
-      - партия должна быть доступна
-      - остаток партии должен покрывать количество
-      - кредитный лимит (hard) должен быть проверен вызывающей стороной отдельно
+    Бизнес-проверки перед отгрузкой/закрытием обычной продажи (не is_defect_sale):
+      - должна быть партия в строках и/или в шапке (см. legacy ниже)
+      - партия в статусе «доступна», качество «годный» (как при реальном списании stock_ops)
+      - остаток партии покрывает количество
+    Продажи брака (is_defect_sale) не ограничиваются здесь — отдельные сценарии / DefectRecord.sell.
     """
     from decimal import Decimal
 
-    lines = list(sale.sale_lines.all())
-    if lines:
-        any_wb = False
+    from apps.warehouse.models import WarehouseBatch
+
+    if getattr(sale, 'is_defect_sale', False):
+        return
+
+    def _assert_good_available(wb: WarehouseBatch, label: str) -> None:
+        if wb.status != WarehouseBatch.STATUS_AVAILABLE:
+            raise ValueError(
+                f'{label}: партия склада #{wb.pk} недоступна для отгрузки (статус: {wb.status}). '
+                f'Нужна партия в статусе «{WarehouseBatch.STATUS_AVAILABLE}».'
+            )
+        if wb.quality != WarehouseBatch.QUALITY_GOOD:
+            raise ValueError(
+                f'{label}: партия #{wb.pk} с качеством «брак» не может участвовать в обычной отгрузке.'
+            )
+
+    lines = list(sale.sale_lines.select_related('warehouse_batch').all())
+    any_line_has_batch = any(sl.warehouse_batch_id for sl in lines)
+
+    if any_line_has_batch:
+        has_positive = False
         for sl in lines:
-            if not sl.warehouse_batch_id:
+            qty = Decimal(str(sl.quantity or 0))
+            if qty <= 0:
                 continue
-            any_wb = True
-            wb = sl.warehouse_batch
-            if wb.status not in ('available', 'reserved'):
+            has_positive = True
+            if not sl.warehouse_batch_id:
                 raise ValueError(
-                    f'Партия склада #{wb.pk} недоступна для отгрузки (статус: {wb.status})'
+                    f'Строка продажи #{sl.pk}: для отгрузки укажите warehouse_batch.'
                 )
+            wb = sl.warehouse_batch
+            _assert_good_available(wb, f'Строка #{sl.pk}')
             avail = Decimal(str(wb.quantity))
-            qty = Decimal(str(sl.quantity))
             if qty > avail:
                 raise ValueError(
                     f'Нельзя отгрузить {qty} шт. по строке #{sl.pk}: на партии доступно только {avail} шт.'
                 )
-        if any_wb:
-            return
+        if not has_positive:
+            raise ValueError(
+                'Для отгрузки по строкам продажи укажите quantity > 0 хотя бы в одной строке с партией.'
+            )
+        return
 
-    if sale.warehouse_batch_id:
-        wb = sale.warehouse_batch
-        if wb.status not in ('available', 'reserved'):
-            raise ValueError(
-                f'Партия склада #{wb.pk} недоступна для отгрузки (статус: {wb.status})'
-            )
-        avail = Decimal(str(wb.quantity))
-        qty = Decimal(str(quantity)) if quantity is not None else Decimal(str(sale.quantity))
-        if qty > avail:
-            raise ValueError(
-                f'Нельзя отгрузить {qty} шт.: на партии доступно только {avail} шт.'
-            )
+    if not sale.warehouse_batch_id:
+        raise ValueError(
+            'Для отгрузки укажите партию склада в шапке продажи (warehouse_batch) '
+            'или у каждой отгружаемой строки (sale_lines[].warehouse_batch). '
+            'Fallback через шапку разрешён только если ни у одной строки нет своей партии.'
+        )
+
+    wb = sale.warehouse_batch
+    _assert_good_available(wb, 'Шапка продажи')
+    qty = Decimal(str(quantity)) if quantity is not None else Decimal(str(sale.quantity or 0))
+    if qty <= 0:
+        raise ValueError('Количество отгрузки по шапке продажи должно быть > 0.')
+    avail = Decimal(str(wb.quantity))
+    if qty > avail:
+        raise ValueError(
+            f'Нельзя отгрузить {qty} шт.: на партии доступно только {avail} шт.'
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

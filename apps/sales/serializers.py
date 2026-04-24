@@ -724,6 +724,7 @@ class SaleSerializer(serializers.ModelSerializer):
         lines_payload = (self.initial_data or {}).get('sale_lines')
         from .sale_warehouse import apply_warehouse_for_sale
         from .reservations import auto_fulfill_sale_lines_after_shipping
+        from .state_machine import validate_sale_ship
         with transaction.atomic():
             instance = super().create(validated_data)
             if lines_payload and isinstance(lines_payload, list) and len(lines_payload) > 0:
@@ -753,6 +754,10 @@ class SaleSerializer(serializers.ModelSerializer):
                     {'sale_lines': 'Должна быть минимум одна строка продажи (sale_lines или данные «шапки»)'},
                 )
             if shipping:
+                try:
+                    validate_sale_ship(instance)
+                except ValueError as e:
+                    raise serializers.ValidationError({'non_field_errors': [str(e)]})
                 try:
                     apply_warehouse_for_sale(instance)
                 except (ValueError, DrfValidationError) as e:
@@ -789,11 +794,16 @@ class SaleSerializer(serializers.ModelSerializer):
         user = getattr(request, 'user', None)
         from .sale_warehouse import apply_warehouse_for_sale
         from .reservations import auto_fulfill_sale_lines_after_shipping
+        from .state_machine import validate_sale_ship
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if not instance.sale_lines.exists() and (instance.warehouse_batch_id or (instance.product or '').strip()):
                 self._build_legacy_sale_line(instance)
             if self._is_shipping_status(instance.sale_status):
+                try:
+                    validate_sale_ship(instance)
+                except ValueError as e:
+                    raise serializers.ValidationError({'non_field_errors': [str(e)]})
                 try:
                     apply_warehouse_for_sale(instance)
                 except (ValueError, DrfValidationError) as e:
