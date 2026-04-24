@@ -117,6 +117,27 @@ def validate_sale_ship(sale, quantity: Optional[float] = None) -> None:
     """
     from decimal import Decimal
 
+    lines = list(sale.sale_lines.all())
+    if lines:
+        any_wb = False
+        for sl in lines:
+            if not sl.warehouse_batch_id:
+                continue
+            any_wb = True
+            wb = sl.warehouse_batch
+            if wb.status not in ('available', 'reserved'):
+                raise ValueError(
+                    f'Партия склада #{wb.pk} недоступна для отгрузки (статус: {wb.status})'
+                )
+            avail = Decimal(str(wb.quantity))
+            qty = Decimal(str(sl.quantity))
+            if qty > avail:
+                raise ValueError(
+                    f'Нельзя отгрузить {qty} шт. по строке #{sl.pk}: на партии доступно только {avail} шт.'
+                )
+        if any_wb:
+            return
+
     if sale.warehouse_batch_id:
         wb = sale.warehouse_batch
         if wb.status not in ('available', 'reserved'):
@@ -140,10 +161,13 @@ def validate_return_quantity(sale_line, return_quantity) -> None:
     Нельзя вернуть больше, чем отгружено по строке продажи.
     """
     from decimal import Decimal
-    from .models import ReturnLine
+    from .models import Return, ReturnLine
 
     already_returned = sum(
-        rl.quantity for rl in ReturnLine.objects.filter(sale_line=sale_line)
+        rl.quantity
+        for rl in ReturnLine.objects.filter(sale_line=sale_line).exclude(
+            return_doc__status=Return.STATUS_CANCELED,
+        )
     )
     total = Decimal(str(already_returned)) + Decimal(str(return_quantity))
     if total > Decimal(str(sale_line.quantity)):

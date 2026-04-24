@@ -20,8 +20,11 @@ def rollback_return_document(ret_doc: Return) -> None:
 
 def _rollback_line(line: ReturnLine, ret_doc: Return) -> None:
     if line.return_target == ReturnLine.TARGET_WAREHOUSE:
-        sale = ret_doc.sale
-        wb = sale.warehouse_batch
+        wb = None
+        if line.sale_line_id and line.sale_line.warehouse_batch_id:
+            wb = line.sale_line.warehouse_batch
+        else:
+            wb = ret_doc.sale.warehouse_batch
         if wb:
             with transaction.atomic():
                 w = WarehouseBatch.objects.select_for_update().get(pk=wb.pk)

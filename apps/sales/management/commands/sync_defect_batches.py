@@ -1,8 +1,12 @@
+import logging
+
 from django.core.management.base import BaseCommand
 
 from apps.warehouse.models import WarehouseBatch
 from apps.sales.defect_service import ensure_defect_record_for_defect_batch
 from apps.sales.models import DefectRecord
+
+logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
@@ -15,3 +19,4 @@ class Command(BaseCommand):
                 ensure_defect_record_for_defect_batch(wb)
                 n += 1
         self.stdout.write(self.style.SUCCESS(f'Создано записей: {n}'))
+        logger.info('sync_defect_batches: created %s DefectRecord(s)', n)

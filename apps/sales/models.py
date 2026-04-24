@@ -246,7 +246,7 @@ class Sale(models.Model):
         'Статус продажи',
         max_length=25,
         choices=SALE_STATUS_CHOICES,
-        default=STATUS_CLOSED,
+        default=STATUS_DRAFT,
         db_index=True,
     )
     linked_order = models.ForeignKey(
@@ -317,6 +317,9 @@ class Sale(models.Model):
     credit_limit_bypassed = models.BooleanField(
         'Согласован обход кредитного лимита', default=False, db_index=True,
     )
+    warehouse_mutation = models.JSONField(
+        'Снимок списания склада для отката', null=True, blank=True, default=None, editable=False,
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -358,6 +361,9 @@ class SaleLine(models.Model):
         verbose_name='Партия склада ГП',
     )
     stock_form = models.CharField('Форма учёта', max_length=20, blank=True, default='')
+    piece_pick = models.CharField(
+        'Источник штук (packed/…)', max_length=40, blank=True, default='',
+    )
     quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4, default=0)
     unit_price = models.DecimalField('Цена за ед.', max_digits=14, decimal_places=2, null=True, blank=True)
     line_total = models.DecimalField('Сумма строки', max_digits=16, decimal_places=2, default=0)
@@ -517,7 +523,7 @@ class Return(models.Model):
     return_number = models.CharField('Номер возврата', max_length=100, blank=True, default='')
     date = models.DateField('Дата')
     status = models.CharField(
-        'Статус', max_length=20, choices=RETURN_STATUS_CHOICES, default=STATUS_COMPLETED, db_index=True,
+        'Статус', max_length=20, choices=RETURN_STATUS_CHOICES, default=STATUS_DRAFT, db_index=True,
     )
     sale = models.ForeignKey(
         Sale, on_delete=models.PROTECT, related_name='returns', verbose_name='Продажа',

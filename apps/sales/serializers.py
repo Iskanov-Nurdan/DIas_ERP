@@ -164,6 +164,9 @@ class OrderSerializer(serializers.ModelSerializer):
     remaining_amount = serializers.SerializerMethodField()
     has_company_debt_by_goods = serializers.SerializerMethodField()
     paid_amount = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    debt_amount = serializers.SerializerMethodField()
+    refund_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -175,12 +178,14 @@ class OrderSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
             'lines',
             'total_amount', 'shipped_amount', 'remaining_amount',
-            'paid_amount', 'has_company_debt_by_goods',
+            'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
+            'has_company_debt_by_goods',
         )
         read_only_fields = (
             'order_number', 'created_at', 'updated_at',
             'total_amount', 'shipped_amount', 'remaining_amount',
-            'paid_amount', 'has_company_debt_by_goods',
+            'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
+            'has_company_debt_by_goods',
         )
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
@@ -201,19 +206,20 @@ class OrderSerializer(serializers.ModelSerializer):
         return obj.has_company_debt_by_goods
 
     def get_paid_amount(self, obj):
-        total = sum(
-            (p.amount or Decimal('0'))
-            for p in obj.payments.all()
-            if p.status == Payment.STATUS_ACTIVE
-            and p.payment_type in (Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE)
-        )
-        refunds = sum(
-            (p.amount or Decimal('0'))
-            for p in obj.payments.all()
-            if p.status == Payment.STATUS_ACTIVE
-            and p.payment_type == Payment.TYPE_REFUND
-        )
-        return api_decimal_str(total - refunds)
+        from .payment_status import order_payment_metrics
+        return api_decimal_str(order_payment_metrics(obj)['paid_amount'])
+
+    def get_payment_status(self, obj):
+        from .payment_status import order_payment_metrics
+        return order_payment_metrics(obj)['payment_status']
+
+    def get_debt_amount(self, obj):
+        from .payment_status import order_payment_metrics
+        return api_decimal_str(order_payment_metrics(obj)['debt_amount'])
+
+    def get_refund_amount(self, obj):
+        from .payment_status import order_payment_metrics
+        return api_decimal_str(order_payment_metrics(obj)['refund_amount'])
 
     def create(self, validated_data):
         lines_data = validated_data.pop('lines', [])
@@ -331,6 +337,20 @@ class PaymentSerializer(serializers.ModelSerializer):
         ret['amount'] = api_decimal_str(Decimal(str(instance.amount or 0)))
         return ret
 
+    def update(self, instance, validated_data):
+        if instance.status == Payment.STATUS_CANCELED:
+            raise serializers.ValidationError({'status': 'Отменённую оплату нельзя редактировать'})
+        frozen = ('amount', 'client', 'linked_sale', 'linked_order', 'linked_return', 'payment_type')
+        for key in frozen:
+            if key in validated_data:
+                raise serializers.ValidationError({
+                    key: (
+                        'После создания это поле нельзя менять; '
+                        'отмена записи — только POST /api/payments/{id}/cancel/'
+                    ),
+                })
+        return super().update(instance, validated_data)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SALE (Продажа)
@@ -341,7 +361,7 @@ class SaleLineSerializer(serializers.ModelSerializer):
         model = SaleLine
         fields = (
             'id', 'product', 'warehouse_batch', 'order_line',
-            'stock_form', 'quantity', 'unit_price', 'line_total',
+            'stock_form', 'piece_pick', 'quantity', 'unit_price', 'line_total',
             'cost', 'profit', 'defect_flag', 'comment',
         )
         read_only_fields = ('line_total', 'cost', 'profit')
@@ -376,6 +396,10 @@ class SaleSerializer(serializers.ModelSerializer):
     piece_pick = serializers.CharField(required=False, allow_blank=True, max_length=40, default='')
     profile_name = serializers.SerializerMethodField()
     sale_lines = SaleLineSerializer(many=True, read_only=True)
+    payment_status = serializers.SerializerMethodField()
+    paid_amount = serializers.SerializerMethodField()
+    debt_amount = serializers.SerializerMethodField()
+    refund_amount = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
 
     class Meta:
@@ -393,13 +417,14 @@ class SaleSerializer(serializers.ModelSerializer):
             'is_defect_sale',
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
             'created_by', 'created_by_name', 'created_at',
-            'sale_lines',
+            'sale_lines', 'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
         )
         read_only_fields = (
             'profit', 'revenue', 'cost', 'total_meters', 'inventory_form',
             'warehouse_batch_id', 'profile_name', 'stock_quality',
             'created_at', 'sale_lines',
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
+            'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
@@ -432,6 +457,22 @@ class SaleSerializer(serializers.ModelSerializer):
                 pass
         sf = (obj.stock_form or '').strip()
         return sf or None
+
+    def get_payment_status(self, obj):
+        from .payment_status import sale_payment_metrics
+        return sale_payment_metrics(obj)['payment_status']
+
+    def get_paid_amount(self, obj):
+        from .payment_status import sale_payment_metrics
+        return api_decimal_str(sale_payment_metrics(obj)['paid_amount'])
+
+    def get_debt_amount(self, obj):
+        from .payment_status import sale_payment_metrics
+        return api_decimal_str(sale_payment_metrics(obj)['debt_amount'])
+
+    def get_refund_amount(self, obj):
+        from .payment_status import sale_payment_metrics
+        return api_decimal_str(sale_payment_metrics(obj)['refund_amount'])
 
     def to_internal_value(self, data):
         return super().to_internal_value(data)
@@ -613,6 +654,8 @@ class SaleSerializer(serializers.ModelSerializer):
             sale=instance,
             product=instance.product,
             warehouse_batch_id=instance.warehouse_batch_id,
+            stock_form=instance.stock_form or '',
+            piece_pick=instance.piece_pick or '',
             quantity=instance.quantity,
             unit_price=instance.price,
             line_total=lt,
@@ -632,7 +675,7 @@ class SaleSerializer(serializers.ModelSerializer):
         validated_data = self._fill_quantity_input(validated_data)
         self._apply_finance(validated_data)
 
-        ss = validated_data.get('sale_status', Sale.STATUS_CLOSED)
+        ss = validated_data.get('sale_status', Sale.STATUS_DRAFT)
         shipping = self._is_shipping_status(ss)
         client = validated_data.get('client')
         request = self.context.get('request')
@@ -680,15 +723,20 @@ class SaleSerializer(serializers.ModelSerializer):
         linked_order = validated_data.get('linked_order')
         lines_payload = (self.initial_data or {}).get('sale_lines')
         from .sale_warehouse import apply_warehouse_for_sale
-        from .reservations import auto_fulfill_for_sale
+        from .reservations import auto_fulfill_sale_lines_after_shipping
         with transaction.atomic():
             instance = super().create(validated_data)
             if lines_payload and isinstance(lines_payload, list) and len(lines_payload) > 0:
                 allowed = {
-                    'order_line', 'product', 'warehouse_batch', 'stock_form',
+                    'order_line', 'product', 'warehouse_batch', 'stock_form', 'piece_pick',
                     'quantity', 'unit_price', 'defect_flag', 'comment',
                 }
                 for row in lines_payload:
+                    extra = set(row.keys()) - allowed
+                    if extra:
+                        raise serializers.ValidationError(
+                            {'sale_lines': f'Недопустимые поля в строке: {", ".join(sorted(extra))}'},
+                        )
                     sld = {k: v for k, v in row.items() if k in allowed}
                     up = Decimal(str(sld.get('unit_price') or 0))
                     qn = Decimal(str(sld.get('quantity') or 0))
@@ -700,24 +748,23 @@ class SaleSerializer(serializers.ModelSerializer):
             else:
                 self._build_legacy_sale_line(instance)
             instance = Sale.objects.select_for_update().get(pk=instance.pk)
+            if not instance.sale_lines.exists():
+                raise serializers.ValidationError(
+                    {'sale_lines': 'Должна быть минимум одна строка продажи (sale_lines или данные «шапки»)'},
+                )
             if shipping:
                 try:
                     apply_warehouse_for_sale(instance)
                 except (ValueError, DrfValidationError) as e:
                     msg = getattr(e, 'detail', e) if isinstance(e, DrfValidationError) else str(e)
                     raise serializers.ValidationError({'non_field_errors': [str(msg)]})
-            if shipping and linked_order is not None and wb_pk is not None:
-                sl = instance.sale_lines.order_by('id').first()
-                if sl is not None:
-                    auto_fulfill_for_sale(
-                        sale=instance,
-                        order=linked_order,
-                        warehouse_batch_id=wb_pk,
-                        quantity=Decimal(str(qty)),
-                        user=user,
-                        request=request,
-                        sale_line=sl,
-                    )
+            if shipping and linked_order is not None:
+                auto_fulfill_sale_lines_after_shipping(
+                    sale=instance,
+                    order=linked_order,
+                    user=user,
+                    request=request,
+                )
         return instance
 
     def update(self, instance, validated_data):
@@ -741,7 +788,7 @@ class SaleSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
         from .sale_warehouse import apply_warehouse_for_sale
-        from .reservations import auto_fulfill_for_sale
+        from .reservations import auto_fulfill_sale_lines_after_shipping
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if not instance.sale_lines.exists() and (instance.warehouse_batch_id or (instance.product or '').strip()):
@@ -752,18 +799,13 @@ class SaleSerializer(serializers.ModelSerializer):
                 except (ValueError, DrfValidationError) as e:
                     msg = getattr(e, 'detail', e) if isinstance(e, DrfValidationError) else str(e)
                     raise serializers.ValidationError({'non_field_errors': [str(msg)]})
-                if instance.linked_order_id and instance.warehouse_batch_id:
-                    sl = instance.sale_lines.order_by('id').first()
-                    if sl is not None:
-                        auto_fulfill_for_sale(
-                            sale=instance,
-                            order=instance.linked_order,
-                            warehouse_batch_id=instance.warehouse_batch_id,
-                            quantity=Decimal(str(instance.quantity)),
-                            user=user,
-                            request=request,
-                            sale_line=sl,
-                        )
+                if instance.linked_order_id:
+                    auto_fulfill_sale_lines_after_shipping(
+                        sale=instance,
+                        order=instance.linked_order,
+                        user=user,
+                        request=request,
+                    )
         return instance
 
 
@@ -788,6 +830,10 @@ class ReturnLineSerializer(serializers.ModelSerializer):
         }
 
     def validate(self, attrs):
+        if self.instance and self.instance.return_doc.status == Return.STATUS_COMPLETED:
+            raise serializers.ValidationError(
+                'Строку проведённого возврата нельзя изменять',
+            )
         sale_line = attrs.get('sale_line')
         if sale_line is None:
             raise serializers.ValidationError({'sale_line': 'Поле sale_line обязательно'})
@@ -841,6 +887,20 @@ class ReturnSerializer(serializers.ModelSerializer):
             return obj.sale.client.name
         return ''
 
+    def validate(self, attrs):
+        if not self.instance:
+            lines = (self.initial_data or {}).get('lines')
+            if not lines or not isinstance(lines, list) or len(lines) < 1:
+                raise serializers.ValidationError(
+                    {'lines': 'Нужна минимум одна строка возврата (sale_line)'},
+                )
+            st = (self.initial_data or {}).get('status')
+            if st == Return.STATUS_COMPLETED:
+                raise serializers.ValidationError({
+                    'status': 'Создайте возврат как черновик (draft), затем POST /api/returns/{id}/complete/',
+                })
+        return attrs
+
     def create(self, validated_data):
         lines_data = validated_data.pop('lines', [])
         if not validated_data.get('date'):
@@ -853,18 +913,37 @@ class ReturnSerializer(serializers.ModelSerializer):
         except (ValueError, IndexError):
             last_n = 0
         validated_data['return_number'] = f'RET-{year}-{last_n + 1:04d}'
+        validated_data.pop('status', None)
+        validated_data['status'] = Return.STATUS_DRAFT
 
-        st = validated_data.get('status', Return.STATUS_COMPLETED)
         with transaction.atomic():
             ret_doc = super().create(validated_data)
             for line_data in lines_data:
                 sale_line = line_data.get('sale_line')
                 if sale_line is not None:
                     line_data['product'] = sale_line.product
-                line = ReturnLine.objects.create(return_doc=ret_doc, **line_data)
-                if st == Return.STATUS_COMPLETED:
-                    self._process_return_line(line, ret_doc)
+                ReturnLine.objects.create(return_doc=ret_doc, **line_data)
         return ret_doc
+
+    def update(self, instance, validated_data):
+        if instance.status == Return.STATUS_CANCELED:
+            raise serializers.ValidationError({'status': 'Отменённый возврат нельзя редактировать'})
+        if instance.status == Return.STATUS_COMPLETED:
+            allowed = {'comment', 'return_reason', 'invoice_number'}
+            initial = self.initial_data or {}
+            for key in initial:
+                if key not in allowed:
+                    raise serializers.ValidationError({
+                        key: 'У проведённого возврата можно менять только comment, return_reason, invoice_number',
+                    })
+            validated_data = {k: v for k, v in validated_data.items() if k in allowed}
+            return super().update(instance, validated_data)
+        return super().update(instance, validated_data)
+
+    def apply_completion_effects(self, ret_doc: Return) -> None:
+        """Склад / брак / переделка — только при проведении возврата (после complete)."""
+        for line in ret_doc.lines.all().select_related('sale_line', 'sale_line__warehouse_batch'):
+            self._process_return_line(line, ret_doc)
 
     def _process_return_line(self, line: ReturnLine, ret_doc: Return):
         """Обрабатываем возврат — возврат на склад, в брак или на переделку."""
@@ -872,9 +951,11 @@ class ReturnSerializer(serializers.ModelSerializer):
         from apps.warehouse.packaging import q4
 
         if line.return_target == ReturnLine.TARGET_WAREHOUSE:
-            # Возвращаем на склад ГП
-            sale = ret_doc.sale
-            wb = sale.warehouse_batch
+            wb = None
+            if line.sale_line_id and line.sale_line.warehouse_batch_id:
+                wb = line.sale_line.warehouse_batch
+            else:
+                wb = ret_doc.sale.warehouse_batch
             if wb:
                 wb.quantity = q4(wb.quantity + line.quantity)
                 if wb.status == WarehouseBatch.STATUS_SHIPPED:

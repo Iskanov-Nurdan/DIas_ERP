@@ -266,12 +266,13 @@ def auto_fulfill_for_sale(
     sale_line=None,
 ) -> int:
     """
-    При создании продажи (Sale) автоматически исполнить активные резервы
-    по данному заказу и партии на запрошенное количество.
+    Исполнить активные резервы по заказу и партии на quantity.
 
-    Также обновляет OrderLine.shipped_quantity для связанных строк заявки.
+    Если передан sale_line с order_line_id — резервы только этой строки заявки
+    и этой партии (многострочная продажа). Иначе — все строки заявки с этой партией (legacy).
 
-    Возвращает количество обновлённых резервов.
+    Пересчёт shipped по заявке — вызывайте `recalculate_order_line_shipped_from_sale_lines_for_order`
+    после набора вызовов (см. `auto_fulfill_sale_lines_after_shipping`).
     """
     if sale_line is None:
         sale_line = (
@@ -288,15 +289,23 @@ def auto_fulfill_for_sale(
     remaining = Decimal(str(quantity))
 
     with transaction.atomic():
-        line_ids = list(order.lines.values_list('id', flat=True))
+        if sale_line.order_line_id:
+            res_filter = {
+                'order_line_id': sale_line.order_line_id,
+                'warehouse_batch_id': warehouse_batch_id,
+                'status': OrderReservation.STATUS_ACTIVE,
+            }
+        else:
+            line_ids = list(order.lines.values_list('id', flat=True))
+            res_filter = {
+                'order_line_id__in': line_ids,
+                'warehouse_batch_id': warehouse_batch_id,
+                'status': OrderReservation.STATUS_ACTIVE,
+            }
 
         active_reservations = (
             OrderReservation.objects.select_for_update()
-            .filter(
-                order_line_id__in=line_ids,
-                warehouse_batch_id=warehouse_batch_id,
-                status=OrderReservation.STATUS_ACTIVE,
-            )
+            .filter(**res_filter)
             .order_by('created_at')
         )
 
@@ -315,17 +324,54 @@ def auto_fulfill_for_sale(
             remaining -= take
             fulfilled_count += 1
 
-            # Update OrderLine.shipped_quantity
-            try:
-                line = OrderLine.objects.select_for_update().get(pk=res.order_line_id)
-                line.shipped_quantity = (
-                    Decimal(str(getattr(line, 'shipped_quantity', None) or 0)) + take
-                ).quantize(Decimal('0.0001'))
-                line.save(update_fields=['shipped_quantity'])
-            except OrderLine.DoesNotExist:
-                pass
-
     return fulfilled_count
+
+
+def auto_fulfill_sale_lines_after_shipping(
+    *,
+    sale,
+    order,
+    user=None,
+    request=None,
+) -> int:
+    """
+    После отгрузки продажи: по каждой sale_line с партией и строкой заявки — исполнить резервы;
+    иначе один вызов по шапке (legacy: warehouse_batch на продаже + первая строка без order_line).
+    В конце — пересчёт shipped по заявке из SaleLine.
+    """
+    from .order_sync import recalculate_order_line_shipped_from_sale_lines_for_order
+
+    if order is None or not sale.linked_order_id:
+        return 0
+    total = 0
+    lines = list(sale.sale_lines.order_by('id'))
+    if not lines:
+        return 0
+    keyed = [sl for sl in lines if sl.warehouse_batch_id and sl.order_line_id]
+    if keyed:
+        for sl in keyed:
+            total += auto_fulfill_for_sale(
+                sale=sale,
+                order=order,
+                warehouse_batch_id=sl.warehouse_batch_id,
+                quantity=Decimal(str(sl.quantity)),
+                user=user,
+                request=request,
+                sale_line=sl,
+            )
+    elif sale.warehouse_batch_id:
+        sl = lines[0]
+        total += auto_fulfill_for_sale(
+            sale=sale,
+            order=order,
+            warehouse_batch_id=sale.warehouse_batch_id,
+            quantity=Decimal(str(sale.quantity)),
+            user=user,
+            request=request,
+            sale_line=sl,
+        )
+    recalculate_order_line_shipped_from_sale_lines_for_order(order)
+    return total
 
 
 def restore_reservations_for_sale(
@@ -335,8 +381,7 @@ def restore_reservations_for_sale(
     request=None,
 ) -> int:
     """
-    При отмене/удалении Sale восстановить (снять fulfilled-пометку) резервы,
-    которые были исполнены этой продажей, и откатить shipped_quantity.
+    При отмене/удалении Sale — восстановить резервы; отгруженное по заявке — через пересчёт от SaleLine.
 
     Возвращает количество восстановленных резервов.
     """
@@ -363,11 +408,7 @@ def restore_reservations_for_sale(
                 line.reserved_quantity = (
                     Decimal(str(line.reserved_quantity or 0)) + fq
                 ).quantize(Decimal('0.0001'))
-                line.shipped_quantity = max(
-                    Decimal('0'),
-                    Decimal(str(getattr(line, 'shipped_quantity', None) or 0)) - fq,
-                ).quantize(Decimal('0.0001'))
-                line.save(update_fields=['reserved_quantity', 'shipped_quantity'])
+                line.save(update_fields=['reserved_quantity'])
             except OrderLine.DoesNotExist:
                 pass
 
@@ -386,6 +427,7 @@ def restore_reservations_for_sale(
                 },
             )
             restored_count += 1
+
     return restored_count
 
 

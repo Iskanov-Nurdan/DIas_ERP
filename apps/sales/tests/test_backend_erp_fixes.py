@@ -31,5 +31,5 @@ class DefectAndSaleHelpersTests(TestCase):
 
 
 class ReturnModelTests(TestCase):
-    def test_return_status_choices(self):
-        self.assertEqual(Return.STATUS_COMPLETED, 'completed')
+    def test_return_default_status_is_draft(self):
+        self.assertEqual(Return.STATUS_DRAFT, 'draft')

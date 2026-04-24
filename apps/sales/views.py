@@ -288,13 +288,16 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         except ValueError as e:
             return _err('INVALID_STATUS_TRANSITION', str(e), http_status=422)
 
-        # Дополнительная бизнес-проверка при закрытии заявки
-        if new_status == Order.STATUS_CLOSED:
-            from .state_machine import validate_order_close
+        if new_status in (
+            Order.STATUS_SHIPPED,
+            Order.STATUS_PARTIALLY_SHIPPED,
+            Order.STATUS_CLOSED,
+        ):
+            from .order_sync import validate_order_for_new_status
             try:
-                validate_order_close(order)
+                validate_order_for_new_status(order, new_status)
             except ValueError as e:
-                return _err('ORDER_CLOSE_BLOCKED', str(e), http_status=422)
+                return _err('ORDER_STATUS_BLOCKED', str(e), http_status=422)
 
         order.status = new_status
         order.save(update_fields=['status', 'updated_at'])
@@ -502,7 +505,7 @@ def _order_html_response(order: Order) -> HttpResponse:
 class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Sale.objects.select_related(
         'client', 'warehouse_batch', 'warehouse_batch__profile', 'linked_order',
-    ).prefetch_related('sale_lines').all()
+    ).prefetch_related('sale_lines', 'payments').all()
     serializer_class = SaleSerializer
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'sales'
@@ -748,6 +751,19 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             restore_reservations_for_sale(sale, user=request.user, request=request)
             sale.sale_status = Sale.STATUS_CANCELED
             sale.save(update_fields=['sale_status', 'updated_at'])
+        if sale.linked_order_id:
+            from .order_sync import recalculate_order_line_shipped_from_sale_lines_for_order
+            recalculate_order_line_shipped_from_sale_lines_for_order(sale.linked_order_id)
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='sales',
+            description=f'Отмена продажи #{sale.order_number}',
+            model_cls=Sale,
+            instance=sale,
+            payload_extra={'action': 'cancel_sale', 'sale_id': sale.pk},
+        )
         return Response(SaleSerializer(sale, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='waybill')
@@ -815,7 +831,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         sale.save(update_fields=['sale_status', 'updated_at'])
         sale.refresh_from_db()
         from .sale_warehouse import apply_warehouse_for_sale
-        from .reservations import auto_fulfill_for_sale
+        from .reservations import auto_fulfill_sale_lines_after_shipping
         try:
             apply_warehouse_for_sale(sale)
         except (ValueError, Exception) as e:
@@ -823,18 +839,13 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             if isinstance(e, DrfV):
                 return _err('WAREHOUSE_APPLY', str(e.detail), http_status=422)
             return _err('WAREHOUSE_APPLY', str(e), http_status=422)
-        if sale.linked_order_id and sale.warehouse_batch_id and new_status in shipping_statuses:
-            sl = sale.sale_lines.order_by('id').first()
-            if sl is not None:
-                auto_fulfill_for_sale(
-                    sale=sale,
-                    order=sale.linked_order,
-                    warehouse_batch_id=sale.warehouse_batch_id,
-                    quantity=Decimal(str(sale.quantity)),
-                    user=request.user if request.user.is_authenticated else None,
-                    request=request,
-                    sale_line=sl,
-                )
+        if sale.linked_order_id and new_status in shipping_statuses:
+            auto_fulfill_sale_lines_after_shipping(
+                sale=sale,
+                order=sale.linked_order,
+                user=request.user if request.user.is_authenticated else None,
+                request=request,
+            )
         return Response(SaleSerializer(sale, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='receipt')
@@ -893,6 +904,16 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             return _err('ALREADY_CANCELED', 'Оплата уже отменена', http_status=422)
         p.status = Payment.STATUS_CANCELED
         p.save(update_fields=['status'])
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='payments',
+            description=f'Отмена оплаты #{p.payment_number or p.pk}',
+            model_cls=Payment,
+            instance=p,
+            payload_extra={'action': 'cancel_payment', 'payment_id': p.pk},
+        )
         return Response(PaymentSerializer(p).data)
 
     def perform_create(self, serializer):
@@ -978,6 +999,31 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 rollback_return_document(ret_doc)
             ret_doc.status = Return.STATUS_CANCELED
             ret_doc.save(update_fields=['status'])
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='returns',
+            description=f'Отмена возврата #{ret_doc.return_number or ret_doc.pk}',
+            model_cls=Return,
+            instance=ret_doc,
+            payload_extra={'action': 'cancel_return', 'return_id': ret_doc.pk},
+        )
+        return Response(ReturnSerializer(ret_doc, context={'request': request}).data)
+
+    @action(detail=True, methods=['post', 'patch'], url_path='complete')
+    def complete_return(self, request, pk=None):
+        """Провести возврат: склад/брак/переделка только здесь (из статуса draft)."""
+        ret_doc = self.get_object()
+        if ret_doc.status != Return.STATUS_DRAFT:
+            return _err('INVALID_STATE', 'Провести можно только возврат в статусе draft', http_status=422)
+        if not ret_doc.lines.exists():
+            return _err('NO_LINES', 'Нет строк возврата', http_status=422)
+        ser = ReturnSerializer()
+        with transaction.atomic():
+            ser.apply_completion_effects(ret_doc)
+            ret_doc.status = Return.STATUS_COMPLETED
+            ret_doc.save(update_fields=['status'])
         return Response(ReturnSerializer(ret_doc, context={'request': request}).data)
 
     def perform_create(self, serializer):
@@ -1043,6 +1089,7 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         data['available_status_transitions'] = []
         data['available_actions'] = {
             'waybill': True,
+            'complete': instance.status == Return.STATUS_DRAFT,
         }
         return Response(data)
 
@@ -1194,7 +1241,7 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         data['available_status_transitions'] = DEFECT_TRANSITIONS.get(instance.status, [])
         data['available_actions'] = {
             'send_to_rework': DefectRecord.STATUS_SENT_TO_REWORK in DEFECT_TRANSITIONS.get(instance.status, []),
-            'complete_rework': DefectRecord.STATUS_REWORKED in DEFECT_TRANSITIONS.get(instance.status, []),
+            'complete_rework': False,
             'writeoff': DefectRecord.STATUS_WRITTEN_OFF in DEFECT_TRANSITIONS.get(instance.status, []),
             'sell': instance.status in (DefectRecord.STATUS_ON_STOCK, DefectRecord.STATUS_REWORKED),
         }
@@ -1266,6 +1313,16 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             )
             record.status = DefectRecord.STATUS_SENT_TO_REWORK
             record.save(update_fields=['status', 'updated_at'])
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='defects',
+            description=f'Брак → переделка: defect #{record.pk}, {rw_n}',
+            model_cls=DefectRecord,
+            instance=record,
+            payload_extra={'action': 'send_defect_to_rework', 'defect_id': record.pk, 'rework_id': rw.pk},
+        )
         return Response({
             'defect': DefectRecordSerializer(record).data,
             'rework_request': ReworkRequestSerializer(rw).data,
@@ -1273,16 +1330,15 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='complete-rework')
     def complete_rework(self, request, pk=None):
-        """Завершить переработку брака."""
-        from .state_machine import validate_defect_transition
-        record = self.get_object()
-        try:
-            validate_defect_transition(record.status, DefectRecord.STATUS_REWORKED)
-        except ValueError as e:
-            return _err('INVALID_STATUS', str(e), http_status=422)
-        record.status = DefectRecord.STATUS_REWORKED
-        record.save(update_fields=['status', 'updated_at'])
-        return Response(DefectRecordSerializer(record).data)
+        """Отключено: завершение переделки и выход на склад только через POST /api/rework-requests/{id}/complete/."""
+        return Response(
+            {
+                'code': 'USE_REWORK_COMPLETE',
+                'error': 'Завершение переделки только через POST /api/rework-requests/{id}/complete/',
+                'detail': 'Завершение переделки только через POST /api/rework-requests/{id}/complete/',
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     @action(detail=True, methods=['post'], url_path='writeoff')
     def writeoff(self, request, pk=None):
@@ -1299,6 +1355,16 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         record.status = DefectRecord.STATUS_WRITTEN_OFF
         record.writeoff_reason = reason
         record.save(update_fields=['status', 'writeoff_reason', 'updated_at'])
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='defects',
+            description=f'Списание брака #{record.pk}',
+            model_cls=DefectRecord,
+            instance=record,
+            payload_extra={'action': 'writeoff_defect', 'defect_id': record.pk},
+        )
         return Response(DefectRecordSerializer(record).data)
 
     @action(detail=True, methods=['post'], url_path='sell')
@@ -1314,7 +1380,32 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             return _err('INVALID_STATUS', str(e), http_status=422)
         client_id = request.data.get('client_id')
         price = request.data.get('price')
-        quantity = request.data.get('quantity', record.quantity_pcs)
+        quantity_raw = request.data.get('quantity')
+        if client_id is None or client_id == '':
+            return _err('MISSING_CLIENT', 'Укажите client_id', http_status=422)
+        if price is None or str(price).strip() == '':
+            return _err('MISSING_PRICE', 'Укажите price', http_status=422)
+        if quantity_raw is None or str(quantity_raw).strip() == '':
+            return _err('MISSING_QUANTITY', 'Укажите quantity (полная продажа остатка по браку)', http_status=422)
+        try:
+            price_d = Decimal(str(price))
+            qty_d = Decimal(str(quantity_raw))
+        except Exception:
+            return _err('INVALID_DECIMAL', 'Некорректные price или quantity', http_status=422)
+        if price_d <= 0:
+            return _err('INVALID_PRICE', 'price должен быть > 0', http_status=422)
+        if qty_d <= 0:
+            return _err('INVALID_QUANTITY', 'quantity должен быть > 0', http_status=422)
+        avail = Decimal(str(record.quantity_pcs or 0))
+        if qty_d > avail + Decimal('0.0001'):
+            return _err('QTY_TOO_HIGH', f'Нельзя продать больше остатка по браку ({avail})', http_status=422)
+        if qty_d + Decimal('0.0001') < avail:
+            return _err(
+                'PARTIAL_NOT_SUPPORTED',
+                'Частичная продажа брака не поддержана: quantity должен равняться полному остатку quantity_pcs',
+                http_status=422,
+            )
+        quantity = qty_d
         comment = request.data.get('comment', '')
         date = request.data.get('date') or timezone.now().date()
 
@@ -1323,8 +1414,8 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             product=record.product,
             quantity=Decimal(str(quantity)),
             sold_pieces=Decimal(str(quantity)),
-            price=Decimal(str(price)) if price else None,
-            revenue=(Decimal(str(price)) * Decimal(str(quantity))).quantize(Decimal('0.01')) if price else Decimal('0'),
+            price=price_d,
+            revenue=(price_d * quantity).quantize(Decimal('0.01')),
             cost=Decimal('0'),
             profit=Decimal('0'),
             date=date,
@@ -1342,9 +1433,29 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             last_n = 0
         sale.order_number = f'ORD-{year}-{last_n + 1:03d}'
         sale.save(update_fields=['order_number'])
+        lt = (price_d * quantity).quantize(Decimal('0.01'))
+        SaleLine.objects.create(
+            sale=sale,
+            product=record.product,
+            quantity=quantity,
+            unit_price=price_d,
+            line_total=lt,
+            cost=Decimal('0'),
+            profit=lt,
+        )
 
         record.status = DefectRecord.STATUS_SOLD
         record.save(update_fields=['status', 'updated_at'])
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='defects',
+            description=f'Продажа брака #{record.pk} → sale #{sale.pk}',
+            model_cls=DefectRecord,
+            instance=record,
+            payload_extra={'action': 'sell_defect', 'defect_id': record.pk, 'sale_id': sale.pk},
+        )
         return Response({'sale_id': sale.id, 'sale_order_number': sale.order_number}, status=status.HTTP_201_CREATED)
 
 
@@ -1552,6 +1663,16 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             entity_id=rework.pk,
             extra={'status': ReworkRequest.STATUS_COMPLETED},
         ))
+        from .commercial_audit import log_commercial_audit
+        log_commercial_audit(
+            user=request.user,
+            request=request,
+            section='rework',
+            description=f'Завершение переделки {rework.rework_number}',
+            model_cls=ReworkRequest,
+            instance=rework,
+            payload_extra={'action': 'complete_rework', 'rework_id': rework.pk},
+        )
         rework.refresh_from_db()
         return Response(ReworkRequestSerializer(rework).data)
 
@@ -1665,7 +1786,8 @@ class ClientFinancialSummaryView(viewsets.ViewSet):
 
     def list(self, request):
         from config.api_numbers import api_decimal_str
-        from .credit_check import check_credit_limit, compute_client_debt
+        from .credit_check import check_credit_limit
+        from .payment_status import payment_status
         from django.db.models import Sum
         from django.db.models.functions import Coalesce
 
@@ -1705,10 +1827,17 @@ class ClientFinancialSummaryView(viewsets.ViewSet):
         client_advance = max(Decimal('0'), net_paid - total_revenue)
 
         credit_result = check_credit_limit(client)
+        fin_payment_status = payment_status(
+            total_due=total_revenue,
+            net_paid=net_paid,
+            total_incoming=total_incoming,
+            total_refund=total_refunded,
+        )
 
         return Response({
             'client_id': client.pk,
             'client_name': client.name,
+            'payment_status': fin_payment_status,
             'total_revenue': api_decimal_str(total_revenue),
             'total_cost': api_decimal_str(total_cost),
             'total_profit': api_decimal_str(total_profit),
