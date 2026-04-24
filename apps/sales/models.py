@@ -632,6 +632,7 @@ class DefectRecord(models.Model):
     STATUS_REWORKED = 'reworked'
     STATUS_SOLD = 'sold'
     STATUS_WRITTEN_OFF = 'written_off'
+    STATUS_CLOSED = 'closed'
     STATUS_CHOICES = [
         (STATUS_NEW, 'Новый'),
         (STATUS_ON_STOCK, 'На складе брака'),
@@ -639,6 +640,7 @@ class DefectRecord(models.Model):
         (STATUS_REWORKED, 'Переработан'),
         (STATUS_SOLD, 'Продан'),
         (STATUS_WRITTEN_OFF, 'Списан'),
+        (STATUS_CLOSED, 'Закрыт'),
     ]
 
     source_type = models.CharField(
@@ -661,8 +663,20 @@ class DefectRecord(models.Model):
         verbose_name='Профиль',
     )
     product = models.CharField('Продукт / наименование', max_length=255, blank=True, default='')
+    original_quantity_pcs = models.DecimalField(
+        'Исходно шт (база учёта)', max_digits=14, decimal_places=4, default=0,
+    )
     quantity_pcs = models.DecimalField(
-        'Количество шт/м', max_digits=14, decimal_places=4, default=0,
+        'Остаток шт/м (доступно к операциям)', max_digits=14, decimal_places=4, default=0,
+    )
+    sold_quantity_pcs = models.DecimalField(
+        'Продано шт (накопительно)', max_digits=14, decimal_places=4, default=0,
+    )
+    written_off_quantity_pcs = models.DecimalField(
+        'Списано шт (накопительно)', max_digits=14, decimal_places=4, default=0,
+    )
+    sent_to_rework_quantity_pcs = models.DecimalField(
+        'Отправлено в переделку шт (накопительно)', max_digits=14, decimal_places=4, default=0,
     )
     quantity_kg = models.DecimalField(
         'Количество кг', max_digits=14, decimal_places=4, null=True, blank=True,
@@ -694,6 +708,45 @@ class DefectRecord(models.Model):
 
     def __str__(self):
         return f'Брак #{self.id} — {self.product} ({self.get_status_display()})'
+
+    def recompute_remaining_pcs(self) -> None:
+        """Остаток = original − sold − written_off − sent_to_rework (все ≥ 0)."""
+        from decimal import Decimal
+
+        o = Decimal(str(self.original_quantity_pcs or 0))
+        sold = Decimal(str(self.sold_quantity_pcs or 0))
+        woff = Decimal(str(self.written_off_quantity_pcs or 0))
+        sent = Decimal(str(self.sent_to_rework_quantity_pcs or 0))
+        rem = (o - sold - woff - sent).quantize(Decimal('0.0001'))
+        self.quantity_pcs = rem if rem > 0 else Decimal('0')
+
+    def apply_terminal_status_from_counters(self) -> None:
+        """Если остаток исчерпан — финальный статус: один канал → sold/written_off/sent_to_rework; смешанно → closed."""
+        from decimal import Decimal
+
+        eps = Decimal('0.0001')
+        if self.quantity_pcs > eps:
+            return
+        o = Decimal(str(self.original_quantity_pcs or 0))
+        if o <= 0:
+            return
+        sold = Decimal(str(self.sold_quantity_pcs or 0))
+        woff = Decimal(str(self.written_off_quantity_pcs or 0))
+        sent = Decimal(str(self.sent_to_rework_quantity_pcs or 0))
+        n_s = 1 if sold > eps else 0
+        n_w = 1 if woff > eps else 0
+        n_r = 1 if sent > eps else 0
+        channels = n_s + n_w + n_r
+        if channels >= 2:
+            self.status = self.STATUS_CLOSED
+        elif sold >= o - eps:
+            self.status = self.STATUS_SOLD
+        elif woff >= o - eps:
+            self.status = self.STATUS_WRITTEN_OFF
+        elif sent >= o - eps:
+            self.status = self.STATUS_SENT_TO_REWORK
+        else:
+            self.status = self.STATUS_CLOSED
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,6 +791,10 @@ class ReworkRequest(models.Model):
         verbose_name='Исходная продажа',
     )
     product = models.CharField('Продукт', max_length=255, blank=True, default='')
+    quantity_pcs = models.DecimalField(
+        'Количество шт (вход с брака)',
+        max_digits=14, decimal_places=4, null=True, blank=True,
+    )
     quantity_kg = models.DecimalField('Масса входа кг (сырьё)', max_digits=14, decimal_places=4, default=0)
     output_quantity_kg = models.DecimalField(
         'Масса выхода кг (ГП)', max_digits=14, decimal_places=4, null=True, blank=True,
@@ -783,8 +840,15 @@ class ReworkRequest(models.Model):
         from decimal import Decimal
         if self.loss_kg is not None:
             return self.loss_kg
-        if self.quantity_kg and self.output_quantity_kg is not None:
-            return max(Decimal('0'), Decimal(str(self.quantity_kg)) - Decimal(str(self.output_quantity_kg)))
+        if self.output_quantity_kg is None:
+            return None
+        out = Decimal(str(self.output_quantity_kg))
+        if self.quantity_pcs is not None and Decimal(str(self.quantity_pcs)) > 0:
+            inp = Decimal(str(self.quantity_pcs))
+            return max(Decimal('0'), inp - out)
+        if self.quantity_kg and Decimal(str(self.quantity_kg)) > 0:
+            inp = Decimal(str(self.quantity_kg))
+            return max(Decimal('0'), inp - out)
         return None
 
     @property

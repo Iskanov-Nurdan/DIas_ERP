@@ -761,19 +761,60 @@
 
 ### Поля `DefectRecordSerializer`
 
-Включая `source_label` (read-only), `profile_name` (read-only), `created_by_name` (read-only). Числа `quantity_pcs`, `quantity_kg`, `kg_coefficient` в ответе — строки.
+Включая `source_label` (read-only), `profile_name` (read-only), `created_by_name` (read-only). Числовые поля в ответе — строки через `api_decimal_str`.
 
-**`writeoff_reason`:** обязателен при переходе в `written_off` (см. `validate`).
+**Учёт остатка (ERP):**
+
+| Поле | Смысл |
+|------|--------|
+| **`original_quantity_pcs`** | Исходно принято шт (база; read-only в API) |
+| **`quantity_pcs`** | **Остаток** шт, доступный к продаже / списанию / переделке |
+| **`sold_quantity_pcs`** | Накопительно продано шт |
+| **`written_off_quantity_pcs`** | Накопительно списано шт |
+| **`sent_to_rework_quantity_pcs`** | Накопительно отправлено в переделку шт |
+| **`available_quantity_pcs`** | Read-only, дублирует остаток (`quantity_pcs`) для UI |
+| **`display_quantity_label`** | Read-only, например `3 шт` или `1.5 кг` по остатку |
+| `quantity_kg`, `kg_coefficient` | Кг по строке брака (при частичных операциях кг может уменьшаться пропорционально шт) |
+
+Инвариант: `original_quantity_pcs ≈ quantity_pcs + sold + written_off + sent_to_rework` (пересчёт `quantity_pcs` после операций).
+
+**`writeoff_reason`:** обязателен при `PATCH` в статус `written_off` (см. `validate`). Для **`POST .../writeoff/`** причина обязательна всегда.
 
 ### GET `/api/defects/{id}/`
 
-`linked_entities.source` (для `source_type=return`), `rework_requests`, `available_status_transitions` из `DEFECT_TRANSITIONS`, `available_actions`: `send_to_rework`, **`complete_rework` всегда false** (завершение — через rework-requests), `writeoff`, `sell`.
+`linked_entities.source` (для `source_type=return`), `rework_requests`, `available_status_transitions` из `DEFECT_TRANSITIONS`, `available_actions`: `send_to_rework`, **`complete_rework` всегда false** (завершение — через rework-requests), `writeoff`, `sell`. Для **`sell` / `writeoff` / `send_to_rework`** флаги **`false`**, если остаток **`quantity_pcs`** (≈ **`available_quantity_pcs`**) ≤ 0 — по закрытой записи действия недоступны.
 
 ### POST `send-to-rework/`
 
-Создаёт `ReworkRequest` (без `return_doc`, с `defect_record`), статус брака → `sent_to_rework`. Ошибки: `REWORK_ACTIVE` (422), `INVALID_STATUS` (422).
+**Body (опционально):** `{ "quantity": "3" }` — сколько **шт** остатка отправить в переделку; если не указано — весь текущий остаток.
 
-**Ответ:** `{ "defect": ..., "rework_request": ... }`.
+Создаётся **`ReworkRequest`** с входом на указанное количество; у брака увеличивается **`sent_to_rework_quantity_pcs`**, пересчитывается **`quantity_pcs`** (остаток). Если отправлен **весь** остаток одной операцией — проверяется переход в **`sent_to_rework`**; если часть — статус брака остаётся **`on_stock`** (или **`reworked`** / **`new`** по текущему значению). В **`rework_request`** — **`quantity_pcs`** / **`quantity_kg`** по отправленной порции (кг пропорционально остатку, если было на браке).
+
+Ошибки: `REWORK_ACTIVE` (422), `INVALID_STATUS` (422), **`NO_QUANTITY`**, **`INVALID_DECIMAL`**, **`INVALID_QUANTITY`**, **`QTY_TOO_HIGH`**.
+
+**Ответ:** `{ "defect": ..., "rework_request": ... }` — объект `rework_request` в формате **`ReworkRequestSerializer`** (см. §6.2), включая `display_quantity` / `defect_*`.
+
+**Пример фрагмента `rework_request`:**
+
+```json
+{
+  "id": 1,
+  "rework_number": "RWK-2026-0001",
+  "defect_record": 1,
+  "defect_record_id": 1,
+  "defect_product_name": "60 мм белый",
+  "defect_quantity_pcs": "2",
+  "defect_quantity_kg": null,
+  "defect_reason": "трещина",
+  "defect_source_type": "warehouse",
+  "defect_source_label": "Складская партия #5",
+  "display_quantity": "2",
+  "display_quantity_label": "2 шт",
+  "quantity_pcs": "2",
+  "quantity_kg": "0",
+  "status": "pending"
+}
+```
 
 ### POST `complete-rework/` (на **DefectRecord**)
 
@@ -781,17 +822,34 @@
 
 ### POST `writeoff/`
 
-**Body:** `{ "writeoff_reason": "..." }` (обязателен непустой).
+**Body:** `{ "writeoff_reason": "...", "quantity": "2" }` — **`writeoff_reason`** обязателен; **`quantity`** опционален: если не передан — списывается **весь** остаток; иначе указанное число шт (≤ остатка).
+
+Частичное списание: растёт **`written_off_quantity_pcs`**, остаётся **`on_stock`** при ненулевом остатке. Если после операции остаток = 0: при **только** списании (весь объём ушёл списанием) — **`written_off`**; при **смешанных** каналах (продажа + списание и т.п.) — **`closed`** («Закрыт»). После каждой операции: **`recompute_remaining_pcs()`** → **`apply_terminal_status_from_counters()`** → **`save()`**.
+
+При связи **`warehouse_batch`** со строкой брака со склада списывается **`quantity`** той же партии (как при продаже со склада), чтобы остаток партии не расходился с учётом брака.
+
+**Ошибки:** `MISSING_REASON`, `INVALID_STATUS`, `INVALID_DECIMAL`, `INVALID_QUANTITY`, `QTY_TOO_HIGH`, **`WAREHOUSE_APPLY`** (422 — не удалось списать партию).
+
+**Ответ:** тело **`DefectRecordSerializer`** (обновлённая запись).
 
 ### POST `sell/`
 
-**Обязательные поля:** `client_id`, `price` (> 0), `quantity` (**строго равен** `quantity_pcs` записи брака; частичная продажа не поддерживается).
+**Обязательные поля:** `client_id`, `price` (> 0), `quantity` (> 0, **≤** текущего остатка **`quantity_pcs`**).
 
-**Ошибки:** `MISSING_CLIENT`, `MISSING_PRICE`, `MISSING_QUANTITY`, `INVALID_DECIMAL`, `INVALID_PRICE`, `INVALID_QUANTITY`, `QTY_TOO_HIGH`, `PARTIAL_NOT_SUPPORTED`, `INVALID_STATUS`.
+Частичная продажа: создаётся `Sale` + `SaleLine` на указанное количество; у брака **`sold_quantity_pcs`** увеличивается, остаток пересчитывается; статус **`on_stock`**, пока остаток > 0; при продаже **всего** исходного объёма (накопительно, один канал «продажа») — **`sold`**; при **смешанных** операциях с нулевым остатком — **`closed`**.
 
-Создаётся `Sale` (`is_defect_sale=true`, `sale_status=shipped`) + одна `SaleLine`; брак → `sold`.
+Если у брака задана **`warehouse_batch`**, в продажу подставляется та же партия и выполняется списание со склада (**`apply_warehouse_for_sale`**) в одной транзакции с обновлением счётчиков брака.
+
+**Ошибки:** `MISSING_CLIENT`, `MISSING_PRICE`, `MISSING_QUANTITY`, `INVALID_DECIMAL`, `INVALID_PRICE`, `INVALID_QUANTITY`, `QTY_TOO_HIGH`, `INVALID_STATUS`, **`WAREHOUSE_APPLY`** (422).
+
+**Пример смешанного сценария (остаток 0 → не `on_stock`):** было **`original_quantity_pcs` = 5**; **`POST .../sell/`** `quantity=2`; затем **`POST .../writeoff/`** `quantity=3`, `writeoff_reason=...` → **`quantity_pcs`** = **`"0"`**, **`available_quantity_pcs`** = **`"0"`**, **`status`** = **`closed`**, **`display_quantity_label`** = **`"0 шт"`**.
 
 **Ответ 201:** `{ "sale_id", "sale_order_number" }`.
+
+**Пример частичной продажи (остаток 5 → продали 2):**
+
+Запрос: `{ "client_id": 1, "price": "100.00", "quantity": "2" }`  
+После: `quantity_pcs` = `"3"`, `sold_quantity_pcs` = `"2"`, `status` = `on_stock`.
 
 ## Select-sources — `GET /api/defects/select-sources/`
 
@@ -804,9 +862,12 @@
 | new | Новый | on_stock, sent_to_rework, written_off |
 | on_stock | На складе брака | sent_to_rework, sold, written_off |
 | sent_to_rework | Передан на переработку | reworked, on_stock |
-| reworked | Переработан | sold, written_off |
+| reworked | Переработан | sold, written_off, sent_to_rework |
 | sold | Продан | — |
 | written_off | Списан | — |
+| closed | Закрыт | — |
+
+Финальный статус при **нулевом остатке**: только продажи → **`sold`**; только списание → **`written_off`**; только переделка (весь объём ушёл в **`sent_to_rework_quantity_pcs`**) → **`sent_to_rework`**; **два и более каналов** (например, часть продана и часть списана) → **`closed`**. Статус **`on_stock`** при **`quantity_pcs` = 0** не используется.
 
 ## `source_type`
 
@@ -842,13 +903,38 @@
 
 ### Поля `ReworkRequestSerializer`
 
-Read-only: `rework_number`, `created_at`, `updated_at`, `rework_loss_kg`, `recovered_output`, `return_doc_number`, `defect_status`, `original_sale_number`, `result_warehouse_batch_label`.
+**Модель (запись в БД):** `product`, **`quantity_pcs`** (вход шт с брака, nullable), **`quantity_kg`** (вход кг), `output_quantity_kg`, `loss_kg`, `conversion_rate`, `status`, `comment`, FK: `return_doc`, `defect_record`, `original_sale`, `result_warehouse_batch`, `created_by`.
 
-**Create:** в `create()` обязателен **`defect_record`**; номер `RWK-...` генерируется автоматически.
+**Read-only (в т.ч. для list/detail):** `rework_number`, `created_at`, `updated_at`, `rework_loss_kg`, `recovered_output`, `return_doc_number`, `defect_status`, `original_sale_number`, `result_warehouse_batch_label`, **`defect_record_id`**, **`defect_product_name`**, **`defect_quantity_pcs`**, **`defect_quantity_kg`**, **`defect_reason`**, **`defect_source_type`**, **`defect_source_label`**, **`display_quantity`**, **`display_quantity_label`**.
+
+- **`display_quantity` / `display_quantity_label`:** по сохранённой переделке — приоритет **`quantity_pcs`** > 0, иначе **`quantity_kg`** > 0 (строки и подпись вида `2 шт` или `1.5 кг`).
+- **`defect_*`:** снимок с текущей связанной записи **DefectRecord** (продукт, количества, причина, источник).
+
+**Create (`POST /api/rework-requests/`):** обязателен **`defect_record`**; номер `RWK-...` генерируется автоматически; **`quantity_pcs`** и **`quantity_kg`** сервер **всегда подставляет из брака** (как при `send-to-rework`), нельзя сохранить нули при положительном количестве на браке.
+
+### GET `/api/rework-requests/` и GET `/api/rework-requests/{id}/`
+
+Список и деталь отдают один и тот же набор полей сериализатора (включая все **`defect_*`**, **`display_*`**, **`quantity_pcs`**).
+
+**Пример элемента списка (фрагмент):**
+
+```json
+{
+  "id": 1,
+  "rework_number": "RWK-2026-0001",
+  "defect_record": 1,
+  "defect_record_id": 1,
+  "defect_product_name": "60 мм белый",
+  "defect_quantity_pcs": "2",
+  "display_quantity": "2",
+  "display_quantity_label": "2 шт",
+  "status": "pending"
+}
+```
 
 ### GET `/api/rework-requests/{id}/`
 
-`linked_entities`, `available_status_transitions` (`REWORK_TRANSITIONS`), `available_actions`: `start`, `complete`, `cancel`.
+Помимо тела сериализатора: `linked_entities`, `available_status_transitions` (`REWORK_TRANSITIONS`), `available_actions`: `start`, `complete`, `cancel`.
 
 ### POST `complete/`
 
@@ -866,10 +952,39 @@ Read-only: `rework_number`, `created_at`, `updated_at`, `rework_loss_kg`, `recov
 
 ## Select-sources — `GET /api/rework-requests/select-sources/`
 
-- `defect_records` — id записи брака.
-- `original_sales` — id продажи.
-- `returns` — id возврата.
-- `result_warehouse_batches` — id партии (good, available) для справки/legacy.
+**`defect_records`** — массив объектов (не только `label`):
+
+| Поле | Описание |
+|------|----------|
+| `id` | id **DefectRecord** |
+| `label` | Человекочитаемо: `продукт — кол-во — причина — источник` (например `60 мм белый — 2 шт — трещина — Склад`) |
+| `product_name` | Продукт |
+| `quantity_pcs` | Строка decimal или `null`, если шт нет |
+| `quantity_kg` | Строка или `null` |
+| `defect_reason` | Причина |
+| `source_type` | Код источника |
+| `source_label` | Техническая подпись источника (партия / ReturnLine / ОТК) |
+| `status` | Статус брака |
+
+**Пример элемента `defect_records`:**
+
+```json
+{
+  "id": 1,
+  "label": "60 мм белый — 2 шт — трещина — Склад",
+  "product_name": "60 мм белый",
+  "quantity_pcs": "2",
+  "quantity_kg": null,
+  "defect_reason": "трещина",
+  "source_type": "warehouse",
+  "source_label": "Складская партия #5",
+  "status": "on_stock"
+}
+```
+
+- `original_sales` — `{ id, label }` продажи.
+- `returns` — `{ id, label }` возврата.
+- `result_warehouse_batches` — `{ id, label }` партии (good, available).
 
 ## Статусы переделки
 

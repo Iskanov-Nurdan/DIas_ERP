@@ -975,24 +975,29 @@ class ReturnSerializer(serializers.ModelSerializer):
         elif line.return_target == ReturnLine.TARGET_DEFECT:
             # Создаём запись брака
             product = line.sale_line.product
+            qp = Decimal(str(line.quantity))
             DefectRecord.objects.create(
                 source_type=DefectRecord.SOURCE_RETURN,
                 source_id=line.id,
                 product=product,
-                quantity_pcs=line.quantity,
+                original_quantity_pcs=qp,
+                quantity_pcs=qp,
                 defect_reason=ret_doc.return_reason or '',
                 status=DefectRecord.STATUS_ON_STOCK,
                 comment=line.comment or '',
             )
 
         elif line.return_target == ReturnLine.TARGET_REWORK:
-            # Создаём заявку на переделку
+            # Создаём заявку на переделку (вся строка возврата сразу уходит в переделку)
             product = line.sale_line.product
+            qp = Decimal(str(line.quantity))
             defect = DefectRecord.objects.create(
                 source_type=DefectRecord.SOURCE_RETURN,
                 source_id=line.id,
                 product=product,
-                quantity_pcs=line.quantity,
+                original_quantity_pcs=qp,
+                quantity_pcs=Decimal('0'),
+                sent_to_rework_quantity_pcs=qp,
                 defect_reason=ret_doc.return_reason or '',
                 status=DefectRecord.STATUS_SENT_TO_REWORK,
                 comment=line.comment or '',
@@ -1002,6 +1007,7 @@ class ReturnSerializer(serializers.ModelSerializer):
                 defect_record=defect,
                 original_sale=ret_doc.sale,
                 product=product,
+                quantity_pcs=qp,
                 quantity_kg=Decimal('0'),
                 status=ReworkRequest.STATUS_PENDING,
                 comment=line.comment or '',
@@ -1016,18 +1022,26 @@ class DefectRecordSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
     profile_name = serializers.CharField(source='profile.name', read_only=True, allow_null=True, default='')
     source_label = serializers.SerializerMethodField()
+    available_quantity_pcs = serializers.SerializerMethodField()
+    display_quantity_label = serializers.SerializerMethodField()
 
     class Meta:
         model = DefectRecord
         fields = (
             'id', 'source_type', 'source_id', 'warehouse_batch',
             'profile', 'profile_name', 'product',
-            'quantity_pcs', 'quantity_kg', 'kg_coefficient',
+            'original_quantity_pcs', 'quantity_pcs', 'available_quantity_pcs',
+            'sold_quantity_pcs', 'written_off_quantity_pcs', 'sent_to_rework_quantity_pcs',
+            'quantity_kg', 'kg_coefficient',
             'defect_reason', 'status', 'writeoff_reason',
-            'source_label',
+            'source_label', 'display_quantity_label',
             'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
-        read_only_fields = ('created_at', 'updated_at')
+        read_only_fields = (
+            'created_at', 'updated_at',
+            'original_quantity_pcs', 'sold_quantity_pcs', 'written_off_quantity_pcs',
+            'sent_to_rework_quantity_pcs', 'available_quantity_pcs', 'display_quantity_label',
+        )
         extra_kwargs = {
             'profile': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
@@ -1072,14 +1086,35 @@ class DefectRecordSerializer(serializers.ModelSerializer):
             if rl is not None:
                 validated_data['product'] = rl.sale_line.product
                 validated_data['quantity_pcs'] = rl.quantity
+        qp = validated_data.get('quantity_pcs')
+        if qp is not None and Decimal(str(qp or 0)) > 0:
+            if not validated_data.get('original_quantity_pcs'):
+                validated_data['original_quantity_pcs'] = qp
         return super().create(validated_data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        for k in ('quantity_pcs', 'quantity_kg', 'kg_coefficient'):
+        for k in (
+            'quantity_pcs', 'quantity_kg', 'kg_coefficient',
+            'original_quantity_pcs', 'sold_quantity_pcs', 'written_off_quantity_pcs',
+            'sent_to_rework_quantity_pcs',
+        ):
             if ret.get(k) is not None:
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
         return ret
+
+    def get_available_quantity_pcs(self, obj):
+        v = Decimal(str(obj.quantity_pcs or 0))
+        return api_decimal_str(v) if v > 0 else api_decimal_str(Decimal('0'))
+
+    def get_display_quantity_label(self, obj):
+        v = Decimal(str(obj.quantity_pcs or 0))
+        if v > 0:
+            return f'{api_decimal_str(v)} шт'
+        kg = obj.quantity_kg
+        if kg is not None and Decimal(str(kg)) > 0:
+            return f'{api_decimal_str(Decimal(str(kg)))} кг'
+        return '0 шт'
 
     def get_source_label(self, obj):
         if obj.warehouse_batch_id:
@@ -1097,6 +1132,51 @@ class DefectRecordSerializer(serializers.ModelSerializer):
 # REWORK REQUEST (Переделка)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def defect_record_source_label(dr: DefectRecord) -> str:
+    if dr.warehouse_batch_id:
+        return f'Складская партия #{dr.warehouse_batch_id}'
+    if dr.source_type == DefectRecord.SOURCE_RETURN and dr.source_id:
+        rl = ReturnLine.objects.filter(pk=dr.source_id).select_related('return_doc').first()
+        if rl is not None:
+            return f'ReturnLine #{rl.pk} / Return #{rl.return_doc_id}'
+    if dr.source_type in (DefectRecord.SOURCE_OTK, DefectRecord.SOURCE_QC) and dr.source_id:
+        return f'ОТК/источник #{dr.source_id}'
+    return ''
+
+
+def rework_quantities_from_defect_record(
+    defect: DefectRecord,
+    pcs_to_send: Decimal | None = None,
+) -> dict:
+    """
+    quantity_pcs / quantity_kg для новой ReworkRequest по остатку DefectRecord.
+    pcs_to_send: если задано — не больше остатка quantity_pcs; иначе весь остаток.
+    """
+    remaining_pcs = Decimal(str(defect.quantity_pcs or 0))
+    kg_raw = defect.quantity_kg
+    kg_rem = Decimal(str(kg_raw)) if kg_raw is not None else Decimal('0')
+    if remaining_pcs > 0:
+        limit = remaining_pcs if pcs_to_send is None else min(Decimal(str(pcs_to_send)), remaining_pcs)
+        if limit <= 0:
+            raise ValueError('Количество для переделки должно быть > 0 и не больше остатка по браку')
+        kg_part = Decimal('0')
+        if kg_rem > 0 and remaining_pcs > 0:
+            kg_part = (limit / remaining_pcs * kg_rem).quantize(Decimal('0.0001'))
+        return {
+            'quantity_pcs': limit,
+            'quantity_kg': kg_part,
+        }
+    if kg_rem > 0:
+        limit_kg = kg_rem if pcs_to_send is None else min(Decimal(str(pcs_to_send)), kg_rem)
+        if limit_kg <= 0:
+            raise ValueError('Количество для переделки должно быть > 0')
+        return {
+            'quantity_pcs': None,
+            'quantity_kg': limit_kg,
+        }
+    raise ValueError('У записи брака нет положительного количества (шт или кг) для переделки')
+
+
 class ReworkRequestSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
     rework_loss_kg = serializers.SerializerMethodField()
@@ -1105,29 +1185,103 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
     defect_status = serializers.CharField(source='defect_record.status', read_only=True, default='')
     original_sale_number = serializers.CharField(source='original_sale.order_number', read_only=True, default='')
     result_warehouse_batch_label = serializers.SerializerMethodField()
+    defect_record_id = serializers.IntegerField(read_only=True, allow_null=True)
+    defect_product_name = serializers.SerializerMethodField()
+    defect_quantity_pcs = serializers.SerializerMethodField()
+    defect_quantity_kg = serializers.SerializerMethodField()
+    defect_reason = serializers.SerializerMethodField()
+    defect_source_type = serializers.SerializerMethodField()
+    defect_source_label = serializers.SerializerMethodField()
+    display_quantity = serializers.SerializerMethodField()
+    display_quantity_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ReworkRequest
         fields = (
-            'id', 'rework_number', 'return_doc', 'defect_record', 'original_sale',
+            'id', 'rework_number', 'return_doc', 'defect_record', 'defect_record_id', 'original_sale',
             'return_doc_number', 'defect_status', 'original_sale_number',
-            'product', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
+            'defect_product_name', 'defect_quantity_pcs', 'defect_quantity_kg',
+            'defect_reason', 'defect_source_type', 'defect_source_label',
+            'display_quantity', 'display_quantity_label',
+            'product', 'quantity_pcs', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
             'status', 'result_warehouse_batch',
             'result_warehouse_batch_label',
             'rework_loss_kg', 'recovered_output',
             'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
-        read_only_fields = ('rework_number', 'created_at', 'updated_at', 'rework_loss_kg', 'recovered_output')
+        read_only_fields = (
+            'rework_number', 'created_at', 'updated_at', 'rework_loss_kg', 'recovered_output',
+            'defect_record_id', 'defect_product_name', 'defect_quantity_pcs', 'defect_quantity_kg',
+            'defect_reason', 'defect_source_type', 'defect_source_label',
+            'display_quantity', 'display_quantity_label',
+        )
         extra_kwargs = {
             'return_doc': {'required': False, 'allow_null': True},
             'defect_record': {'required': False, 'allow_null': True},
             'original_sale': {'required': False, 'allow_null': True},
             'result_warehouse_batch': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
+            'quantity_pcs': {'required': False, 'allow_null': True},
             'output_quantity_kg': {'required': False, 'allow_null': True},
             'loss_kg': {'required': False, 'allow_null': True},
             'conversion_rate': {'required': False, 'allow_null': True},
         }
+
+    def get_defect_product_name(self, obj):
+        if obj.defect_record_id:
+            return (obj.defect_record.product or '').strip()
+        return ''
+
+    def _defect_qty_pcs_str(self, obj):
+        if not obj.defect_record_id:
+            return None
+        v = obj.defect_record.quantity_pcs
+        if v is None or Decimal(str(v)) == 0:
+            return None
+        return api_decimal_str(Decimal(str(v)))
+
+    def _defect_qty_kg_str(self, obj):
+        if not obj.defect_record_id:
+            return None
+        v = obj.defect_record.quantity_kg
+        if v is None or Decimal(str(v)) == 0:
+            return None
+        return api_decimal_str(Decimal(str(v)))
+
+    def get_defect_quantity_pcs(self, obj):
+        return self._defect_qty_pcs_str(obj)
+
+    def get_defect_quantity_kg(self, obj):
+        return self._defect_qty_kg_str(obj)
+
+    def get_defect_reason(self, obj):
+        if obj.defect_record_id:
+            return (obj.defect_record.defect_reason or '').strip()
+        return ''
+
+    def get_defect_source_type(self, obj):
+        if obj.defect_record_id:
+            return obj.defect_record.source_type
+        return ''
+
+    def get_defect_source_label(self, obj):
+        if obj.defect_record_id:
+            return defect_record_source_label(obj.defect_record)
+        return ''
+
+    def get_display_quantity(self, obj):
+        if obj.quantity_pcs is not None and Decimal(str(obj.quantity_pcs)) > 0:
+            return api_decimal_str(Decimal(str(obj.quantity_pcs)))
+        if obj.quantity_kg is not None and Decimal(str(obj.quantity_kg)) > 0:
+            return api_decimal_str(Decimal(str(obj.quantity_kg)))
+        return None
+
+    def get_display_quantity_label(self, obj):
+        if obj.quantity_pcs is not None and Decimal(str(obj.quantity_pcs)) > 0:
+            return f'{api_decimal_str(Decimal(str(obj.quantity_pcs)))} шт'
+        if obj.quantity_kg is not None and Decimal(str(obj.quantity_kg)) > 0:
+            return f'{api_decimal_str(Decimal(str(obj.quantity_kg)))} кг'
+        return None
 
     def get_rework_loss_kg(self, obj):
         v = obj.rework_loss_kg
@@ -1146,15 +1300,15 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         if validated_data.get('defect_record') is None:
             raise serializers.ValidationError({'defect_record': 'Поле defect_record обязательно'})
+        defect = validated_data['defect_record']
         if not (validated_data.get('product') or '').strip():
-            defect = validated_data.get('defect_record')
-            if defect is not None:
-                validated_data['product'] = defect.product
-                if (
-                    (validated_data.get('quantity_kg') in (None, Decimal('0')))
-                    and defect.quantity_kg is not None
-                ):
-                    validated_data['quantity_kg'] = defect.quantity_kg
+            validated_data['product'] = defect.product
+        try:
+            qmap = rework_quantities_from_defect_record(defect)
+        except ValueError as e:
+            raise serializers.ValidationError({'defect_record': str(e)})
+        validated_data['quantity_pcs'] = qmap['quantity_pcs']
+        validated_data['quantity_kg'] = qmap['quantity_kg']
         year = timezone.now().date().year
         last = ReworkRequest.objects.filter(rework_number__startswith=f'RWK-{year}-').order_by('-rework_number').first()
         try:
@@ -1166,7 +1320,7 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        for k in ('quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate'):
+        for k in ('quantity_pcs', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate'):
             if ret.get(k) is not None:
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
         return ret

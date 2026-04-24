@@ -213,9 +213,10 @@ DEFECT_TRANSITIONS: dict[str, list[str]] = {
     'new':            ['on_stock', 'sent_to_rework', 'written_off'],
     'on_stock':       ['sent_to_rework', 'sold', 'written_off'],
     'sent_to_rework': ['reworked', 'on_stock'],
-    'reworked':       ['sold', 'written_off'],
+    'reworked':       ['sold', 'written_off', 'sent_to_rework'],
     'sold':           [],
     'written_off':    [],
+    'closed':         [],
 }
 
 
@@ -229,12 +230,26 @@ def validate_defect_transition(current: str, new: str) -> None:
 
 
 def validate_defect_sell(defect_record) -> None:
-    allowed_statuses = ('on_stock', 'reworked')
+    allowed_statuses = ('new', 'on_stock', 'reworked')
     if defect_record.status not in allowed_statuses:
         raise ValueError(
             f'Нельзя продать брак из статуса «{defect_record.get_status_display()}». '
             f'Допустимо только из: {allowed_statuses}'
         )
+
+
+def validate_defect_writeoff_qty(defect_record) -> None:
+    """Частичное или полное списание: нужен положительный остаток quantity_pcs."""
+    from decimal import Decimal
+
+    allowed_statuses = ('new', 'on_stock', 'reworked')
+    if defect_record.status not in allowed_statuses:
+        raise ValueError(
+            f'Нельзя списать брак из статуса «{defect_record.get_status_display()}». '
+            f'Допустимо из: {allowed_statuses}'
+        )
+    if Decimal(str(defect_record.quantity_pcs or 0)) <= 0:
+        raise ValueError('Нет остатка шт для списания по этой записи брака.')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
