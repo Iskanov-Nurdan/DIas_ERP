@@ -2,6 +2,7 @@ import logging
 from decimal import Decimal
 from html import escape
 
+from django.db import transaction
 from django.db.models import Count, DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
@@ -87,22 +88,14 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         )
 
     def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        sales_count = instance.sales.count()
-        if sales_count:
-            return Response(
-                {
-                    'code': 'CLIENT_IN_USE',
-                    'error': 'Нельзя удалить клиента: есть связанные продажи.',
-                    'detail': (
-                        'Сначала удалите или переназначьте продажи, привязанные к этому клиенту '
-                        '(или оставьте клиента в справочнике для истории).'
-                    ),
-                    'sales_count': sales_count,
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
-        return super().destroy(request, *args, **kwargs)
+        return Response(
+            {
+                'code': 'DELETE_DISABLED',
+                'error': 'Физическое удаление клиентов отключено. Используйте is_active=false.',
+                'detail': 'Патч клиента: {"is_active": false}.',
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     @action(detail=True, methods=['get'], url_path='history')
     def history(self, request, pk=None):
@@ -119,7 +112,7 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         orders = Order.objects.filter(client=client).prefetch_related('lines', 'payments').order_by('-date')
         sales = Sale.objects.filter(client=client).order_by('-date')
-        payments = Payment.objects.filter(client=client).order_by('-date')
+        payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE).order_by('-date')
         returns = Return.objects.filter(sale__client=client).order_by('-date')
 
         # Денежная аналитика
@@ -314,12 +307,21 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         order = self.get_object()
         return _order_html_response(order)
 
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {
+                'code': 'DELETE_DISABLED',
+                'error': 'Физическое удаление заявок отключено. Используйте /api/orders/{id}/cancel/.',
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
     @action(detail=True, methods=['get'], url_path='history')
     def order_history(self, request, pk=None):
         """Трассировка: заявка → продажи → возвраты → переделки."""
         order = self.get_object()
         sales = Sale.objects.filter(linked_order=order).prefetch_related('sale_lines')
-        payments = Payment.objects.filter(linked_order=order)
+        payments = Payment.objects.filter(linked_order=order, status=Payment.STATUS_ACTIVE)
         returns = Return.objects.filter(linked_order=order).prefetch_related('lines')
         return Response({
             'order': OrderSerializer(order).data,
@@ -489,7 +491,7 @@ def _order_html_response(order: Order) -> HttpResponse:
     parts.append('<p><em>Сформировано автоматически.</em></p></body></html>')
     html = ''.join(parts)
     resp = HttpResponse(html, content_type='text/html; charset=utf-8')
-    resp['Content-Disposition'] = f'inline; filename="order-{order.id}.html"'
+    resp['Content-Disposition'] = f'inline; filename="order-waybill-{order.id}.html"'
     return resp
 
 
@@ -552,13 +554,11 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 )
         super().perform_update(serializer)
 
-    def perform_destroy(self, instance):
-        """Shipment.sale — PROTECT; иначе DELETE продажи даёт 500."""
-        from django.db import transaction
-
-        with transaction.atomic():
-            Shipment.objects.filter(sale_id=instance.pk).delete()
-            super().perform_destroy(instance)
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'code': 'DELETE_DISABLED', 'error': 'Удаление продажи отключено. Используйте /api/sales/{id}/cancel/.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -696,7 +696,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 parts.append(f'<p><strong>Итого:</strong> {line_sum}</p>')
 
         # Оплата / остаток
-        payments = list(sale.payments.all())
+        payments = list(sale.payments.filter(status=Payment.STATUS_ACTIVE).all())
         if payments:
             paid = sum(
                 (p.amount or Decimal('0')) for p in payments
@@ -718,12 +718,37 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         parts.append('<p><em>Сформировано автоматически.</em></p></body></html>')
         html = ''.join(parts)
         resp = HttpResponse(html, content_type='text/html; charset=utf-8')
-        resp['Content-Disposition'] = f'inline; filename="nakladnaya-{sale.id}.html"'
+        resp['Content-Disposition'] = f'inline; filename="sale-waybill-{sale.id}.html"'
         return resp
 
     def _serve_nakladnaya(self, request, *args, **kwargs):
         sale = self.get_object()
         return SaleViewSet._nakladnaya_html_response(sale)
+
+    @action(detail=True, methods=['post', 'patch'], url_path='cancel')
+    def cancel_sale(self, request, pk=None):
+        """Отмена продажи: откат склада, восстановление резервов, статус canceled."""
+        from .state_machine import validate_sale_transition
+        from .sale_warehouse import reverse_warehouse_for_sale
+        from .reservations import restore_reservations_for_sale
+
+        sale = self.get_object()
+        if sale.sale_status == Sale.STATUS_CANCELED:
+            return _err('ALREADY_CANCELED', 'Продажа уже отменена', http_status=422)
+        if Return.objects.filter(sale=sale).exclude(status=Return.STATUS_CANCELED).exists():
+            return _err('HAS_RETURNS', 'Нельзя отменить продажу: есть возвраты. Обработайте возвраты вручную.', http_status=409)
+        if Payment.objects.filter(linked_sale=sale, status=Payment.STATUS_ACTIVE).exists():
+            return _err('HAS_PAYMENTS', 'Нельзя отменить продажу: есть оплаты. Сначала отмените/скорректируйте оплаты.', http_status=409)
+        try:
+            validate_sale_transition(sale.sale_status, Sale.STATUS_CANCELED)
+        except ValueError as e:
+            return _err('INVALID_TRANSITION', str(e), http_status=422)
+        with transaction.atomic():
+            reverse_warehouse_for_sale(sale)
+            restore_reservations_for_sale(sale, user=request.user, request=request)
+            sale.sale_status = Sale.STATUS_CANCELED
+            sale.save(update_fields=['sale_status', 'updated_at'])
+        return Response(SaleSerializer(sale, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='waybill')
     def waybill(self, request, pk=None):
@@ -762,7 +787,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         except ValueError as e:
             return _err('INVALID_STATUS_TRANSITION', str(e), http_status=422)
 
-        shipping_statuses = (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED)
+        shipping_statuses = (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED, Sale.STATUS_PARTIALLY_SHIPPED)
         if new_status in shipping_statuses:
             # Stock / reservation check
             try:
@@ -773,6 +798,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             # Hard credit limit check
             if sale.client_id:
                 force_override = str(request.data.get('force_credit_override', '')).lower() in ('1', 'true', 'yes')
+                if force_override:
+                    sale.credit_limit_bypassed = True
+                    sale.save(update_fields=['credit_limit_bypassed'])
                 try:
                     enforce_credit_limit(
                         sale.client,
@@ -785,13 +813,35 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         sale.sale_status = new_status
         sale.save(update_fields=['sale_status', 'updated_at'])
+        sale.refresh_from_db()
+        from .sale_warehouse import apply_warehouse_for_sale
+        from .reservations import auto_fulfill_for_sale
+        try:
+            apply_warehouse_for_sale(sale)
+        except (ValueError, Exception) as e:
+            from rest_framework.exceptions import ValidationError as DrfV
+            if isinstance(e, DrfV):
+                return _err('WAREHOUSE_APPLY', str(e.detail), http_status=422)
+            return _err('WAREHOUSE_APPLY', str(e), http_status=422)
+        if sale.linked_order_id and sale.warehouse_batch_id and new_status in shipping_statuses:
+            sl = sale.sale_lines.order_by('id').first()
+            if sl is not None:
+                auto_fulfill_for_sale(
+                    sale=sale,
+                    order=sale.linked_order,
+                    warehouse_batch_id=sale.warehouse_batch_id,
+                    quantity=Decimal(str(sale.quantity)),
+                    user=request.user if request.user.is_authenticated else None,
+                    request=request,
+                    sale_line=sl,
+                )
         return Response(SaleSerializer(sale, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='receipt')
     def receipt(self, request, pk=None):
         """HTML-квитанция об оплате."""
         sale = self.get_object()
-        payments = list(sale.payments.all())
+        payments = list(sale.payments.filter(status=Payment.STATUS_ACTIVE).all())
         parts = [
             '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">',
             f'<title>Квитанция {escape(sale.receipt_number or sale.order_number)}</title>',
@@ -812,7 +862,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         parts.append('<p><em>Сформировано автоматически.</em></p></body></html>')
         html = ''.join(parts)
         resp = HttpResponse(html, content_type='text/html; charset=utf-8')
-        resp['Content-Disposition'] = f'inline; filename="receipt-{sale.id}.html"'
+        resp['Content-Disposition'] = f'inline; filename="sale-receipt-{sale.id}.html"'
         return resp
 
 
@@ -829,6 +879,21 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_label = 'оплата'
     ordering_fields = ['id', 'date']
     filterset_class = PaymentFilter
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'code': 'DELETE_DISABLED', 'error': 'Удаление оплат отключено. Используйте /api/payments/{id}/cancel/.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @action(detail=True, methods=['post', 'patch'], url_path='cancel')
+    def cancel_payment(self, request, pk=None):
+        p = self.get_object()
+        if p.status == Payment.STATUS_CANCELED:
+            return _err('ALREADY_CANCELED', 'Оплата уже отменена', http_status=422)
+        p.status = Payment.STATUS_CANCELED
+        p.save(update_fields=['status'])
+        return Response(PaymentSerializer(p).data)
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
@@ -854,7 +919,7 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         except Client.DoesNotExist:
             return _err('NOT_FOUND', 'Клиент не найден', http_status=404)
 
-        payments = Payment.objects.filter(client=client)
+        payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE)
         sales = Sale.objects.filter(client=client)
 
         total_paid = payments.filter(
@@ -894,6 +959,26 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_label = 'возврат'
     ordering_fields = ['id', 'date']
     filterset_class = ReturnFilter
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'code': 'DELETE_DISABLED', 'error': 'Удаление возвратов отключено. Используйте /api/returns/{id}/cancel/.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @action(detail=True, methods=['post', 'patch'], url_path='cancel')
+    def cancel_return(self, request, pk=None):
+        from .return_rollback import rollback_return_document
+
+        ret_doc = self.get_object()
+        if ret_doc.status == Return.STATUS_CANCELED:
+            return _err('ALREADY_CANCELED', 'Возврат уже отменён', http_status=422)
+        with transaction.atomic():
+            if ret_doc.status == Return.STATUS_COMPLETED:
+                rollback_return_document(ret_doc)
+            ret_doc.status = Return.STATUS_CANCELED
+            ret_doc.save(update_fields=['status'])
+        return Response(ReturnSerializer(ret_doc, context={'request': request}).data)
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
@@ -1034,7 +1119,7 @@ def _return_html_response(ret_doc: Return) -> HttpResponse:
     parts.append('<p><em>Сформировано автоматически.</em></p></body></html>')
     html = ''.join(parts)
     resp = HttpResponse(html, content_type='text/html; charset=utf-8')
-    resp['Content-Disposition'] = f'inline; filename="return-{ret_doc.id}.html"'
+    resp['Content-Disposition'] = f'inline; filename="return-waybill-{ret_doc.id}.html"'
     return resp
 
 
@@ -1051,6 +1136,12 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_label = 'запись брака'
     ordering_fields = ['id', 'created_at', 'status']
     filterset_class = DefectFilter
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'code': 'DELETE_DISABLED', 'error': 'Удаление записей брака отключено (используйте writeoff / cancel сценарии).'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
@@ -1111,10 +1202,17 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='select-sources')
     def select_sources(self, request):
+        from apps.warehouse.models import WarehouseBatch
+
         lines = (
             ReturnLine.objects.select_related('return_doc')
             .order_by('-id')
             .values('id', 'product', 'quantity', 'return_doc_id')[:300]
+        )
+        wh_def = list(
+            WarehouseBatch.objects.filter(quality=WarehouseBatch.QUALITY_DEFECT)
+            .order_by('-date', '-id')
+            .values('id', 'product', 'quantity')[:200]
         )
         return Response({
             'return_lines': [
@@ -1124,20 +1222,54 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 }
                 for rl in lines
             ],
+            'warehouse_defect_batches': [
+                {'id': b['id'], 'label': f"#{b['id']} {b['product']} × {b['quantity']}"}
+                for b in wh_def
+            ],
         })
 
     @action(detail=True, methods=['post'], url_path='send-to-rework')
     def send_to_rework(self, request, pk=None):
-        """Передать брак на переработку."""
+        """Создать ReworkRequest и перевести брак в sent_to_rework."""
+        from django.utils import timezone as tz
+
         from .state_machine import validate_defect_transition
+
         record = self.get_object()
+        if ReworkRequest.objects.filter(
+            defect_record=record,
+            status__in=(ReworkRequest.STATUS_PENDING, ReworkRequest.STATUS_IN_PROGRESS),
+        ).exists():
+            return _err('REWORK_ACTIVE', 'По этому браку уже есть активная переделка', http_status=422)
         try:
             validate_defect_transition(record.status, DefectRecord.STATUS_SENT_TO_REWORK)
         except ValueError as e:
             return _err('INVALID_STATUS', str(e), http_status=422)
-        record.status = DefectRecord.STATUS_SENT_TO_REWORK
-        record.save(update_fields=['status', 'updated_at'])
-        return Response(DefectRecordSerializer(record).data)
+        year = tz.now().date().year
+        last = ReworkRequest.objects.filter(rework_number__startswith=f'RWK-{year}-').order_by('-rework_number').first()
+        try:
+            last_n = int(last.rework_number.split('-')[-1]) if last else 0
+        except (ValueError, IndexError):
+            last_n = 0
+        rw_n = f'RWK-{year}-{last_n + 1:04d}'
+        user = request.user if request.user.is_authenticated else None
+        with transaction.atomic():
+            rw = ReworkRequest.objects.create(
+                return_doc=None,
+                defect_record=record,
+                original_sale=None,
+                product=record.product,
+                quantity_kg=record.quantity_kg or Decimal('0'),
+                status=ReworkRequest.STATUS_PENDING,
+                rework_number=rw_n,
+                created_by=user,
+            )
+            record.status = DefectRecord.STATUS_SENT_TO_REWORK
+            record.save(update_fields=['status', 'updated_at'])
+        return Response({
+            'defect': DefectRecordSerializer(record).data,
+            'rework_request': ReworkRequestSerializer(rw).data,
+        })
 
     @action(detail=True, methods=['post'], url_path='complete-rework')
     def complete_rework(self, request, pk=None):
@@ -1222,7 +1354,7 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
 class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = ReworkRequest.objects.select_related(
-        'return_doc', 'defect_record', 'original_sale', 'result_warehouse_batch', 'created_by',
+        'return_doc', 'defect_record', 'defect_record__warehouse_batch', 'original_sale', 'result_warehouse_batch', 'created_by',
     ).all()
     serializer_class = ReworkRequestSerializer
     permission_classes = [IsAdminOrHasAccess]
@@ -1231,6 +1363,12 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     activity_label = 'переделка'
     ordering_fields = ['id', 'created_at', 'status']
     filterset_fields = ['status', 'original_sale']
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'code': 'DELETE_DISABLED', 'error': 'Удаление переделок отключено. Используйте cancel/complete.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
@@ -1288,7 +1426,10 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from apps.warehouse.models import WarehouseBatch
 
         defects = list(
-            DefectRecord.objects.order_by('-created_at', '-id')
+            DefectRecord.objects.filter(
+                status__in=(DefectRecord.STATUS_ON_STOCK, DefectRecord.STATUS_NEW),
+            )
+            .order_by('-created_at', '-id')
             .values('id', 'product', 'status')[:300]
         )
         sales = list(
@@ -1340,68 +1481,76 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='complete')
     def complete(self, request, pk=None):
         """
-        Завершить переделку — указать результирующую партию ГП,
-        фактический выход (output_quantity_kg) и потери (loss_kg).
+        Завершить переделку: создать новую партию ГП (good или defect) по output_quantity / loss_quantity.
+        result_warehouse_batch_id опционален (legacy); при отсутствии — партия создаётся в backend.
         """
-        from .state_machine import validate_rework_complete
-        from django.db import transaction as db_transaction
-
-        rework = self.get_object()
-        wb_id = request.data.get('result_warehouse_batch_id')
-        if not wb_id:
-            return _err('MISSING_BATCH', 'Укажите result_warehouse_batch_id')
+        from django.utils import timezone as tz
 
         from apps.warehouse.models import WarehouseBatch
-        try:
-            wb = WarehouseBatch.objects.get(pk=wb_id)
-        except WarehouseBatch.DoesNotExist:
-            return _err('NOT_FOUND', 'Партия склада не найдена', http_status=404)
+        from .state_machine import validate_rework_complete
+        from django.db import transaction as db_transaction
+        from apps.realtime.broadcast import schedule_push
 
+        rework = self.get_object()
         try:
             validate_rework_complete(rework)
         except ValueError as e:
             return _err('INVALID_STATUS', str(e), http_status=422)
 
-        update_fields = ['status', 'result_warehouse_batch', 'updated_at']
+        out_raw = request.data.get('output_quantity', request.data.get('output_quantity_kg'))
+        loss_raw = request.data.get('loss_quantity', request.data.get('loss_kg'))
+        out_quality = (request.data.get('quality') or WarehouseBatch.QUALITY_GOOD).strip()
+        if out_raw is None or loss_raw is None:
+            return _err('MISSING_FIELDS', 'Укажите output_quantity (или output_quantity_kg) и loss_quantity (или loss_kg)')
+        output_pcs = Decimal(str(out_raw))
+        loss_pcs = Decimal(str(loss_raw))
+        if out_quality not in (WarehouseBatch.QUALITY_GOOD, WarehouseBatch.QUALITY_DEFECT):
+            return _err('INVALID_QUALITY', 'quality: good | defect', http_status=422)
+        defect = rework.defect_record
+        if defect is None:
+            return _err('NO_DEFECT', 'Нет defect_record', http_status=422)
+        input_pcs = Decimal(str(defect.quantity_pcs or 0))
+        if input_pcs and output_pcs + loss_pcs > input_pcs + Decimal('0.0001'):
+            return _err('QTY_BOUNDS', f'output+loss не должно превышать вход ({input_pcs})', http_status=422)
 
-        output_kg_raw = request.data.get('output_quantity_kg')
-        loss_kg_raw = request.data.get('loss_kg')
-
-        if output_kg_raw is not None:
-            rework.output_quantity_kg = Decimal(str(output_kg_raw))
-            update_fields.append('output_quantity_kg')
-        if loss_kg_raw is not None:
-            rework.loss_kg = Decimal(str(loss_kg_raw))
-            update_fields.append('loss_kg')
-        elif rework.quantity_kg and rework.output_quantity_kg is not None:
-            rework.loss_kg = max(
-                Decimal('0'),
-                Decimal(str(rework.quantity_kg)) - Decimal(str(rework.output_quantity_kg)),
+        tpl = getattr(defect, 'warehouse_batch', None)
+        with transaction.atomic():
+            wb = WarehouseBatch.objects.create(
+                profile_id=defect.profile_id,
+                product=defect.product,
+                length_per_piece=tpl.length_per_piece if tpl else None,
+                quantity=output_pcs,
+                cost_per_piece=tpl.cost_per_piece if tpl else Decimal('0'),
+                cost_per_meter=tpl.cost_per_meter if tpl else Decimal('0'),
+                date=tz.now().date(),
+                source_batch_id=tpl.source_batch_id if tpl else None,
+                inventory_form=tpl.inventory_form if tpl else WarehouseBatch.INVENTORY_UNPACKED,
+                quality=out_quality,
+                defect_reason=(defect.defect_reason or '')[:2000] if out_quality == WarehouseBatch.QUALITY_DEFECT else '',
             )
-            update_fields.append('loss_kg')
+            if loss_pcs and loss_pcs > 0 and tpl:
+                pass
+            rework.output_quantity_kg = output_pcs
+            rework.loss_kg = loss_pcs
+            if rework.quantity_kg and rework.output_quantity_kg is not None:
+                input_d = Decimal(str(rework.quantity_kg))
+                if input_d > 0:
+                    rework.conversion_rate = (Decimal(str(rework.output_quantity_kg)) / input_d).quantize(
+                        Decimal('0.000001')
+                    )
+            rework.status = ReworkRequest.STATUS_COMPLETED
+            rework.result_warehouse_batch = wb
+            rework.save()
+            if rework.defect_record_id:
+                DefectRecord.objects.filter(pk=rework.defect_record_id).update(
+                    status=DefectRecord.STATUS_REWORKED,
+                )
 
-        if rework.quantity_kg and rework.output_quantity_kg is not None:
-            input_d = Decimal(str(rework.quantity_kg))
-            if input_d > 0:
-                rework.conversion_rate = (
-                    Decimal(str(rework.output_quantity_kg)) / input_d
-                ).quantize(Decimal('0.000001'))
-                update_fields.append('conversion_rate')
-
-        rework.status = ReworkRequest.STATUS_COMPLETED
-        rework.result_warehouse_batch = wb
-        rework.save(update_fields=list(set(update_fields)))
-
-        # Обновить статус брака
-        if rework.defect_record_id:
-            DefectRecord.objects.filter(pk=rework.defect_record_id).update(status=DefectRecord.STATUS_REWORKED)
-
-        from apps.realtime.broadcast import schedule_push
         db_transaction.on_commit(lambda: schedule_push(
             resource='rework_request',
             action='updated',
             entity_id=rework.pk,
-            extra={'status': rework.status},
+            extra={'status': ReworkRequest.STATUS_COMPLETED},
         ))
         rework.refresh_from_db()
         return Response(ReworkRequestSerializer(rework).data)
@@ -1415,8 +1564,13 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             validate_rework_transition(rework.status, ReworkRequest.STATUS_CANCELED)
         except ValueError as e:
             return _err('INVALID_STATUS', str(e), http_status=422)
-        rework.status = ReworkRequest.STATUS_CANCELED
-        rework.save(update_fields=['status', 'updated_at'])
+        with transaction.atomic():
+            rework.status = ReworkRequest.STATUS_CANCELED
+            rework.save(update_fields=['status', 'updated_at'])
+            if rework.defect_record_id and rework.defect_record.status == DefectRecord.STATUS_SENT_TO_REWORK:
+                DefectRecord.objects.filter(pk=rework.defect_record_id).update(
+                    status=DefectRecord.STATUS_ON_STOCK,
+                )
         return Response(ReworkRequestSerializer(rework).data)
 
 
@@ -1525,7 +1679,7 @@ class ClientFinancialSummaryView(viewsets.ViewSet):
             return _err('NOT_FOUND', 'Клиент не найден', http_status=404)
 
         sales = Sale.objects.filter(client=client).exclude(sale_status=Sale.STATUS_CANCELED)
-        payments = Payment.objects.filter(client=client)
+        payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE)
 
         total_revenue = sales.aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t'] or Decimal('0')
         total_cost = (

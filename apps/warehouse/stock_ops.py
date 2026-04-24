@@ -336,3 +336,16 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
             return
 
         raise drf_serializers.ValidationError({'piece_pick': 'Неизвестное значение'})
+
+
+def reverse_apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal) -> None:
+    """
+    Упрощённый откат списания: увеличить quantity на партии, при необходимости вернуть статус available.
+    Не восстанавливает сложные разбиения packed/open_package; для production может потребоваться доработка.
+    """
+    with transaction.atomic():
+        b = WarehouseBatch.objects.select_for_update().get(pk=batch_id)
+        b.quantity = q4(Decimal(str(b.quantity)) + Decimal(str(quantity)))
+        if b.status == WarehouseBatch.STATUS_SHIPPED and b.quantity > 0:
+            b.status = WarehouseBatch.STATUS_AVAILABLE
+        b.save(update_fields=['quantity', 'status'])

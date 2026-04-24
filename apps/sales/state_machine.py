@@ -207,9 +207,6 @@ def validate_rework_transition(current: str, new: str) -> None:
 
 
 def validate_rework_complete(rework_request) -> None:
-    """
-    Завершить переделку можно только если указана результирующая партия ГП.
-    """
     if rework_request.status != 'in_progress':
         raise ValueError(
             'Завершить переделку можно только из статуса «В работе». '

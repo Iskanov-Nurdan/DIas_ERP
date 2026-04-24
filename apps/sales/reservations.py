@@ -263,6 +263,7 @@ def auto_fulfill_for_sale(
     quantity: Decimal,
     user=None,
     request=None,
+    sale_line=None,
 ) -> int:
     """
     При создании продажи (Sale) автоматически исполнить активные резервы
@@ -272,6 +273,17 @@ def auto_fulfill_for_sale(
 
     Возвращает количество обновлённых резервов.
     """
+    if sale_line is None:
+        sale_line = (
+            sale.sale_lines.filter(warehouse_batch_id=warehouse_batch_id)
+            .order_by('id')
+            .first()
+        )
+        if sale_line is None:
+            sale_line = sale.sale_lines.order_by('id').first()
+    if sale_line is None:
+        return 0
+
     fulfilled_count = 0
     remaining = Decimal(str(quantity))
 
@@ -293,7 +305,13 @@ def auto_fulfill_for_sale(
                 break
             res_qty = Decimal(str(res.quantity))
             take = min(res_qty, remaining)
-            fulfill_reservation(res, fulfilled_quantity=take, sale_line=sale, user=user, request=request)
+            fulfill_reservation(
+                res,
+                fulfilled_quantity=take,
+                sale_line=sale_line,
+                user=user,
+                request=request,
+            )
             remaining -= take
             fulfilled_count += 1
 
@@ -324,9 +342,13 @@ def restore_reservations_for_sale(
     """
     restored_count = 0
     with transaction.atomic():
+        line_ids = list(sale.sale_lines.values_list('id', flat=True))
         fulfilled = (
             OrderReservation.objects.select_for_update()
-            .filter(sale_line=sale, status=OrderReservation.STATUS_FULFILLED)
+            .filter(
+                sale_line_id__in=line_ids,
+                status=OrderReservation.STATUS_FULFILLED,
+            )
         )
         for res in fulfilled:
             fq = Decimal(str(res.fulfilled_quantity or res.quantity))

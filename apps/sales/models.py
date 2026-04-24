@@ -311,6 +311,12 @@ class Sale(models.Model):
         default='',
     )
     is_defect_sale = models.BooleanField('Продажа брака', default=False, db_index=True)
+    warehouse_stock_applied = models.BooleanField(
+        'Списание со склада применено', default=False, db_index=True,
+    )
+    credit_limit_bypassed = models.BooleanField(
+        'Согласован обход кредитного лимита', default=False, db_index=True,
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -319,6 +325,7 @@ class Sale(models.Model):
         verbose_name='Создал',
     )
     created_at = models.DateTimeField('Создано', auto_now_add=True, null=True, blank=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
 
     class Meta:
         db_table = 'sales'
@@ -453,6 +460,24 @@ class Payment(models.Model):
         'Способ оплаты', max_length=20, choices=METHOD_CHOICES, default=METHOD_CASH,
     )
     comment = models.TextField('Комментарий', blank=True, default='')
+    STATUS_ACTIVE = 'active'
+    STATUS_CANCELED = 'canceled'
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, 'Активна'),
+        (STATUS_CANCELED, 'Отменена'),
+    ]
+    status = models.CharField(
+        'Статус записи', max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True,
+    )
+    linked_return = models.ForeignKey(
+        'Return',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='linked_payments',
+        verbose_name='Связанный возврат (для refund)',
+    )
+    manual_refund_reason = models.TextField('Причина ручного возврата без Return', blank=True, default='')
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -480,8 +505,20 @@ class Payment(models.Model):
 class Return(models.Model):
     """Возврат товара от клиента. Всегда привязан к продаже."""
 
+    STATUS_DRAFT = 'draft'
+    STATUS_COMPLETED = 'completed'
+    STATUS_CANCELED = 'canceled'
+    RETURN_STATUS_CHOICES = [
+        (STATUS_DRAFT, 'Черновик'),
+        (STATUS_COMPLETED, 'Проведён'),
+        (STATUS_CANCELED, 'Отменён'),
+    ]
+
     return_number = models.CharField('Номер возврата', max_length=100, blank=True, default='')
     date = models.DateField('Дата')
+    status = models.CharField(
+        'Статус', max_length=20, choices=RETURN_STATUS_CHOICES, default=STATUS_COMPLETED, db_index=True,
+    )
     sale = models.ForeignKey(
         Sale, on_delete=models.PROTECT, related_name='returns', verbose_name='Продажа',
     )
@@ -571,10 +608,16 @@ class DefectRecord(models.Model):
     """Учётная единица брака. Источник — ОТК или возврат клиента."""
 
     SOURCE_OTK = 'otk'
+    SOURCE_QC = 'qc'
+    SOURCE_WAREHOUSE = 'warehouse'
     SOURCE_RETURN = 'return'
+    SOURCE_MANUAL = 'manual'
     SOURCE_CHOICES = [
         (SOURCE_OTK, 'ОТК'),
+        (SOURCE_QC, 'ОТК / контроль качества'),
+        (SOURCE_WAREHOUSE, 'Склад'),
         (SOURCE_RETURN, 'Возврат клиента'),
+        (SOURCE_MANUAL, 'Вручную'),
     ]
 
     STATUS_NEW = 'new'
@@ -595,7 +638,15 @@ class DefectRecord(models.Model):
     source_type = models.CharField(
         'Источник', max_length=20, choices=SOURCE_CHOICES, default=SOURCE_OTK,
     )
-    source_id = models.IntegerField('ID источника (otk_check или return_line)', null=True, blank=True)
+    source_id = models.IntegerField('ID источника (otk, return_line, otk_check_id)', null=True, blank=True)
+    warehouse_batch = models.OneToOneField(
+        'warehouse.WarehouseBatch',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='linked_defect_record',
+        verbose_name='Партия склада (брак)',
+    )
     profile = models.ForeignKey(
         'recipes.PlasticProfile',
         on_delete=models.SET_NULL,
@@ -661,6 +712,8 @@ class ReworkRequest(models.Model):
     return_doc = models.ForeignKey(
         Return,
         on_delete=models.PROTECT,
+        null=True,
+        blank=True,
         related_name='rework_requests',
         verbose_name='Возврат',
     )
