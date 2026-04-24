@@ -16,21 +16,27 @@ from config.permissions import IsAdminOrHasAccess
 from .filters import ClientFilter, DefectFilter, OrderFilter, PaymentFilter, ReturnFilter, SaleFilter
 from .models import (
     Client,
+    ClientPrice,
     DefectRecord,
     Order,
     OrderLine,
+    OrderReservation,
     Payment,
+    PriceList,
     Return,
     ReworkRequest,
     Sale,
     Shipment,
 )
 from .serializers import (
+    ClientPriceSerializer,
     ClientSerializer,
     DefectRecordSerializer,
+    OrderReservationSerializer,
     OrderSerializer,
     OrderLineSerializer,
     PaymentSerializer,
+    PriceListSerializer,
     ReturnSerializer,
     ReworkRequestSerializer,
     SaleSerializer,
@@ -98,7 +104,15 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'], url_path='history')
     def history(self, request, pk=None):
-        """Агрегированная история клиента: заявки, продажи, оплаты, возвраты, долги."""
+        """
+        Агрегированная история клиента: заявки, продажи, оплаты, возвраты,
+        долги, авансы, кредитный лимит, прибыль, просроченные долги.
+        """
+        from django.db.models import Sum
+        from django.db.models.functions import Coalesce
+        from config.api_numbers import api_decimal_str
+        from .credit_check import compute_client_debt, check_credit_limit
+
         client = self.get_object()
 
         orders = Order.objects.filter(client=client).prefetch_related('lines', 'payments').order_by('-date')
@@ -118,7 +132,6 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             if p.payment_type == Payment.TYPE_REFUND
         )
         net_paid = total_paid - total_refunded
-
         total_revenue = sum((s.revenue or Decimal('0')) for s in sales)
 
         # Долг или аванс
@@ -129,12 +142,26 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             client_debt_money = Decimal('0')
             client_advance_amount = net_paid - total_revenue
 
-        # Неотгруженные товары
-        has_unshipped = any(
-            order.has_company_debt_by_goods for order in orders
-        )
+        # Прибыль по клиенту
+        total_cost = sum((s.cost or Decimal('0')) for s in sales if not s.is_defect_sale)
+        defect_revenue = sum((s.revenue or Decimal('0')) for s in sales if s.is_defect_sale)
+        total_profit = total_revenue - total_cost
 
-        from config.api_numbers import api_decimal_str
+        # Неотгруженные товары
+        has_unshipped = any(order.has_company_debt_by_goods for order in orders)
+
+        # Кредитный лимит
+        credit_check = check_credit_limit(client)
+
+        # Просроченные задолженности (продажи старше 30 дней с непогашенным долгом)
+        from django.utils import timezone as tz
+        import datetime
+        threshold = tz.now().date() - datetime.timedelta(days=30)
+        overdue_orders = [
+            o for o in orders
+            if o.has_company_debt_by_goods and o.date < threshold
+        ]
+
         return Response({
             'client_id': client.id,
             'client_name': client.name,
@@ -142,11 +169,26 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'sales': SaleSerializer(sales, many=True).data,
             'payments': PaymentSerializer(payments, many=True).data,
             'returns': ReturnSerializer(returns, many=True).data,
+            # Денежные итоги
+            'total_revenue': api_decimal_str(total_revenue),
             'total_ordered': api_decimal_str(total_revenue),
             'total_paid': api_decimal_str(net_paid),
+            'total_paid_gross': api_decimal_str(total_paid),
+            'total_refunded': api_decimal_str(total_refunded),
             'client_debt_money': api_decimal_str(client_debt_money),
             'client_advance_amount': api_decimal_str(client_advance_amount),
+            # Товарный долг
             'has_unshipped_goods': has_unshipped,
+            'overdue_orders_count': len(overdue_orders),
+            # Прибыль
+            'total_profit': api_decimal_str(total_profit),
+            'defect_revenue': api_decimal_str(defect_revenue),
+            # Кредитный лимит
+            'credit_limit': api_decimal_str(credit_check.credit_limit) if credit_check.credit_limit is not None else None,
+            'credit_limit_mode': credit_check.block_mode,
+            'credit_available': api_decimal_str(credit_check.credit_available) if credit_check.credit_available is not None else None,
+            'credit_is_over_limit': credit_check.is_over_limit,
+            'credit_warning': credit_check.warning,
         })
 
 
@@ -233,6 +275,119 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'sales': SaleSerializer(sales, many=True).data,
             'payments': PaymentSerializer(payments, many=True).data,
             'returns': ReturnSerializer(returns, many=True).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='reserve')
+    def reserve(self, request, pk=None):
+        """
+        Зарезервировать товар под строку заявки.
+        Body: { order_line_id, warehouse_batch_id, quantity, comment? }
+        """
+        from .reservations import reserve_order_line
+        from apps.warehouse.models import WarehouseBatch
+
+        order = self.get_object()
+        line_id = request.data.get('order_line_id')
+        wb_id = request.data.get('warehouse_batch_id')
+        quantity_raw = request.data.get('quantity')
+        comment = request.data.get('comment', '')
+
+        if not line_id:
+            return _err('MISSING_FIELD', 'Укажите order_line_id')
+        if not wb_id:
+            return _err('MISSING_FIELD', 'Укажите warehouse_batch_id')
+        if quantity_raw is None:
+            return _err('MISSING_FIELD', 'Укажите quantity')
+
+        try:
+            line = order.lines.get(pk=line_id)
+        except OrderLine.DoesNotExist:
+            return _err('NOT_FOUND', 'Строка заявки не найдена', http_status=404)
+
+        try:
+            wb = WarehouseBatch.objects.get(pk=wb_id)
+        except WarehouseBatch.DoesNotExist:
+            return _err('NOT_FOUND', 'Партия склада не найдена', http_status=404)
+
+        try:
+            qty = Decimal(str(quantity_raw))
+        except Exception:
+            return _err('INVALID_FIELD', 'Некорректное значение quantity')
+
+        try:
+            reservation = reserve_order_line(
+                order_line=line,
+                warehouse_batch=wb,
+                quantity=qty,
+                user=request.user if request.user.is_authenticated else None,
+                comment=comment,
+            )
+        except ValueError as e:
+            return _err('RESERVATION_ERROR', str(e), http_status=422)
+
+        return Response(OrderReservationSerializer(reservation).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='release-reserve')
+    def release_reserve(self, request, pk=None):
+        """
+        Снять резерв.
+        Body: { reservation_id }
+        """
+        from .reservations import release_reservation
+
+        order = self.get_object()
+        res_id = request.data.get('reservation_id')
+        if not res_id:
+            return _err('MISSING_FIELD', 'Укажите reservation_id')
+
+        try:
+            reservation = OrderReservation.objects.get(
+                pk=res_id,
+                order_line__order=order,
+            )
+        except OrderReservation.DoesNotExist:
+            return _err('NOT_FOUND', 'Резерв не найден', http_status=404)
+
+        try:
+            reservation = release_reservation(reservation)
+        except ValueError as e:
+            return _err('RESERVATION_ERROR', str(e), http_status=422)
+
+        return Response(OrderReservationSerializer(reservation).data)
+
+    @action(detail=True, methods=['get'], url_path='reservations')
+    def reservations(self, request, pk=None):
+        """Список всех резервов по заявке."""
+        order = self.get_object()
+        line_ids = list(order.lines.values_list('id', flat=True))
+        qs = OrderReservation.objects.filter(
+            order_line_id__in=line_ids,
+        ).select_related('order_line', 'warehouse_batch', 'created_by').order_by('-created_at')
+        return Response(OrderReservationSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=['patch'], url_path='cancel')
+    def cancel_order(self, request, pk=None):
+        """
+        Отменить заявку с автоматическим снятием всех активных резервов.
+        """
+        from .reservations import release_all_for_order
+        from .state_machine import validate_order_transition, validate_order_cancel
+
+        order = self.get_object()
+        try:
+            validate_order_transition(order.status, Order.STATUS_CANCELED)
+            validate_order_cancel(order)
+        except ValueError as e:
+            return _err('INVALID_TRANSITION', str(e), http_status=422)
+
+        released = release_all_for_order(order)
+        order.status = Order.STATUS_CANCELED
+        order.save(update_fields=['status', 'updated_at'])
+        self._broadcast(order, created=False)
+        return Response({
+            'status': order.status,
+            'reservations_released': released,
+            'order': OrderSerializer(order).data,
         })
 
 
@@ -463,6 +618,16 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def invoice(self, request, pk=None):
         return self._serve_nakladnaya(request)
 
+    @action(detail=True, methods=['get'], url_path='credit-check')
+    def credit_check_for_sale(self, request, pk=None):
+        """Проверить кредитный лимит клиента перед оплатой/отгрузкой по продаже."""
+        from .credit_check import check_credit_limit, credit_check_result_to_dict
+        sale = self.get_object()
+        if not sale.client_id:
+            return _err('NO_CLIENT', 'У продажи не указан клиент')
+        result = check_credit_limit(sale.client, additional_amount=sale.revenue or Decimal('0'))
+        return Response(credit_check_result_to_dict(result))
+
     @action(detail=True, methods=['get'], url_path='receipt')
     def receipt(self, request, pk=None):
         """HTML-квитанция об оплате."""
@@ -676,9 +841,12 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='send-to-rework')
     def send_to_rework(self, request, pk=None):
         """Передать брак на переработку."""
+        from .state_machine import validate_defect_transition
         record = self.get_object()
-        if record.status not in (DefectRecord.STATUS_NEW, DefectRecord.STATUS_ON_STOCK):
-            return _err('INVALID_STATUS', f'Нельзя передать на переработку из статуса «{record.get_status_display()}»')
+        try:
+            validate_defect_transition(record.status, DefectRecord.STATUS_SENT_TO_REWORK)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
         record.status = DefectRecord.STATUS_SENT_TO_REWORK
         record.save(update_fields=['status', 'updated_at'])
         return Response(DefectRecordSerializer(record).data)
@@ -686,9 +854,12 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='complete-rework')
     def complete_rework(self, request, pk=None):
         """Завершить переработку брака."""
+        from .state_machine import validate_defect_transition
         record = self.get_object()
-        if record.status != DefectRecord.STATUS_SENT_TO_REWORK:
-            return _err('INVALID_STATUS', 'Можно завершить только из статуса «передан на переработку»')
+        try:
+            validate_defect_transition(record.status, DefectRecord.STATUS_REWORKED)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
         record.status = DefectRecord.STATUS_REWORKED
         record.save(update_fields=['status', 'updated_at'])
         return Response(DefectRecordSerializer(record).data)
@@ -696,12 +867,15 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='writeoff')
     def writeoff(self, request, pk=None):
         """Списать брак."""
+        from .state_machine import validate_defect_transition
         record = self.get_object()
         reason = request.data.get('writeoff_reason', '').strip()
         if not reason:
             return _err('MISSING_REASON', 'Укажите writeoff_reason — причина списания обязательна')
-        if record.status == DefectRecord.STATUS_WRITTEN_OFF:
-            return _err('ALREADY_WRITTEN_OFF', 'Брак уже списан')
+        try:
+            validate_defect_transition(record.status, DefectRecord.STATUS_WRITTEN_OFF)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
         record.status = DefectRecord.STATUS_WRITTEN_OFF
         record.writeoff_reason = reason
         record.save(update_fields=['status', 'writeoff_reason', 'updated_at'])
@@ -711,10 +885,13 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def sell_defect(self, request, pk=None):
         """Продажа брака — создаёт Sale с is_defect_sale=True."""
         from django.utils import timezone
+        from .state_machine import validate_defect_sell
 
         record = self.get_object()
-        if record.status not in (DefectRecord.STATUS_ON_STOCK, DefectRecord.STATUS_REWORKED):
-            return _err('INVALID_STATUS', f'Нельзя продать из статуса «{record.get_status_display()}»')
+        try:
+            validate_defect_sell(record)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
         client_id = request.data.get('client_id')
         price = request.data.get('price')
         quantity = request.data.get('quantity', record.quantity_pcs)
@@ -780,9 +957,28 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             extra={'status': inst.status},
         ))
 
+    @action(detail=True, methods=['post'], url_path='start')
+    def start_rework(self, request, pk=None):
+        """Перевести переделку в статус «В работе»."""
+        from .state_machine import validate_rework_transition
+        rework = self.get_object()
+        try:
+            validate_rework_transition(rework.status, ReworkRequest.STATUS_IN_PROGRESS)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
+        rework.status = ReworkRequest.STATUS_IN_PROGRESS
+        rework.save(update_fields=['status', 'updated_at'])
+        return Response(ReworkRequestSerializer(rework).data)
+
     @action(detail=True, methods=['post'], url_path='complete')
     def complete(self, request, pk=None):
-        """Завершить переделку — указать результирующую партию ГП."""
+        """
+        Завершить переделку — указать результирующую партию ГП,
+        фактический выход (output_quantity_kg) и потери (loss_kg).
+        """
+        from .state_machine import validate_rework_complete
+        from django.db import transaction as db_transaction
+
         rework = self.get_object()
         wb_id = request.data.get('result_warehouse_batch_id')
         if not wb_id:
@@ -794,20 +990,216 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         except WarehouseBatch.DoesNotExist:
             return _err('NOT_FOUND', 'Партия склада не найдена', http_status=404)
 
+        try:
+            validate_rework_complete(rework)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
+
+        update_fields = ['status', 'result_warehouse_batch', 'updated_at']
+
+        output_kg_raw = request.data.get('output_quantity_kg')
+        loss_kg_raw = request.data.get('loss_kg')
+
+        if output_kg_raw is not None:
+            rework.output_quantity_kg = Decimal(str(output_kg_raw))
+            update_fields.append('output_quantity_kg')
+        if loss_kg_raw is not None:
+            rework.loss_kg = Decimal(str(loss_kg_raw))
+            update_fields.append('loss_kg')
+        elif rework.quantity_kg and rework.output_quantity_kg is not None:
+            rework.loss_kg = max(
+                Decimal('0'),
+                Decimal(str(rework.quantity_kg)) - Decimal(str(rework.output_quantity_kg)),
+            )
+            update_fields.append('loss_kg')
+
+        if rework.quantity_kg and rework.output_quantity_kg is not None:
+            input_d = Decimal(str(rework.quantity_kg))
+            if input_d > 0:
+                rework.conversion_rate = (
+                    Decimal(str(rework.output_quantity_kg)) / input_d
+                ).quantize(Decimal('0.000001'))
+                update_fields.append('conversion_rate')
+
         rework.status = ReworkRequest.STATUS_COMPLETED
         rework.result_warehouse_batch = wb
-        rework.save(update_fields=['status', 'result_warehouse_batch', 'updated_at'])
+        rework.save(update_fields=list(set(update_fields)))
 
         # Обновить статус брака
         if rework.defect_record_id:
             DefectRecord.objects.filter(pk=rework.defect_record_id).update(status=DefectRecord.STATUS_REWORKED)
 
         from apps.realtime.broadcast import schedule_push
-        from django.db import transaction
-        transaction.on_commit(lambda: schedule_push(
+        db_transaction.on_commit(lambda: schedule_push(
             resource='rework_request',
             action='updated',
             entity_id=rework.pk,
             extra={'status': rework.status},
         ))
+        rework.refresh_from_db()
         return Response(ReworkRequestSerializer(rework).data)
+
+    @action(detail=True, methods=['post'], url_path='cancel')
+    def cancel_rework(self, request, pk=None):
+        """Отменить переделку."""
+        from .state_machine import validate_rework_transition
+        rework = self.get_object()
+        try:
+            validate_rework_transition(rework.status, ReworkRequest.STATUS_CANCELED)
+        except ValueError as e:
+            return _err('INVALID_STATUS', str(e), http_status=422)
+        rework.status = ReworkRequest.STATUS_CANCELED
+        rework.save(update_fields=['status', 'updated_at'])
+        return Response(ReworkRequestSerializer(rework).data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRICE LIST (Прайс-лист)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PriceListViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    queryset = PriceList.objects.prefetch_related('product_prices', 'product_prices__profile').all()
+    serializer_class = PriceListSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'sales'
+    activity_section = 'Прайсы'
+    activity_label = 'прайс-лист'
+
+    @action(detail=False, methods=['get'], url_path='suggest-price')
+    def suggest_price(self, request):
+        """
+        GET /api/price-lists/suggest-price/?client_id=&profile_id=&product=
+        Возвращает рекомендованную цену по приоритету:
+          1. Индивидуальная цена клиента
+          2. Базовый прайс
+          3. null
+        """
+        from .pricing import suggest_price, price_suggestion_to_dict
+        from datetime import date
+
+        client_id = request.query_params.get('client_id')
+        profile_id = request.query_params.get('profile_id')
+        product = request.query_params.get('product')
+        date_raw = request.query_params.get('date')
+
+        on_date = None
+        if date_raw:
+            try:
+                from datetime import datetime
+                on_date = datetime.strptime(date_raw[:10], '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                pass
+
+        suggestion = suggest_price(
+            client_id=int(client_id) if client_id else None,
+            profile_id=int(profile_id) if profile_id else None,
+            product=product,
+            on_date=on_date,
+        )
+        return Response(price_suggestion_to_dict(suggestion))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENT PRICE (Индивидуальные цены клиента)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClientPriceViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    queryset = ClientPrice.objects.select_related('client', 'profile').all()
+    serializer_class = ClientPriceSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'sales'
+    activity_section = 'Цены клиентов'
+    activity_label = 'цена клиента'
+    filterset_fields = ['client', 'profile']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER RESERVATION (Резервы — отдельный список)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrderReservationViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Только чтение. Управление резервами — через /orders/{id}/reserve/
+    """
+    queryset = OrderReservation.objects.select_related(
+        'order_line', 'order_line__order', 'warehouse_batch', 'created_by',
+    ).all()
+    serializer_class = OrderReservationSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'client_orders'
+    filterset_fields = ['status', 'order_line', 'warehouse_batch']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENT FINANCIAL SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClientFinancialSummaryView(viewsets.ViewSet):
+    """
+    GET /api/clients/{client_id}/financial-summary/
+    Полная финансовая сводка по клиенту.
+    """
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'clients'
+
+    def list(self, request):
+        from config.api_numbers import api_decimal_str
+        from .credit_check import check_credit_limit, compute_client_debt
+        from django.db.models import Sum
+        from django.db.models.functions import Coalesce
+
+        client_id = request.query_params.get('client_id')
+        if not client_id:
+            return _err('MISSING_PARAM', 'Укажите client_id')
+
+        try:
+            client = Client.objects.get(pk=client_id)
+        except Client.DoesNotExist:
+            return _err('NOT_FOUND', 'Клиент не найден', http_status=404)
+
+        sales = Sale.objects.filter(client=client).exclude(sale_status=Sale.STATUS_CANCELED)
+        payments = Payment.objects.filter(client=client)
+
+        total_revenue = sales.aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t'] or Decimal('0')
+        total_cost = (
+            sales.exclude(is_defect_sale=True).aggregate(t=Coalesce(Sum('cost'), Decimal('0')))['t']
+        ) or Decimal('0')
+        total_profit = total_revenue - total_cost
+        defect_revenue = (
+            sales.filter(is_defect_sale=True).aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t']
+        ) or Decimal('0')
+
+        total_incoming = (
+            payments.filter(
+                payment_type__in=[Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE]
+            ).aggregate(t=Coalesce(Sum('amount'), Decimal('0')))['t']
+        ) or Decimal('0')
+        total_refunded = (
+            payments.filter(payment_type=Payment.TYPE_REFUND)
+            .aggregate(t=Coalesce(Sum('amount'), Decimal('0')))['t']
+        ) or Decimal('0')
+        net_paid = total_incoming - total_refunded
+
+        client_debt = max(Decimal('0'), total_revenue - net_paid)
+        client_advance = max(Decimal('0'), net_paid - total_revenue)
+
+        credit_result = check_credit_limit(client)
+
+        return Response({
+            'client_id': client.pk,
+            'client_name': client.name,
+            'total_revenue': api_decimal_str(total_revenue),
+            'total_cost': api_decimal_str(total_cost),
+            'total_profit': api_decimal_str(total_profit),
+            'defect_revenue': api_decimal_str(defect_revenue),
+            'total_paid_gross': api_decimal_str(total_incoming),
+            'total_refunded': api_decimal_str(total_refunded),
+            'total_paid_net': api_decimal_str(net_paid),
+            'client_debt_money': api_decimal_str(client_debt),
+            'client_advance_amount': api_decimal_str(client_advance),
+            'credit_limit': api_decimal_str(credit_result.credit_limit) if credit_result.credit_limit is not None else None,
+            'credit_limit_mode': credit_result.block_mode,
+            'credit_available': api_decimal_str(credit_result.credit_available) if credit_result.credit_available is not None else None,
+            'is_over_limit': credit_result.is_over_limit,
+            'credit_warning': credit_result.warning,
+        })

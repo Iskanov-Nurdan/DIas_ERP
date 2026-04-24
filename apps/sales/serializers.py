@@ -17,9 +17,13 @@ from apps.warehouse.stock_ops import (
 )
 from .models import (
     Client,
+    ClientPrice,
     Order,
     OrderLine,
+    OrderReservation,
     Payment,
+    PriceList,
+    ProductPrice,
     Return,
     ReturnLine,
     DefectRecord,
@@ -90,6 +94,7 @@ class ClientSerializer(serializers.ModelSerializer):
             'inn', 'address', 'email', 'messenger', 'whatsapp_telegram',
             'client_type', 'notes', 'is_active', 'status',
             'sales_count', 'sales_total', 'has_sales',
+            'credit_limit', 'credit_limit_mode',
         )
 
     def get_status(self, obj):
@@ -131,22 +136,35 @@ class ClientSerializer(serializers.ModelSerializer):
 class OrderLineSerializer(serializers.ModelSerializer):
     remaining_quantity = serializers.SerializerMethodField()
     line_total = serializers.SerializerMethodField()
+    available_to_ship = serializers.SerializerMethodField()
+    remaining_to_reserve = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderLine
         fields = (
             'id', 'product', 'product_type', 'profile',
-            'ordered_quantity', 'shipped_quantity',
+            'ordered_quantity', 'shipped_quantity', 'reserved_quantity',
             'unit_price', 'comment',
-            'remaining_quantity', 'line_total',
+            'remaining_quantity', 'available_to_ship',
+            'remaining_to_reserve', 'line_total',
         )
-        read_only_fields = ('shipped_quantity', 'remaining_quantity', 'line_total')
+        read_only_fields = (
+            'shipped_quantity', 'reserved_quantity',
+            'remaining_quantity', 'available_to_ship',
+            'remaining_to_reserve', 'line_total',
+        )
         extra_kwargs = {
             'profile': {'required': False, 'allow_null': True},
         }
 
     def get_remaining_quantity(self, obj):
         return api_decimal_str(obj.remaining_quantity)
+
+    def get_available_to_ship(self, obj):
+        return api_decimal_str(obj.available_to_ship)
+
+    def get_remaining_to_reserve(self, obj):
+        return api_decimal_str(obj.remaining_to_reserve)
 
     def get_line_total(self, obj):
         return api_decimal_str(obj.line_total)
@@ -307,9 +325,9 @@ class SaleLineSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'product', 'warehouse_batch', 'order_line',
             'stock_form', 'quantity', 'unit_price', 'line_total',
-            'cost', 'defect_flag', 'comment',
+            'cost', 'profit', 'defect_flag', 'comment',
         )
-        read_only_fields = ('line_total', 'cost')
+        read_only_fields = ('line_total', 'cost', 'profit')
         extra_kwargs = {
             'warehouse_batch': {'required': False, 'allow_null': True},
             'order_line': {'required': False, 'allow_null': True},
@@ -317,7 +335,7 @@ class SaleLineSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        for k in ('quantity', 'unit_price', 'line_total', 'cost'):
+        for k in ('quantity', 'unit_price', 'line_total', 'cost', 'profit'):
             if ret.get(k) is not None:
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
         return ret
@@ -800,22 +818,36 @@ class DefectRecordSerializer(serializers.ModelSerializer):
 
 class ReworkRequestSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
+    rework_loss_kg = serializers.SerializerMethodField()
+    recovered_output = serializers.SerializerMethodField()
 
     class Meta:
         model = ReworkRequest
         fields = (
             'id', 'rework_number', 'return_doc', 'defect_record', 'original_sale',
-            'product', 'quantity_kg', 'status',
-            'result_warehouse_batch',
+            'product', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
+            'status', 'result_warehouse_batch',
+            'rework_loss_kg', 'recovered_output',
             'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
-        read_only_fields = ('rework_number', 'created_at', 'updated_at')
+        read_only_fields = ('rework_number', 'created_at', 'updated_at', 'rework_loss_kg', 'recovered_output')
         extra_kwargs = {
             'defect_record': {'required': False, 'allow_null': True},
             'original_sale': {'required': False, 'allow_null': True},
             'result_warehouse_batch': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
+            'output_quantity_kg': {'required': False, 'allow_null': True},
+            'loss_kg': {'required': False, 'allow_null': True},
+            'conversion_rate': {'required': False, 'allow_null': True},
         }
+
+    def get_rework_loss_kg(self, obj):
+        v = obj.rework_loss_kg
+        return api_decimal_str(v) if v is not None else None
+
+    def get_recovered_output(self, obj):
+        v = obj.recovered_output
+        return api_decimal_str(Decimal(str(v))) if v is not None else None
 
     def create(self, validated_data):
         year = timezone.now().date().year
@@ -829,8 +861,9 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
-        if ret.get('quantity_kg') is not None:
-            ret['quantity_kg'] = api_decimal_str(Decimal(str(ret['quantity_kg'])))
+        for k in ('quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate'):
+            if ret.get(k) is not None:
+                ret[k] = api_decimal_str(Decimal(str(ret[k])))
         return ret
 
 
@@ -851,3 +884,103 @@ class ClientHistorySerializer(serializers.Serializer):
     client_debt_money = serializers.CharField()
     client_advance_amount = serializers.CharField()
     has_unshipped_goods = serializers.BooleanField()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПРАЙС-ЛИСТЫ
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProductPriceSerializer(serializers.ModelSerializer):
+    profile_name = serializers.CharField(source='profile.name', read_only=True, allow_null=True, default='')
+
+    class Meta:
+        model = ProductPrice
+        fields = ('id', 'price_list', 'profile', 'profile_name', 'product', 'price', 'unit')
+        extra_kwargs = {
+            'profile': {'required': False, 'allow_null': True},
+        }
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get('price') is not None:
+            ret['price'] = api_decimal_str(Decimal(str(ret['price'])))
+        return ret
+
+
+class PriceListSerializer(serializers.ModelSerializer):
+    product_prices = ProductPriceSerializer(many=True, required=False)
+
+    class Meta:
+        model = PriceList
+        fields = ('id', 'name', 'is_active', 'valid_from', 'valid_to', 'comment', 'created_at', 'product_prices')
+        read_only_fields = ('created_at',)
+
+    def create(self, validated_data):
+        prices_data = validated_data.pop('product_prices', [])
+        with transaction.atomic():
+            pl = super().create(validated_data)
+            for pd in prices_data:
+                ProductPrice.objects.create(price_list=pl, **pd)
+        return pl
+
+    def update(self, instance, validated_data):
+        prices_data = validated_data.pop('product_prices', None)
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
+            if prices_data is not None:
+                instance.product_prices.all().delete()
+                for pd in prices_data:
+                    ProductPrice.objects.create(price_list=instance, **pd)
+        return instance
+
+
+class ClientPriceSerializer(serializers.ModelSerializer):
+    client_name = serializers.CharField(source='client.name', read_only=True, default='')
+    profile_name = serializers.CharField(source='profile.name', read_only=True, allow_null=True, default='')
+
+    class Meta:
+        model = ClientPrice
+        fields = (
+            'id', 'client', 'client_name', 'profile', 'profile_name',
+            'product', 'price', 'unit',
+            'valid_from', 'valid_to', 'comment', 'created_at',
+        )
+        read_only_fields = ('created_at',)
+        extra_kwargs = {
+            'profile': {'required': False, 'allow_null': True},
+        }
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get('price') is not None:
+            ret['price'] = api_decimal_str(Decimal(str(ret['price'])))
+        return ret
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER RESERVATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrderReservationSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
+    order_line_product = serializers.CharField(source='order_line.product', read_only=True, default='')
+    warehouse_batch_product = serializers.CharField(source='warehouse_batch.product', read_only=True, default='')
+
+    class Meta:
+        model = OrderReservation
+        fields = (
+            'id', 'order_line', 'order_line_product',
+            'warehouse_batch', 'warehouse_batch_product',
+            'quantity', 'status', 'comment',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        )
+        read_only_fields = ('created_at', 'updated_at', 'status')
+        extra_kwargs = {
+            'created_by': {'required': False, 'allow_null': True},
+        }
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get('quantity') is not None:
+            ret['quantity'] = api_decimal_str(Decimal(str(ret['quantity'])))
+        return ret

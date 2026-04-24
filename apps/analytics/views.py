@@ -11,7 +11,7 @@ from config.openapi_common import DiasErrorSerializer
 from config.permissions import IsAdminOrHasAccess
 from apps.materials.models import MaterialStockDeduction
 
-from .services import parse_analytics_scope, parse_period
+from .services import parse_analytics_scope, parse_period, _parse_iso_date, _parse_int_param, _qp_first
 from .reporting import (
     build_analytics_summary,
     build_otk_details,
@@ -221,5 +221,292 @@ class AnalyticsWriteoffDetailsView(viewsets.ViewSet):
             })
         return Response({
             'total': api_decimal_str(total_est),
+            'items': items,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# АНАЛИТИКА БРАКА
+# ─────────────────────────────────────────────────────────────────────────────
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Аналитика брака: потери, статусы, источники',
+        parameters=_ANALYTICS_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+    ),
+)
+class AnalyticsDefectView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        from apps.sales.models import DefectRecord
+        from django.db.models import Count, Sum
+        from django.db.models.functions import Coalesce
+
+        scope = parse_analytics_scope(request)
+
+        qs = DefectRecord.objects.all()
+        # Фильтр по дате
+        date_from = scope.date_from or (scope.period._date_field_q('created_at') and None)
+        if scope.date_from:
+            qs = qs.filter(created_at__date__gte=scope.date_from)
+        if scope.date_to:
+            qs = qs.filter(created_at__date__lte=scope.date_to)
+        if not scope.date_from and not scope.date_to:
+            qs = qs.filter(scope.period.writeoff_q())
+
+        if scope.profile_id:
+            qs = qs.filter(profile_id=scope.profile_id)
+
+        total_pcs = qs.aggregate(t=Coalesce(Sum('quantity_pcs'), Decimal('0')))['t'] or Decimal('0')
+        total_kg = qs.aggregate(t=Coalesce(Sum('quantity_kg'), Decimal('0')))['t'] or Decimal('0')
+
+        by_status = list(
+            qs.values('status').annotate(
+                count=Count('id'),
+                pcs=Coalesce(Sum('quantity_pcs'), Decimal('0')),
+                kg=Coalesce(Sum('quantity_kg'), Decimal('0')),
+            ).order_by('status')
+        )
+        by_source = list(
+            qs.values('source_type').annotate(
+                count=Count('id'),
+                pcs=Coalesce(Sum('quantity_pcs'), Decimal('0')),
+            ).order_by('source_type')
+        )
+
+        # Продажи брака
+        from apps.sales.models import Sale
+        defect_sales = Sale.objects.filter(is_defect_sale=True)
+        if scope.date_from:
+            defect_sales = defect_sales.filter(date__gte=scope.date_from)
+        if scope.date_to:
+            defect_sales = defect_sales.filter(date__lte=scope.date_to)
+        if not scope.date_from and not scope.date_to:
+            defect_sales = defect_sales.filter(scope.period.sale_q())
+        defect_revenue = defect_sales.aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t'] or Decimal('0')
+        defect_cost = defect_sales.aggregate(t=Coalesce(Sum('cost'), Decimal('0')))['t'] or Decimal('0')
+
+        return Response({
+            'period': scope.as_period_dict(),
+            'total_defect_pcs': api_decimal_str(total_pcs),
+            'total_defect_kg': api_decimal_str(total_kg),
+            'defect_sale_revenue': api_decimal_str(defect_revenue),
+            'defect_sale_cost': api_decimal_str(defect_cost),
+            'defect_sale_profit': api_decimal_str(defect_revenue - defect_cost),
+            'by_status': [
+                {
+                    'status': r['status'],
+                    'count': r['count'],
+                    'pcs': api_decimal_str(r['pcs']),
+                    'kg': api_decimal_str(r['kg']),
+                }
+                for r in by_status
+            ],
+            'by_source': [
+                {
+                    'source_type': r['source_type'],
+                    'count': r['count'],
+                    'pcs': api_decimal_str(r['pcs']),
+                }
+                for r in by_source
+            ],
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# АНАЛИТИКА ПЕРЕДЕЛКИ
+# ─────────────────────────────────────────────────────────────────────────────
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Аналитика переделки: вход, выход, потери',
+        parameters=_ANALYTICS_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+    ),
+)
+class AnalyticsReworkView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        from apps.sales.models import ReworkRequest
+        from django.db.models import Count, Sum
+        from django.db.models.functions import Coalesce
+
+        scope = parse_analytics_scope(request)
+        qs = ReworkRequest.objects.all()
+        if scope.date_from:
+            qs = qs.filter(created_at__date__gte=scope.date_from)
+        if scope.date_to:
+            qs = qs.filter(created_at__date__lte=scope.date_to)
+        if not scope.date_from and not scope.date_to:
+            qs = qs.filter(scope.period.writeoff_q())
+
+        agg = qs.aggregate(
+            total_input=Coalesce(Sum('quantity_kg'), Decimal('0')),
+            total_output=Coalesce(Sum('output_quantity_kg'), Decimal('0')),
+            total_loss=Coalesce(Sum('loss_kg'), Decimal('0')),
+            count=Count('id'),
+        )
+
+        by_status = list(
+            qs.values('status').annotate(
+                count=Count('id'),
+                input_kg=Coalesce(Sum('quantity_kg'), Decimal('0')),
+                output_kg=Coalesce(Sum('output_quantity_kg'), Decimal('0')),
+                loss_kg=Coalesce(Sum('loss_kg'), Decimal('0')),
+            ).order_by('status')
+        )
+
+        return Response({
+            'period': scope.as_period_dict(),
+            'total_reworks': agg['count'],
+            'total_input_kg': api_decimal_str(agg['total_input']),
+            'total_output_kg': api_decimal_str(agg['total_output']),
+            'total_loss_kg': api_decimal_str(agg['total_loss']),
+            'by_status': [
+                {
+                    'status': r['status'],
+                    'count': r['count'],
+                    'input_kg': api_decimal_str(r['input_kg']),
+                    'output_kg': api_decimal_str(r['output_kg']),
+                    'loss_kg': api_decimal_str(r['loss_kg']),
+                }
+                for r in by_status
+            ],
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПРИБЫЛЬНОСТЬ ПО КЛИЕНТАМ
+# ─────────────────────────────────────────────────────────────────────────────
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Прибыльность по клиентам за период',
+        parameters=_ANALYTICS_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+    ),
+)
+class AnalyticsClientProfitabilityView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        from apps.sales.models import Sale, Client
+        from django.db.models import Sum, Count
+        from django.db.models.functions import Coalesce
+
+        scope = parse_analytics_scope(request)
+        qs = Sale.objects.exclude(sale_status=Sale.STATUS_CANCELED)
+        qs = qs.filter(scope.sale_date_q())
+        if scope.client_id:
+            qs = qs.filter(client_id=scope.client_id)
+
+        rows = (
+            qs.values('client_id', 'client__name')
+            .annotate(
+                revenue=Coalesce(Sum('revenue'), Decimal('0')),
+                cost=Coalesce(Sum('cost'), Decimal('0')),
+                profit=Coalesce(Sum('profit'), Decimal('0')),
+                sales_count=Count('id'),
+            )
+            .order_by('-revenue')
+        )
+
+        items = []
+        for r in rows:
+            items.append({
+                'client_id': r['client_id'],
+                'client_name': r['client__name'] or '—',
+                'revenue': api_decimal_str(r['revenue']),
+                'cost': api_decimal_str(r['cost']),
+                'profit': api_decimal_str(r['profit']),
+                'sales_count': r['sales_count'],
+            })
+
+        return Response({
+            'period': scope.as_period_dict(),
+            'items': items,
+            'total_revenue': api_decimal_str(sum(Decimal(i['revenue']) for i in items)),
+            'total_profit': api_decimal_str(sum(Decimal(i['profit']) for i in items)),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ДЕБИТОРКА И АВАНСЫ
+# ─────────────────────────────────────────────────────────────────────────────
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Дебиторская задолженность и авансы по клиентам',
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+    ),
+)
+class AnalyticsReceivablesView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        from apps.sales.models import Client, Payment, Sale
+        from django.db.models import Sum
+        from django.db.models.functions import Coalesce
+
+        clients = Client.objects.filter(is_active=True)
+        items = []
+        total_debt = Decimal('0')
+        total_advance = Decimal('0')
+
+        for c in clients:
+            revenue = (
+                Sale.objects.filter(client=c)
+                .exclude(sale_status__in=[Sale.STATUS_CANCELED, Sale.STATUS_DRAFT])
+                .aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t']
+            ) or Decimal('0')
+
+            incoming = (
+                Payment.objects.filter(
+                    client=c,
+                    payment_type__in=[Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE],
+                ).aggregate(t=Coalesce(Sum('amount'), Decimal('0')))['t']
+            ) or Decimal('0')
+            refunded = (
+                Payment.objects.filter(client=c, payment_type=Payment.TYPE_REFUND)
+                .aggregate(t=Coalesce(Sum('amount'), Decimal('0')))['t']
+            ) or Decimal('0')
+            net_paid = incoming - refunded
+
+            debt = max(Decimal('0'), revenue - net_paid)
+            advance = max(Decimal('0'), net_paid - revenue)
+
+            if debt > 0 or advance > 0:
+                total_debt += debt
+                total_advance += advance
+                items.append({
+                    'client_id': c.pk,
+                    'client_name': c.name,
+                    'total_revenue': api_decimal_str(revenue),
+                    'total_paid': api_decimal_str(net_paid),
+                    'debt': api_decimal_str(debt),
+                    'advance': api_decimal_str(advance),
+                    'credit_limit': api_decimal_str(c.credit_limit) if c.credit_limit else None,
+                    'credit_limit_mode': c.credit_limit_mode,
+                    'is_over_limit': (
+                        c.credit_limit is not None and debt > c.credit_limit
+                    ),
+                })
+
+        items.sort(key=lambda x: Decimal(x['debt']), reverse=True)
+
+        return Response({
+            'total_debt': api_decimal_str(total_debt),
+            'total_advance': api_decimal_str(total_advance),
             'items': items,
         })

@@ -3,6 +3,13 @@ from django.db import models
 
 
 class Client(models.Model):
+    CREDIT_MODE_SOFT = 'soft'
+    CREDIT_MODE_HARD = 'hard'
+    CREDIT_MODE_CHOICES = [
+        (CREDIT_MODE_SOFT, 'Мягкое предупреждение'),
+        (CREDIT_MODE_HARD, 'Жёсткая блокировка'),
+    ]
+
     name = models.CharField('Название', max_length=255)
     contact = models.CharField('Контакт', max_length=255, blank=True)
     phone = models.CharField('Телефон', max_length=50, blank=True)
@@ -19,6 +26,15 @@ class Client(models.Model):
         default='',
     )
     is_active = models.BooleanField('Активен', default=True)
+    credit_limit = models.DecimalField(
+        'Кредитный лимит', max_digits=16, decimal_places=2, null=True, blank=True,
+    )
+    credit_limit_mode = models.CharField(
+        'Режим кредитного лимита',
+        max_length=10,
+        choices=CREDIT_MODE_CHOICES,
+        default=CREDIT_MODE_SOFT,
+    )
 
     class Meta:
         db_table = 'clients'
@@ -147,6 +163,9 @@ class OrderLine(models.Model):
     shipped_quantity = models.DecimalField(
         'Отгружено', max_digits=14, decimal_places=4, default=0,
     )
+    reserved_quantity = models.DecimalField(
+        'Зарезервировано', max_digits=14, decimal_places=4, default=0,
+    )
     unit_price = models.DecimalField(
         'Цена за ед.', max_digits=14, decimal_places=2, null=True, blank=True,
     )
@@ -162,6 +181,23 @@ class OrderLine(models.Model):
     def remaining_quantity(self):
         from decimal import Decimal
         return max(Decimal('0'), (self.ordered_quantity or Decimal('0')) - (self.shipped_quantity or Decimal('0')))
+
+    @property
+    def available_to_ship(self):
+        """Можно отгрузить = заказано - отгружено - зарезервировано (сверх отгруженного)."""
+        from decimal import Decimal
+        remaining = self.remaining_quantity
+        reserved = max(Decimal('0'), (self.reserved_quantity or Decimal('0')) - (self.shipped_quantity or Decimal('0')))
+        return max(Decimal('0'), remaining - reserved)
+
+    @property
+    def remaining_to_reserve(self):
+        """Ещё можно зарезервировать = заказано - зарезервировано."""
+        from decimal import Decimal
+        return max(
+            Decimal('0'),
+            (self.ordered_quantity or Decimal('0')) - (self.reserved_quantity or Decimal('0')),
+        )
 
     @property
     def line_total(self):
@@ -319,6 +355,7 @@ class SaleLine(models.Model):
     unit_price = models.DecimalField('Цена за ед.', max_digits=14, decimal_places=2, null=True, blank=True)
     line_total = models.DecimalField('Сумма строки', max_digits=16, decimal_places=2, default=0)
     cost = models.DecimalField('Себестоимость строки', max_digits=16, decimal_places=2, default=0)
+    profit = models.DecimalField('Прибыль строки', max_digits=16, decimal_places=2, default=0)
     defect_flag = models.BooleanField('Строка брака', default=False)
     comment = models.TextField('Комментарий', blank=True, default='')
 
@@ -642,7 +679,16 @@ class ReworkRequest(models.Model):
         verbose_name='Исходная продажа',
     )
     product = models.CharField('Продукт', max_length=255, blank=True, default='')
-    quantity_kg = models.DecimalField('Масса кг', max_digits=14, decimal_places=4, default=0)
+    quantity_kg = models.DecimalField('Масса входа кг (сырьё)', max_digits=14, decimal_places=4, default=0)
+    output_quantity_kg = models.DecimalField(
+        'Масса выхода кг (ГП)', max_digits=14, decimal_places=4, null=True, blank=True,
+    )
+    loss_kg = models.DecimalField(
+        'Потери кг', max_digits=14, decimal_places=4, null=True, blank=True,
+    )
+    conversion_rate = models.DecimalField(
+        'Коэффициент переработки (выход/вход)', max_digits=10, decimal_places=6, null=True, blank=True,
+    )
     status = models.CharField(
         'Статус', max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True,
     )
@@ -672,3 +718,154 @@ class ReworkRequest(models.Model):
 
     def __str__(self):
         return f'Переделка #{self.rework_number or self.id} — {self.product}'
+
+    @property
+    def rework_loss_kg(self):
+        from decimal import Decimal
+        if self.loss_kg is not None:
+            return self.loss_kg
+        if self.quantity_kg and self.output_quantity_kg is not None:
+            return max(Decimal('0'), Decimal(str(self.quantity_kg)) - Decimal(str(self.output_quantity_kg)))
+        return None
+
+    @property
+    def recovered_output(self):
+        return self.output_quantity_kg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПРАЙС-ЛИСТ (PriceList / ProductPrice / ClientPrice)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PriceList(models.Model):
+    """Базовый прайс-лист для товаров/профилей."""
+    name = models.CharField('Название прайса', max_length=255)
+    is_active = models.BooleanField('Активен', default=True)
+    valid_from = models.DateField('Действует с', null=True, blank=True)
+    valid_to = models.DateField('Действует по', null=True, blank=True)
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'price_lists'
+        verbose_name = 'Прайс-лист'
+        verbose_name_plural = 'Прайс-листы'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.name
+
+
+class ProductPrice(models.Model):
+    """Цена по прайс-листу для товара/профиля."""
+    price_list = models.ForeignKey(
+        PriceList, on_delete=models.CASCADE, related_name='product_prices', verbose_name='Прайс',
+    )
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        related_name='product_prices',
+        verbose_name='Профиль',
+    )
+    product = models.CharField('Товар (текст)', max_length=255, blank=True, default='')
+    price = models.DecimalField('Цена', max_digits=14, decimal_places=2)
+    unit = models.CharField('Единица', max_length=20, default='piece')
+
+    class Meta:
+        db_table = 'product_prices'
+        verbose_name = 'Цена по прайсу'
+        verbose_name_plural = 'Цены по прайсу'
+        ordering = ['id']
+
+    def __str__(self):
+        label = self.profile.name if self.profile_id else self.product
+        return f'{label} — {self.price}'
+
+
+class ClientPrice(models.Model):
+    """Индивидуальная цена клиента (приоритет выше базового прайса)."""
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name='client_prices', verbose_name='Клиент',
+    )
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='client_prices',
+        verbose_name='Профиль',
+    )
+    product = models.CharField('Товар (текст)', max_length=255, blank=True, default='')
+    price = models.DecimalField('Цена', max_digits=14, decimal_places=2)
+    unit = models.CharField('Единица', max_length=20, default='piece')
+    valid_from = models.DateField('Действует с', null=True, blank=True)
+    valid_to = models.DateField('Действует по', null=True, blank=True)
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'client_prices'
+        verbose_name = 'Индивидуальная цена клиента'
+        verbose_name_plural = 'Индивидуальные цены клиентов'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        label = self.profile.name if self.profile_id else self.product
+        return f'{self.client.name} — {label} — {self.price}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# РЕЗЕРВ ПО ЗАЯВКЕ (OrderReservation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrderReservation(models.Model):
+    """Резерв конкретной партии склада под строку заявки."""
+
+    STATUS_ACTIVE = 'active'
+    STATUS_RELEASED = 'released'
+    STATUS_FULFILLED = 'fulfilled'
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, 'Активен'),
+        (STATUS_RELEASED, 'Снят'),
+        (STATUS_FULFILLED, 'Исполнен (отгружен)'),
+    ]
+
+    order_line = models.ForeignKey(
+        OrderLine,
+        on_delete=models.CASCADE,
+        related_name='reservations',
+        verbose_name='Строка заявки',
+    )
+    warehouse_batch = models.ForeignKey(
+        'warehouse.WarehouseBatch',
+        on_delete=models.CASCADE,
+        related_name='order_reservations',
+        verbose_name='Партия склада',
+    )
+    quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4, default=0)
+    status = models.CharField(
+        'Статус', max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_reservations',
+        verbose_name='Создал',
+    )
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+    comment = models.TextField('Комментарий', blank=True, default='')
+
+    class Meta:
+        db_table = 'order_reservations'
+        verbose_name = 'Резерв по заявке'
+        verbose_name_plural = 'Резервы по заявкам'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['order_line', 'status']),
+            models.Index(fields=['warehouse_batch', 'status']),
+        ]
+
+    def __str__(self):
+        return f'Резерв #{self.id}: строка {self.order_line_id} ← партия {self.warehouse_batch_id} × {self.quantity}'
