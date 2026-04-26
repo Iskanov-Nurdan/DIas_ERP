@@ -1149,10 +1149,89 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         ret_doc = self.get_object()
         if ret_doc.status == Return.STATUS_CANCELED:
-            return _err('ALREADY_CANCELED', 'Возврат уже отменён', http_status=422)
+            return _err('RETURN_ALREADY_CANCELED', 'Возврат уже отменён', http_status=422)
         with transaction.atomic():
             if ret_doc.status == Return.STATUS_COMPLETED:
-                rollback_return_document(ret_doc)
+                active_refund_exists = Payment.objects.filter(
+                    linked_return=ret_doc,
+                    payment_type=Payment.TYPE_REFUND,
+                    status=Payment.STATUS_ACTIVE,
+                ).exists()
+                if active_refund_exists:
+                    return _err(
+                        'REFUND_PAYMENT_EXISTS',
+                        'Нельзя отменить возврат: есть активный refund payment.',
+                        http_status=409,
+                    )
+
+                line_ids = list(ret_doc.lines.values_list('id', flat=True))
+                defects = list(
+                    DefectRecord.objects.filter(
+                        source_type=DefectRecord.SOURCE_RETURN,
+                        source_id__in=line_ids,
+                    ),
+                )
+                for d in defects:
+                    used_statuses = {
+                        DefectRecord.STATUS_SOLD,
+                        DefectRecord.STATUS_WRITTEN_OFF,
+                        DefectRecord.STATUS_SENT_TO_REWORK,
+                        DefectRecord.STATUS_REWORKED,
+                        DefectRecord.STATUS_CLOSED,
+                    }
+                    counters_changed = any(
+                        Decimal(str(x or 0)) > 0
+                        for x in (
+                            d.sold_quantity_pcs,
+                            d.written_off_quantity_pcs,
+                            d.sent_to_rework_quantity_pcs,
+                        )
+                    )
+                    if d.status in used_statuses or counters_changed:
+                        return _err(
+                            'DOWNSTREAM_USED',
+                            'Нельзя отменить возврат: связанный defect уже использован.',
+                            http_status=409,
+                        )
+                reworks = ReworkRequest.objects.filter(defect_record_id__in=[d.id for d in defects])
+                for rw in reworks:
+                    if rw.status in (
+                        ReworkRequest.STATUS_IN_PROGRESS,
+                        ReworkRequest.STATUS_COMPLETED,
+                        ReworkRequest.STATUS_CANCELED,
+                    ):
+                        return _err(
+                            'DOWNSTREAM_USED',
+                            'Нельзя отменить возврат: связанная переделка уже использована.',
+                            http_status=409,
+                        )
+
+                for line in ret_doc.lines.select_related('sale_line', 'sale_line__warehouse_batch').all():
+                    if line.return_target != ReturnLine.TARGET_WAREHOUSE:
+                        continue
+                    wb = None
+                    if line.sale_line_id and line.sale_line.warehouse_batch_id:
+                        wb = line.sale_line.warehouse_batch
+                    elif ret_doc.sale and ret_doc.sale.warehouse_batch_id:
+                        wb = ret_doc.sale.warehouse_batch
+                    if wb is None:
+                        continue
+                    current = Decimal(str(wb.quantity or 0))
+                    delta = Decimal(str(line.quantity or 0))
+                    if current - delta < 0:
+                        return _err(
+                            'WAREHOUSE_ROLLBACK_NEGATIVE',
+                            'Нельзя откатить возврат: rollback уведет складской остаток в минус.',
+                            http_status=409,
+                        )
+                try:
+                    rollback_return_document(ret_doc)
+                except Exception as exc:
+                    return _err(
+                        'RETURN_ROLLBACK_FAILED',
+                        f'Не удалось откатить возврат: {exc}',
+                        http_status=409,
+                    )
             ret_doc.status = Return.STATUS_CANCELED
             ret_doc.save(update_fields=['status'])
         from .commercial_audit import log_commercial_audit
@@ -1171,13 +1250,20 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def complete_return(self, request, pk=None):
         """Провести возврат: склад/брак/переделка только здесь (из статуса draft)."""
         ret_doc = self.get_object()
+        if ret_doc.status == Return.STATUS_COMPLETED:
+            return _err('RETURN_ALREADY_COMPLETED', 'Возврат уже проведен.', http_status=422)
+        if ret_doc.status == Return.STATUS_CANCELED:
+            return _err('RETURN_ALREADY_CANCELED', 'Отмененный возврат нельзя провести.', http_status=422)
         if ret_doc.status != Return.STATUS_DRAFT:
-            return _err('INVALID_STATE', 'Провести можно только возврат в статусе draft', http_status=422)
+            return _err('RETURN_COMPLETE_FAILED', 'Провести можно только возврат в статусе draft.', http_status=422)
         if not ret_doc.lines.exists():
             return _err('NO_LINES', 'Нет строк возврата', http_status=422)
         ser = ReturnSerializer()
         with transaction.atomic():
-            ser.apply_completion_effects(ret_doc)
+            try:
+                ser.apply_completion_effects(ret_doc)
+            except Exception as exc:
+                return _err('RETURN_COMPLETE_FAILED', f'Ошибка проведения возврата: {exc}', http_status=409)
             ret_doc.status = Return.STATUS_COMPLETED
             ret_doc.save(update_fields=['status'])
         return Response(ReturnSerializer(ret_doc, context={'request': request}).data)
@@ -1200,6 +1286,23 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         data = ReturnSerializer(instance, context={'request': request}).data
         downstream = []
         line_ids = list(instance.lines.values_list('id', flat=True))
+        warehouse_effects = []
+        for line in instance.lines.select_related('sale_line', 'sale_line__warehouse_batch').all():
+            if line.return_target != ReturnLine.TARGET_WAREHOUSE:
+                continue
+            batch_id = None
+            if line.sale_line_id and line.sale_line.warehouse_batch_id:
+                batch_id = line.sale_line.warehouse_batch_id
+            elif instance.sale and instance.sale.warehouse_batch_id:
+                batch_id = instance.sale.warehouse_batch_id
+            warehouse_effects.append(
+                {
+                    'type': 'warehouse_effect',
+                    'source_return_line_id': line.id,
+                    'warehouse_batch_id': batch_id,
+                    'quantity': api_decimal_str(Decimal(str(line.quantity or 0))),
+                },
+            )
         defects = DefectRecord.objects.filter(
             source_type=DefectRecord.SOURCE_RETURN,
             source_id__in=line_ids,
@@ -1241,6 +1344,22 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 'defect_record_id': r['defect_record_id'],
                 'result_warehouse_batch_id': r['result_warehouse_batch_id'],
             })
+        active_refunds = Payment.objects.filter(
+            linked_return=instance,
+            payment_type=Payment.TYPE_REFUND,
+            status=Payment.STATUS_ACTIVE,
+        ).values('id', 'payment_number', 'amount', 'status')
+        for p in active_refunds:
+            downstream.append(
+                {
+                    'type': 'refund_payment',
+                    'id': p['id'],
+                    'payment_number': p['payment_number'],
+                    'amount': api_decimal_str(Decimal(str(p['amount'] or 0))),
+                    'status': p['status'],
+                },
+            )
+        downstream.extend(warehouse_effects)
         data['downstream_links'] = downstream
         data['available_status_transitions'] = []
         data['available_actions'] = {
@@ -1252,27 +1371,65 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='select-sources')
     def select_sources(self, request):
         sale_id = request.query_params.get('sale_id')
-        sales_qs = Sale.objects.select_related('client').order_by('-date', '-id')
-        sales = list(sales_qs.values('id', 'order_number', 'client__name')[:200])
+        sales_qs = Sale.objects.select_related('client').filter(
+            sale_status__in=(Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED),
+        ).order_by('-date', '-id')
+        sales_payload = []
+        for sale in sales_qs[:200]:
+            sale_lines = SaleLine.objects.filter(sale=sale).values('id', 'product', 'quantity', 'unit_price')
+            total_returnable = Decimal('0')
+            for sl in sale_lines:
+                sold = Decimal(str(sl['quantity'] or 0))
+                returned = ReturnLine.objects.filter(sale_line_id=sl['id']).exclude(
+                    return_doc__status=Return.STATUS_CANCELED,
+                ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
+                returnable = sold - Decimal(str(returned))
+                if returnable > 0:
+                    total_returnable += returnable
+            if total_returnable <= 0:
+                continue
+            sales_payload.append(
+                {
+                    'id': sale.id,
+                    'label': f'{sale.sale_number or sale.order_number} — {sale.client.name if sale.client_id else "—"} — доступно к возврату {api_decimal_str(total_returnable)}',
+                    'client': sale.client_id,
+                    'client_name': sale.client.name if sale.client_id else '',
+                    'sale_status': sale.sale_status,
+                    'returnable_quantity': api_decimal_str(total_returnable),
+                },
+            )
         lines = []
         if sale_id:
             sale_lines = (
                 SaleLine.objects.filter(sale_id=sale_id)
                 .order_by('id')
-                .values('id', 'product', 'quantity')
+                .values('id', 'product', 'quantity', 'unit_price')
             )
-            lines = [
-                {'id': sl['id'], 'label': f"{sl['product']} × {sl['quantity']}"}
-                for sl in sale_lines
-            ]
+            for sl in sale_lines:
+                sold = Decimal(str(sl['quantity'] or 0))
+                returned = ReturnLine.objects.filter(sale_line_id=sl['id']).exclude(
+                    return_doc__status=Return.STATUS_CANCELED,
+                ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
+                returnable = sold - Decimal(str(returned))
+                if returnable <= 0:
+                    continue
+                sold_s = api_decimal_str(sold)
+                ret_s = api_decimal_str(Decimal(str(returned)))
+                retable_s = api_decimal_str(returnable)
+                unit_price_s = api_decimal_str(Decimal(str(sl['unit_price'] or 0)))
+                lines.append(
+                    {
+                        'id': sl['id'],
+                        'label': f"{sl['product']} — продано {sold_s} — возвращено {ret_s} — доступно {retable_s}",
+                        'product': sl['product'],
+                        'sold_quantity': sold_s,
+                        'returned_quantity': ret_s,
+                        'returnable_quantity': retable_s,
+                        'unit_price': unit_price_s,
+                    },
+                )
         return Response({
-            'sales': [
-                {
-                    'id': s['id'],
-                    'label': f"{s['order_number']} / {s['client__name'] or '—'}",
-                }
-                for s in sales
-            ],
+            'sales': sales_payload,
             'sale_lines': lines,
         })
 
@@ -1415,24 +1572,47 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         lines = (
             ReturnLine.objects.select_related('return_doc')
+            .exclude(
+                id__in=DefectRecord.objects.filter(source_type=DefectRecord.SOURCE_RETURN).values_list('source_id', flat=True),
+            )
             .order_by('-id')
-            .values('id', 'product', 'quantity', 'return_doc_id')[:300]
+            .values('id', 'product', 'quantity', 'return_doc_id', 'return_doc__return_number', 'condition_type')[:300]
         )
         wh_def = list(
-            WarehouseBatch.objects.filter(quality=WarehouseBatch.QUALITY_DEFECT)
+            WarehouseBatch.objects.filter(
+                quality=WarehouseBatch.QUALITY_DEFECT,
+                status=WarehouseBatch.STATUS_AVAILABLE,
+                quantity__gt=0,
+                linked_defect_record__isnull=True,
+            )
             .order_by('-date', '-id')
-            .values('id', 'product', 'quantity')[:200]
+            .values('id', 'product', 'quantity', 'quality', 'status')[:200]
         )
         return Response({
             'return_lines': [
                 {
                     'id': rl['id'],
-                    'label': f"Return #{rl['return_doc_id']} / {rl['product']} × {rl['quantity']}",
+                    'label': (
+                        f"{rl['product']} — возврат {api_decimal_str(Decimal(str(rl['quantity'] or 0)))} шт — "
+                        f"причина: {rl['condition_type']}"
+                    ),
+                    'product': rl['product'],
+                    'quantity_pcs': api_decimal_str(Decimal(str(rl['quantity'] or 0))),
+                    'return_id': rl['return_doc_id'],
+                    'return_number': rl['return_doc__return_number'] or f"RET-{rl['return_doc_id']}",
                 }
                 for rl in lines
             ],
             'warehouse_defect_batches': [
-                {'id': b['id'], 'label': f"#{b['id']} {b['product']} × {b['quantity']}"}
+                {
+                    'id': b['id'],
+                    'label': f"#{b['id']} — {b['product']} — доступно {api_decimal_str(Decimal(str(b['quantity'] or 0)))} шт — Брак",
+                    'product': b['product'],
+                    'available_quantity_pcs': api_decimal_str(Decimal(str(b['quantity'] or 0))),
+                    'quantity_pcs': api_decimal_str(Decimal(str(b['quantity'] or 0))),
+                    'quality': b['quality'],
+                    'status': b['status'],
+                }
                 for b in wh_def
             ],
         })
@@ -1614,6 +1794,12 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from .state_machine import validate_defect_sell
 
         record = self.get_object()
+        if record.status in (
+            DefectRecord.STATUS_SOLD,
+            DefectRecord.STATUS_WRITTEN_OFF,
+            DefectRecord.STATUS_CLOSED,
+        ):
+            return _err('DEFECT_NOT_AVAILABLE', 'Нельзя продать запись брака в финальном статусе.', http_status=422)
         try:
             validate_defect_sell(record)
         except ValueError as e:
@@ -1628,17 +1814,31 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if quantity_raw is None or str(quantity_raw).strip() == '':
             return _err('MISSING_QUANTITY', 'Укажите quantity (> 0, не больше остатка по браку)', http_status=422)
         try:
+            client_pk = int(client_id)
+        except Exception:
+            return _err('MISSING_CLIENT', 'Укажите корректный client_id', http_status=422)
+        client = Client.objects.filter(pk=client_pk).first()
+        if client is None:
+            return _err('MISSING_CLIENT', 'Клиент не найден', http_status=422)
+        if not client.is_active:
+            return _err('INACTIVE_CLIENT', 'Нельзя продавать брак неактивному клиенту.', http_status=422)
+        try:
             price_d = Decimal(str(price))
+        except Exception:
+            return _err('INVALID_PRICE', 'Некорректный price', http_status=422)
+        try:
             qty_d = Decimal(str(quantity_raw))
         except Exception:
-            return _err('INVALID_DECIMAL', 'Некорректные price или quantity', http_status=422)
+            return _err('INVALID_QUANTITY', 'Некорректный quantity', http_status=422)
         if price_d <= 0:
             return _err('INVALID_PRICE', 'price должен быть > 0', http_status=422)
         if qty_d <= 0:
             return _err('INVALID_QUANTITY', 'quantity должен быть > 0', http_status=422)
         avail = Decimal(str(record.quantity_pcs or 0))
+        if avail <= 0:
+            return _err('DEFECT_NOT_AVAILABLE', 'Нет доступного остатка брака для продажи.', http_status=422)
         if qty_d > avail + Decimal('0.0001'):
-            return _err('QTY_TOO_HIGH', f'Нельзя продать больше остатка по браку ({avail})', http_status=422)
+            return _err('QUANTITY_EXCEEDED', f'Нельзя продать больше остатка по браку ({avail})', http_status=422)
         quantity = qty_d
         kg_before_d = Decimal(str(record.quantity_kg)) if record.quantity_kg is not None else None
         comment = request.data.get('comment', '')
@@ -1676,7 +1876,7 @@ class DefectRecordViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     comment=comment or f'Продажа брака #{record.id}',
                     is_defect_sale=True,
                     sale_status=Sale.STATUS_SHIPPED,
-                    client_id=client_id,
+                    client_id=client.pk,
                     warehouse_batch_id=wb_id,
                     stock_form=stock_form,
                     stock_quality=stock_quality,
@@ -1816,8 +2016,12 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from apps.warehouse.models import WarehouseBatch
 
         defects_qs = (
-            DefectRecord.objects.filter(
-                status__in=(DefectRecord.STATUS_ON_STOCK, DefectRecord.STATUS_NEW),
+            DefectRecord.objects.exclude(
+                status__in=(
+                    DefectRecord.STATUS_SOLD,
+                    DefectRecord.STATUS_WRITTEN_OFF,
+                    DefectRecord.STATUS_CLOSED,
+                ),
             )
             .select_related('warehouse_batch')
             .order_by('-created_at', '-id')[:300]
@@ -1827,6 +2031,8 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             pcs = Decimal(str(d.quantity_pcs or 0))
             kg_raw = d.quantity_kg
             kg = Decimal(str(kg_raw)) if kg_raw is not None else Decimal('0')
+            if pcs <= 0 and kg <= 0:
+                continue
             if pcs > 0:
                 qty_part = f'{api_decimal_str(pcs)} шт'
             elif kg > 0:
@@ -1845,6 +2051,9 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 'defect_reason': (d.defect_reason or '').strip(),
                 'source_type': d.source_type,
                 'source_label': defect_record_source_label(d),
+                'display_quantity': api_decimal_str(pcs) if pcs > 0 else api_decimal_str(kg) if kg > 0 else None,
+                'display_quantity_label': qty_part if qty_part != '—' else None,
+                'available_quantity_pcs': api_decimal_str(pcs) if pcs > 0 else None,
                 'status': d.status,
             })
         sales = list(
@@ -1904,18 +2113,32 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         from apps.realtime.broadcast import schedule_push
 
         rework = self.get_object()
+        if rework.status == ReworkRequest.STATUS_COMPLETED:
+            return _err('REWORK_ALREADY_COMPLETED', 'Переделка уже завершена.', http_status=422)
+        if rework.status == ReworkRequest.STATUS_CANCELED:
+            return _err('REWORK_ALREADY_CANCELED', 'Отмененную переделку нельзя завершить.', http_status=422)
+        if rework.status != ReworkRequest.STATUS_IN_PROGRESS:
+            return _err('REWORK_COMPLETE_FORBIDDEN', 'Завершить переделку можно только из статуса in_progress.', http_status=422)
         try:
             validate_rework_complete(rework)
         except ValueError as e:
-            return _err('INVALID_STATUS', str(e), http_status=422)
+            return _err('INVALID_TRANSITION', str(e), http_status=422)
 
         out_raw = request.data.get('output_quantity', request.data.get('output_quantity_kg'))
         loss_raw = request.data.get('loss_quantity', request.data.get('loss_kg'))
-        out_quality = (request.data.get('quality') or WarehouseBatch.QUALITY_GOOD).strip()
+        quality_raw = request.data.get('quality')
+        if quality_raw is None or str(quality_raw).strip() == '':
+            return _err('MISSING_FIELDS', 'Укажите quality.', http_status=422)
+        out_quality = str(quality_raw).strip()
         if out_raw is None or loss_raw is None:
             return _err('MISSING_FIELDS', 'Укажите output_quantity (или output_quantity_kg) и loss_quantity (или loss_kg)')
-        output_pcs = Decimal(str(out_raw))
-        loss_pcs = Decimal(str(loss_raw))
+        try:
+            output_pcs = Decimal(str(out_raw))
+            loss_pcs = Decimal(str(loss_raw))
+        except Exception:
+            return _err('INVALID_QUANTITY', 'Некорректные output_quantity/loss_quantity', http_status=422)
+        if output_pcs < 0 or loss_pcs < 0:
+            return _err('NEGATIVE_QUANTITY', 'output_quantity и loss_quantity должны быть >= 0', http_status=422)
         if out_quality not in (WarehouseBatch.QUALITY_GOOD, WarehouseBatch.QUALITY_DEFECT):
             return _err('INVALID_QUALITY', 'quality: good | defect', http_status=422)
         defect = rework.defect_record
@@ -1990,33 +2213,42 @@ class ReworkRequestViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         """Отменить переделку."""
         from .state_machine import validate_rework_transition
         rework = self.get_object()
+        if rework.status == ReworkRequest.STATUS_COMPLETED:
+            return _err('REWORK_ALREADY_COMPLETED', 'Завершенную переделку нельзя отменить.', http_status=422)
+        if rework.status == ReworkRequest.STATUS_CANCELED:
+            return _err('REWORK_ALREADY_CANCELED', 'Переделка уже отменена.', http_status=422)
+        if rework.status not in (ReworkRequest.STATUS_PENDING, ReworkRequest.STATUS_IN_PROGRESS):
+            return _err('REWORK_CANCEL_FORBIDDEN', 'Отмена переделки разрешена только из pending/in_progress.', http_status=422)
         try:
             validate_rework_transition(rework.status, ReworkRequest.STATUS_CANCELED)
         except ValueError as e:
-            return _err('INVALID_STATUS', str(e), http_status=422)
+            return _err('INVALID_TRANSITION', str(e), http_status=422)
         rpc = Decimal(str(rework.quantity_pcs or 0))
         rkg = Decimal(str(rework.quantity_kg or 0)) if rework.quantity_kg is not None else Decimal('0')
-        with transaction.atomic():
-            rw2 = ReworkRequest.objects.select_for_update().get(pk=rework.pk)
-            rw2.status = ReworkRequest.STATUS_CANCELED
-            rw2.save(update_fields=['status', 'updated_at'])
-            if rw2.defect_record_id and (rpc > 0 or rkg > 0):
-                dr = DefectRecord.objects.select_for_update().get(pk=rw2.defect_record_id)
-                dr.sent_to_rework_quantity_pcs = max(
-                    Decimal('0'),
-                    Decimal(str(dr.sent_to_rework_quantity_pcs or 0)) - rpc,
-                )
-                dr.recompute_remaining_pcs()
-                if dr.quantity_kg is not None and rkg > 0:
-                    dr.quantity_kg = (Decimal(str(dr.quantity_kg or 0)) + rkg).quantize(Decimal('0.0001'))
-                if dr.status == DefectRecord.STATUS_SENT_TO_REWORK:
-                    dr.status = DefectRecord.STATUS_ON_STOCK
-                dr.save(
-                    update_fields=[
-                        'sent_to_rework_quantity_pcs', 'quantity_pcs', 'quantity_kg',
-                        'status', 'updated_at',
-                    ],
-                )
+        try:
+            with transaction.atomic():
+                rw2 = ReworkRequest.objects.select_for_update().get(pk=rework.pk)
+                rw2.status = ReworkRequest.STATUS_CANCELED
+                rw2.save(update_fields=['status', 'updated_at'])
+                if rw2.defect_record_id and (rpc > 0 or rkg > 0):
+                    dr = DefectRecord.objects.select_for_update().get(pk=rw2.defect_record_id)
+                    dr.sent_to_rework_quantity_pcs = max(
+                        Decimal('0'),
+                        Decimal(str(dr.sent_to_rework_quantity_pcs or 0)) - rpc,
+                    )
+                    dr.recompute_remaining_pcs()
+                    if dr.quantity_kg is not None and rkg > 0:
+                        dr.quantity_kg = (Decimal(str(dr.quantity_kg or 0)) + rkg).quantize(Decimal('0.0001'))
+                    if dr.status == DefectRecord.STATUS_SENT_TO_REWORK:
+                        dr.status = DefectRecord.STATUS_ON_STOCK
+                    dr.save(
+                        update_fields=[
+                            'sent_to_rework_quantity_pcs', 'quantity_pcs', 'quantity_kg',
+                            'status', 'updated_at',
+                        ],
+                    )
+        except Exception as e:
+            return _err('WAREHOUSE_ROLLBACK', str(e), http_status=422)
         rework.refresh_from_db()
         return Response(ReworkRequestSerializer(rework).data)
 

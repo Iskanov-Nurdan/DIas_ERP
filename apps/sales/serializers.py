@@ -1381,29 +1381,67 @@ class ReturnLineSerializer(serializers.ModelSerializer):
             'product': {'read_only': True},
         }
 
+    @staticmethod
+    def _raise_return_line_error(code: str, message: str, field: str = 'non_field_errors'):
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'detail': message,
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
+
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as exc:
+            detail = getattr(exc, 'detail', {})
+            if isinstance(detail, dict):
+                if 'return_target' in detail:
+                    self._raise_return_line_error(
+                        'INVALID_RETURN_TARGET',
+                        'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                        field='return_target',
+                    )
+                if 'condition_type' in detail:
+                    self._raise_return_line_error(
+                        'INVALID_CONDITION_TYPE',
+                        'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                        field='condition_type',
+                    )
+            raise
+
     def validate(self, attrs):
         if self.instance and self.instance.return_doc.status == Return.STATUS_COMPLETED:
-            raise serializers.ValidationError(
-                'Строку проведённого возврата нельзя изменять',
+            self._raise_return_line_error(
+                'RETURN_LINE_UPDATE_FORBIDDEN',
+                'Строку проведённого возврата нельзя изменять.',
             )
         sale_line = attrs.get('sale_line')
         if sale_line is None:
-            raise serializers.ValidationError({'sale_line': 'Поле sale_line обязательно'})
+            self._raise_return_line_error('MISSING_SALE_LINE', 'Поле sale_line обязательно.', field='sale_line')
+        qty = attrs.get('quantity')
+        if qty is None:
+            self._raise_return_line_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='quantity')
+        qty_d = Decimal(str(qty))
+        if qty_d <= 0:
+            self._raise_return_line_error('INVALID_QUANTITY', 'quantity должно быть больше 0.', field='quantity')
         if not self.instance:
-            qty = attrs.get('quantity', Decimal('0'))
             total_returned = sum(
                 rl.quantity
                 for rl in ReturnLine.objects.filter(sale_line=sale_line).exclude(
                     return_doc__status=Return.STATUS_CANCELED,
                 )
             )
-            if total_returned + qty > sale_line.quantity:
-                raise serializers.ValidationError({
-                    'quantity': (
-                        f'Нельзя вернуть больше, чем было отгружено по строке '
-                        f'(отгружено: {sale_line.quantity}, уже возвращено: {total_returned})'
-                    )
-                })
+            if total_returned + qty_d > sale_line.quantity:
+                self._raise_return_line_error(
+                    'RETURN_QUANTITY_EXCEEDED',
+                    (
+                        'Нельзя вернуть больше, чем было отгружено по строке '
+                        f'(отгружено: {sale_line.quantity}, уже возвращено: {total_returned}).'
+                    ),
+                    field='quantity',
+                )
         return attrs
 
     def get_sale_line_label(self, obj):
@@ -1434,23 +1472,174 @@ class ReturnSerializer(serializers.ModelSerializer):
             'created_by': {'required': False, 'allow_null': True},
         }
 
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as exc:
+            detail = getattr(exc, 'detail', {})
+            if isinstance(detail, dict):
+                if 'sale' in detail:
+                    self._raise_return_error('MISSING_SALE', 'Поле sale обязательно.', field='sale')
+                if 'lines' in detail:
+                    lines_detail = detail.get('lines')
+                    text = str(lines_detail)
+                    if 'Нельзя вернуть больше' in text:
+                        self._raise_return_error(
+                            'RETURN_QUANTITY_EXCEEDED',
+                            'Нельзя вернуть больше, чем было отгружено по строке продажи.',
+                            field='lines',
+                        )
+                    if 'sale_line' in text:
+                        self._raise_return_error('MISSING_SALE_LINE', 'Поле sale_line обязательно.', field='lines')
+                    if 'quantity' in text:
+                        self._raise_return_error('INVALID_QUANTITY', 'Поле quantity обязательно и должно быть > 0.', field='lines')
+                    if 'return_target' in text:
+                        self._raise_return_error(
+                            'INVALID_RETURN_TARGET',
+                            'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                            field='lines',
+                        )
+                    if 'condition_type' in text:
+                        self._raise_return_error(
+                            'INVALID_CONDITION_TYPE',
+                            'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                            field='lines',
+                        )
+                    self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
+            raise
+
+    @staticmethod
+    def _raise_return_error(code: str, message: str, field: str = 'non_field_errors'):
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'detail': message,
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
+
+    def _validate_line_payload(self, line_data: dict, *, sale: Sale, exclude_return_id: int | None = None) -> dict:
+        payload = dict(line_data or {})
+        sale_line = payload.get('sale_line')
+        if sale_line is None:
+            self._raise_return_error('MISSING_SALE_LINE', 'Поле sale_line обязательно.', field='lines')
+        if not isinstance(sale_line, SaleLine):
+            try:
+                sale_line = SaleLine.objects.get(pk=sale_line)
+            except SaleLine.DoesNotExist:
+                self._raise_return_error('MISSING_SALE_LINE', 'Указанная sale_line не найдена.', field='lines')
+        if sale_line.sale_id != sale.pk:
+            self._raise_return_error(
+                'SALE_LINE_NOT_IN_SALE',
+                'sale_line не принадлежит выбранной sale.',
+                field='lines',
+            )
+
+        qty = payload.get('quantity')
+        if qty in (None, ''):
+            self._raise_return_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='lines')
+        qty_d = Decimal(str(qty))
+        if qty_d <= 0:
+            self._raise_return_error('INVALID_QUANTITY', 'quantity должно быть больше 0.', field='lines')
+
+        total_returned_qs = ReturnLine.objects.filter(sale_line=sale_line).exclude(return_doc__status=Return.STATUS_CANCELED)
+        if exclude_return_id is not None:
+            total_returned_qs = total_returned_qs.exclude(return_doc_id=exclude_return_id)
+        total_returned = sum((Decimal(str(x.quantity or 0)) for x in total_returned_qs), Decimal('0'))
+        if total_returned + qty_d > Decimal(str(sale_line.quantity or 0)):
+            self._raise_return_error(
+                'RETURN_QUANTITY_EXCEEDED',
+                (
+                    'Нельзя вернуть больше, чем было отгружено по строке '
+                    f'(отгружено: {sale_line.quantity}, уже возвращено: {total_returned}).'
+                ),
+                field='lines',
+            )
+
+        rt = payload.get('return_target', ReturnLine.TARGET_WAREHOUSE)
+        ct = payload.get('condition_type', ReturnLine.CONDITION_GOOD)
+        allowed_targets = {x[0] for x in ReturnLine.TARGET_CHOICES}
+        allowed_conditions = {x[0] for x in ReturnLine.CONDITION_CHOICES}
+        if rt not in allowed_targets:
+            self._raise_return_error(
+                'INVALID_RETURN_TARGET',
+                'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                field='lines',
+            )
+        if ct not in allowed_conditions:
+            self._raise_return_error(
+                'INVALID_CONDITION_TYPE',
+                'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                field='lines',
+            )
+
+        payload['sale_line'] = sale_line
+        payload['quantity'] = qty_d
+        payload['product'] = sale_line.product
+        return payload
+
     def get_client_name(self, obj):
         if obj.sale and obj.sale.client:
             return obj.sale.client.name
         return ''
 
     def validate(self, attrs):
-        if not self.instance:
-            lines = (self.initial_data or {}).get('lines')
-            if not lines or not isinstance(lines, list) or len(lines) < 1:
-                raise serializers.ValidationError(
-                    {'lines': 'Нужна минимум одна строка возврата (sale_line)'},
+        initial = self.initial_data or {}
+        is_create = self.instance is None
+
+        if is_create:
+            if 'status' in initial:
+                self._raise_return_error(
+                    'RETURN_STATUS_CREATE_FORBIDDEN',
+                    'При создании статус передавать нельзя. Возврат создается как draft.',
+                    field='status',
                 )
-            st = (self.initial_data or {}).get('status')
-            if st == Return.STATUS_COMPLETED:
-                raise serializers.ValidationError({
-                    'status': 'Создайте возврат как черновик (draft), затем POST /api/returns/{id}/complete/',
-                })
+            if 'sale' not in initial or initial.get('sale') in (None, '', 'null'):
+                self._raise_return_error('MISSING_SALE', 'Поле sale обязательно.', field='sale')
+
+        if not is_create and 'status' in initial:
+            self._raise_return_error(
+                'RETURN_STATUS_UPDATE_FORBIDDEN',
+                'Статус возврата меняется только через complete/cancel.',
+                field='status',
+            )
+
+        sale = attrs.get('sale', self.instance.sale if self.instance else None)
+        if sale is None:
+            self._raise_return_error('MISSING_SALE', 'Поле sale обязательно.', field='sale')
+        if is_create and sale.sale_status not in (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED):
+            self._raise_return_error(
+                'INVALID_SALE_STATUS',
+                'Возврат разрешен только для sale в статусе shipped или closed.',
+                field='sale',
+            )
+
+        if is_create:
+            lines = initial.get('lines')
+            if not lines or not isinstance(lines, list) or len(lines) < 1:
+                self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
+            for line_data in lines:
+                self._validate_line_payload(line_data, sale=sale)
+        else:
+            if self.instance.status == Return.STATUS_CANCELED:
+                self._raise_return_error('RETURN_UPDATE_FORBIDDEN', 'Отмененный возврат нельзя редактировать.', field='status')
+            if self.instance.status == Return.STATUS_COMPLETED:
+                allowed = {'comment', 'return_reason', 'invoice_number'}
+                for key in initial:
+                    if key not in allowed:
+                        self._raise_return_error(
+                            'RETURN_UPDATE_FORBIDDEN',
+                            'У проведенного возврата можно менять только comment, return_reason, invoice_number.',
+                            field=key,
+                        )
+            if self.instance.status == Return.STATUS_DRAFT:
+                lines = initial.get('lines')
+                if lines is not None:
+                    if not isinstance(lines, list) or len(lines) < 1:
+                        self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
+                    base_sale = attrs.get('sale', self.instance.sale)
+                    for line_data in lines:
+                        self._validate_line_payload(line_data, sale=base_sale, exclude_return_id=self.instance.pk)
         return attrs
 
     def create(self, validated_data):
@@ -1471,25 +1660,46 @@ class ReturnSerializer(serializers.ModelSerializer):
         with transaction.atomic():
             ret_doc = super().create(validated_data)
             for line_data in lines_data:
-                sale_line = line_data.get('sale_line')
-                if sale_line is not None:
-                    line_data['product'] = sale_line.product
-                ReturnLine.objects.create(return_doc=ret_doc, **line_data)
+                normalized = self._validate_line_payload(line_data, sale=ret_doc.sale)
+                ReturnLine.objects.create(
+                    return_doc=ret_doc,
+                    sale_line=normalized['sale_line'],
+                    product=normalized['product'],
+                    quantity=normalized['quantity'],
+                    return_target=normalized.get('return_target', ReturnLine.TARGET_WAREHOUSE),
+                    condition_type=normalized.get('condition_type', ReturnLine.CONDITION_GOOD),
+                    comment=normalized.get('comment', '') or '',
+                )
         return ret_doc
 
     def update(self, instance, validated_data):
-        if instance.status == Return.STATUS_CANCELED:
-            raise serializers.ValidationError({'status': 'Отменённый возврат нельзя редактировать'})
+        validated_data.pop('lines', None)
         if instance.status == Return.STATUS_COMPLETED:
-            allowed = {'comment', 'return_reason', 'invoice_number'}
-            initial = self.initial_data or {}
-            for key in initial:
-                if key not in allowed:
-                    raise serializers.ValidationError({
-                        key: 'У проведённого возврата можно менять только comment, return_reason, invoice_number',
-                    })
-            validated_data = {k: v for k, v in validated_data.items() if k in allowed}
+            validated_data = {
+                k: v for k, v in validated_data.items()
+                if k in {'comment', 'return_reason', 'invoice_number'}
+            }
             return super().update(instance, validated_data)
+        if instance.status == Return.STATUS_CANCELED:
+            self._raise_return_error('RETURN_UPDATE_FORBIDDEN', 'Отмененный возврат нельзя редактировать.', field='status')
+        lines_payload = (self.initial_data or {}).get('lines')
+        if lines_payload is not None and instance.status == Return.STATUS_DRAFT:
+            base_sale = validated_data.get('sale', instance.sale)
+            with transaction.atomic():
+                obj = super().update(instance, validated_data)
+                obj.lines.all().delete()
+                for line_data in lines_payload:
+                    normalized = self._validate_line_payload(line_data, sale=base_sale, exclude_return_id=obj.pk)
+                    ReturnLine.objects.create(
+                        return_doc=obj,
+                        sale_line=normalized['sale_line'],
+                        product=normalized['product'],
+                        quantity=normalized['quantity'],
+                        return_target=normalized.get('return_target', ReturnLine.TARGET_WAREHOUSE),
+                        condition_type=normalized.get('condition_type', ReturnLine.CONDITION_GOOD),
+                        comment=normalized.get('comment', '') or '',
+                    )
+                return obj
         return super().update(instance, validated_data)
 
     def apply_completion_effects(self, ret_doc: Return) -> None:
@@ -1588,9 +1798,33 @@ class DefectRecordSerializer(serializers.ModelSerializer):
             'profile': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
             'source_id': {'required': False, 'allow_null': True},
+            'warehouse_batch': {'required': False, 'allow_null': True, 'validators': []},
         }
 
+    @staticmethod
+    def _raise_defect_update_forbidden():
+        message = 'Статус и счётчики брака меняются только через действия.'
+        raise serializers.ValidationError(
+            {
+                'code': 'DEFECT_UPDATE_FORBIDDEN',
+                'detail': message,
+                'errors': [{'field': 'non_field_errors', 'message': message}],
+            },
+        )
+
     def validate(self, attrs):
+        protected_fields = {
+            'quantity_pcs',
+            'available_quantity_pcs',
+            'original_quantity_pcs',
+            'sold_quantity_pcs',
+            'written_off_quantity_pcs',
+            'sent_to_rework_quantity_pcs',
+            'status',
+        }
+        if self.instance is not None and any(f in self.initial_data for f in protected_fields):
+            self._raise_defect_update_forbidden()
+
         status = attrs.get('status', self.instance.status if self.instance else DefectRecord.STATUS_NEW)
         if status == DefectRecord.STATUS_WRITTEN_OFF:
             if not attrs.get('writeoff_reason') and not (self.instance and self.instance.writeoff_reason):
@@ -1612,9 +1846,26 @@ class DefectRecordSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {'warehouse_batch': 'Укажите warehouse_batch или source_id (ID партии/ОТК)'}
                     )
+                batch_id = attrs.get('warehouse_batch').pk if attrs.get('warehouse_batch') else source_id
+                if batch_id and DefectRecord.objects.filter(warehouse_batch_id=batch_id).exists():
+                    raise serializers.ValidationError(
+                        {
+                            'code': 'DEFECT_ALREADY_EXISTS',
+                            'detail': f'Для warehouse_batch #{batch_id} уже есть запись брака.',
+                            'errors': [{'field': 'warehouse_batch', 'message': 'Для партии уже существует DefectRecord.'}],
+                        },
+                    )
             elif source_type == DefectRecord.SOURCE_RETURN:
                 if source_id is None or not ReturnLine.objects.filter(pk=source_id).exists():
                     raise serializers.ValidationError({'source_id': 'ReturnLine с указанным source_id не найден'})
+                if DefectRecord.objects.filter(source_type=DefectRecord.SOURCE_RETURN, source_id=source_id).exists():
+                    raise serializers.ValidationError(
+                        {
+                            'code': 'DEFECT_ALREADY_EXISTS',
+                            'detail': f'Для ReturnLine #{source_id} уже есть запись брака.',
+                            'errors': [{'field': 'source_id', 'message': 'Для return line уже существует DefectRecord.'}],
+                        },
+                    )
             else:
                 if source_id is None:
                     raise serializers.ValidationError({'source_id': 'Поле source_id обязательно при создании (ОТК)'})
@@ -1859,6 +2110,44 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
             last_n = 0
         validated_data['rework_number'] = f'RWK-{year}-{last_n + 1:04d}'
         return super().create(validated_data)
+
+    def validate(self, attrs):
+        if self.instance is None:
+            return attrs
+
+        protected_fields = {'status', 'quantity_pcs', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'result_warehouse_batch'}
+        if any(f in self.initial_data for f in protected_fields):
+            message = 'Переделка меняется только через start/complete/cancel.'
+            raise serializers.ValidationError(
+                {
+                    'code': 'REWORK_UPDATE_FORBIDDEN',
+                    'detail': message,
+                    'errors': [{'field': 'non_field_errors', 'message': message}],
+                },
+            )
+
+        if self.instance.status in (ReworkRequest.STATUS_COMPLETED, ReworkRequest.STATUS_CANCELED):
+            message = 'Переделка меняется только через start/complete/cancel.'
+            raise serializers.ValidationError(
+                {
+                    'code': 'REWORK_UPDATE_FORBIDDEN',
+                    'detail': message,
+                    'errors': [{'field': 'status', 'message': message}],
+                },
+            )
+
+        allowed = {'comment'}
+        unknown_updates = [k for k in self.initial_data.keys() if k not in allowed]
+        if unknown_updates:
+            message = 'Переделка меняется только через start/complete/cancel.'
+            raise serializers.ValidationError(
+                {
+                    'code': 'REWORK_UPDATE_FORBIDDEN',
+                    'detail': message,
+                    'errors': [{'field': k, 'message': message} for k in unknown_updates],
+                },
+            )
+        return attrs
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
