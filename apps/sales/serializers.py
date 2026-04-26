@@ -138,6 +138,7 @@ class OrderLineSerializer(serializers.ModelSerializer):
             'remaining_to_reserve', 'line_total',
         )
         extra_kwargs = {
+            'product': {'required': False, 'allow_blank': True},
             'profile': {'required': False, 'allow_null': True},
         }
 
@@ -221,13 +222,150 @@ class OrderSerializer(serializers.ModelSerializer):
         from .payment_status import order_payment_metrics
         return api_decimal_str(order_payment_metrics(obj)['refund_amount'])
 
+    @staticmethod
+    def _raise_order_error(code: str, message: str, field: str = 'non_field_errors'):
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'detail': message,
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
+
+    @staticmethod
+    def _validate_order_line_payload(line_data: dict, existing_line: OrderLine | None = None) -> dict:
+        payload = dict(line_data)
+        raw_product = payload.get('product', None)
+        if (raw_product is None or not str(raw_product).strip()) and existing_line is not None:
+            product = existing_line.product
+        else:
+            product = raw_product or ''
+        raw_profile = payload.get('profile', None)
+        if raw_profile is None and existing_line is not None:
+            profile = existing_line.profile
+        else:
+            profile = raw_profile
+        if not (str(product or '').strip()) and profile is None:
+            OrderSerializer._raise_order_error(
+                'PRODUCT_OR_PROFILE_REQUIRED',
+                'Укажите product или profile в строке заявки.',
+                field='lines',
+            )
+
+        ordered = payload.get(
+            'ordered_quantity',
+            existing_line.ordered_quantity if existing_line else None,
+        )
+        if ordered is None:
+            OrderSerializer._raise_order_error(
+                'ORDERED_QUANTITY_REQUIRED',
+                'Поле ordered_quantity обязательно.',
+                field='lines',
+            )
+        ordered_d = Decimal(str(ordered))
+        if ordered_d <= 0:
+            OrderSerializer._raise_order_error(
+                'ORDERED_QUANTITY_INVALID',
+                'ordered_quantity должно быть больше 0.',
+                field='lines',
+            )
+
+        if existing_line is not None:
+            shipped_d = Decimal(str(existing_line.shipped_quantity or 0))
+            if ordered_d < shipped_d:
+                OrderSerializer._raise_order_error(
+                    'ORDERED_QUANTITY_LT_SHIPPED',
+                    f'ordered_quantity не может быть меньше уже проданного количества ({shipped_d}).',
+                    field='lines',
+                )
+
+        unit_price = payload.get('unit_price', existing_line.unit_price if existing_line else None)
+        if unit_price is None or unit_price == '':
+            payload['unit_price'] = Decimal('0')
+        else:
+            unit_price_d = Decimal(str(unit_price))
+            if unit_price_d < 0:
+                OrderSerializer._raise_order_error(
+                    'UNIT_PRICE_NEGATIVE',
+                    'unit_price не может быть отрицательной.',
+                    field='lines',
+                )
+
+        return payload
+
+    def validate(self, attrs):
+        if self.instance is None:
+            client = attrs.get('client')
+            if client is None:
+                self._raise_order_error(
+                    'MISSING_CLIENT',
+                    'Поле client обязательно для создания заявки.',
+                    field='client',
+                )
+            if client and not client.is_active:
+                self._raise_order_error(
+                    'INACTIVE_CLIENT',
+                    'Клиент неактивен. Создание заявки запрещено.',
+                    field='client',
+                )
+            lines = (self.initial_data or {}).get('lines')
+            if not isinstance(lines, list) or len(lines) < 1:
+                self._raise_order_error(
+                    'MISSING_LINES',
+                    'Нужна минимум одна строка заявки.',
+                    field='lines',
+                )
+            for line in lines:
+                self._validate_order_line_payload(line)
+            return attrs
+
+        if 'status' in (self.initial_data or {}) or 'status' in attrs:
+            self._raise_order_error(
+                'STATUS_UPDATE_FORBIDDEN',
+                'Статус заявки меняется только через /status/.',
+                field='status',
+            )
+
+        if self.instance.status in (Order.STATUS_CLOSED, Order.STATUS_CANCELED):
+            self._raise_order_error(
+                'ORDER_UPDATE_FORBIDDEN',
+                f'Редактирование заявки в статусе "{self.instance.status}" запрещено.',
+            )
+
+        if 'lines' in (self.initial_data or {}):
+            if self.instance.status in (
+                Order.STATUS_PARTIALLY_SHIPPED,
+                Order.STATUS_SHIPPED,
+                Order.STATUS_CLOSED,
+                Order.STATUS_CANCELED,
+            ):
+                self._raise_order_error(
+                    'ORDER_LINES_UPDATE_FORBIDDEN',
+                    f'Изменение строк заявки в статусе "{self.instance.status}" запрещено.',
+                    field='lines',
+                )
+            active_sales = self.instance.sales.exclude(
+                sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED),
+            )
+            if active_sales.exists():
+                self._raise_order_error(
+                    'ORDER_LINES_UPDATE_FORBIDDEN',
+                    'Нельзя менять строки заявки: есть активные продажи.',
+                    field='lines',
+                )
+            if SaleLine.objects.filter(order_line__order=self.instance).exists():
+                self._raise_order_error(
+                    'ORDER_LINES_UPDATE_FORBIDDEN',
+                    'Нельзя менять строки заявки: есть связанные строки продажи.',
+                    field='lines',
+                )
+
+        return attrs
+
     def create(self, validated_data):
         lines_data = validated_data.pop('lines', [])
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
-
-        if validated_data.get('client') and not validated_data['client'].is_active:
-            raise serializers.ValidationError({'client': 'Клиент неактивен. Создание заявки запрещено.'})
 
         # Автогенерация номера
         year = (validated_data.get('date') or timezone.now().date()).year
@@ -241,7 +379,8 @@ class OrderSerializer(serializers.ModelSerializer):
         with transaction.atomic():
             order = super().create(validated_data)
             for line_data in lines_data:
-                OrderLine.objects.create(order=order, **line_data)
+                normalized = self._validate_order_line_payload(line_data)
+                OrderLine.objects.create(order=order, **normalized)
         return order
 
     def update(self, instance, validated_data):
@@ -254,9 +393,19 @@ class OrderSerializer(serializers.ModelSerializer):
                 for line_data in lines_data:
                     line_id = line_data.pop('id', None)
                     if line_id and line_id in existing_ids:
-                        OrderLine.objects.filter(pk=line_id).update(**line_data)
+                        line = OrderLine.objects.get(pk=line_id, order=instance)
+                        has_returns = ReturnLine.objects.filter(sale_line__order_line=line).exists()
+                        if line.sale_lines.exists() or line.reservations.exists() or has_returns:
+                            self._raise_order_error(
+                                'ORDER_LINE_LOCKED',
+                                f'Нельзя изменить строку #{line.pk}: по ней уже есть продажа/резерв/возврат.',
+                                field='lines',
+                            )
+                        normalized = self._validate_order_line_payload(line_data, existing_line=line)
+                        OrderLine.objects.filter(pk=line_id).update(**normalized)
                     else:
-                        OrderLine.objects.create(order=instance, **line_data)
+                        normalized = self._validate_order_line_payload(line_data)
+                        OrderLine.objects.create(order=instance, **normalized)
         return instance
 
 

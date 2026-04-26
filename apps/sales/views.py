@@ -11,6 +11,7 @@ from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from apps.activity.mixins import ActivityLoggingMixin
 from config.api_numbers import api_decimal_str
@@ -81,9 +82,16 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return (
             Client.objects.annotate(
-                sales_count=Count('sales', distinct=False),
+                sales_count=Count(
+                    'sales',
+                    distinct=False,
+                    filter=~Q(sales__sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED)),
+                ),
                 sales_total=Coalesce(
-                    Sum('sales__revenue'),
+                    Sum(
+                        'sales__revenue',
+                        filter=~Q(sales__sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED)),
+                    ),
                     Value(Decimal('0')),
                     output_field=DecimalField(max_digits=20, decimal_places=2),
                 ),
@@ -115,6 +123,9 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         orders = Order.objects.filter(client=client).prefetch_related('lines', 'payments').order_by('-date')
         sales = Sale.objects.filter(client=client).order_by('-date')
+        sales_for_aggregates = sales.exclude(
+            sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED),
+        )
         payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE).order_by('-date')
         returns = Return.objects.filter(sale__client=client).order_by('-date')
 
@@ -130,7 +141,7 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             if p.payment_type == Payment.TYPE_REFUND
         )
         net_paid = total_paid - total_refunded
-        total_revenue = sum((s.revenue or Decimal('0')) for s in sales)
+        total_revenue = sum((s.revenue or Decimal('0')) for s in sales_for_aggregates)
 
         # Долг или аванс
         if net_paid < total_revenue:
@@ -141,8 +152,8 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             client_advance_amount = net_paid - total_revenue
 
         # Прибыль по клиенту
-        total_cost = sum((s.cost or Decimal('0')) for s in sales if not s.is_defect_sale)
-        defect_revenue = sum((s.revenue or Decimal('0')) for s in sales if s.is_defect_sale)
+        total_cost = sum((s.cost or Decimal('0')) for s in sales_for_aggregates if not s.is_defect_sale)
+        defect_revenue = sum((s.revenue or Decimal('0')) for s in sales_for_aggregates if s.is_defect_sale)
         total_profit = total_revenue - total_cost
 
         # Неотгруженные товары
@@ -1951,12 +1962,27 @@ class OrderReservationViewSet(viewsets.ReadOnlyModelViewSet):
 
 class ClientFinancialSummaryView(viewsets.ViewSet):
     """
-    GET /api/clients/{client_id}/financial-summary/
+    Канонический endpoint:
+    GET /api/client-financial-summary/?client_id=<id>
+
     Полная финансовая сводка по клиенту.
     """
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'clients'
 
+    @extend_schema(
+        summary='Финансовая сводка клиента',
+        description='Канонический endpoint: GET /api/client-financial-summary/?client_id=<id>',
+        parameters=[
+            OpenApiParameter(
+                name='client_id',
+                type=int,
+                required=True,
+                location=OpenApiParameter.QUERY,
+                description='ID клиента',
+            ),
+        ],
+    )
     def list(self, request):
         from config.api_numbers import api_decimal_str
         from .credit_check import check_credit_limit
@@ -1973,7 +1999,9 @@ class ClientFinancialSummaryView(viewsets.ViewSet):
         except Client.DoesNotExist:
             return _err('NOT_FOUND', 'Клиент не найден', http_status=404)
 
-        sales = Sale.objects.filter(client=client).exclude(sale_status=Sale.STATUS_CANCELED)
+        sales = Sale.objects.filter(client=client).exclude(
+            sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED),
+        )
         payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE)
 
         total_revenue = sales.aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t'] or Decimal('0')
