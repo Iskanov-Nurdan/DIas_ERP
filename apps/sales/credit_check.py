@@ -47,7 +47,7 @@ def compute_client_debt(client) -> Decimal:
         .aggregate(t=Coalesce(Sum('revenue'), Decimal('0')))['t']
     ) or Decimal('0')
 
-    payments_qs = Payment.objects.filter(client=client)
+    payments_qs = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE)
     total_incoming = (
         payments_qs.filter(
             payment_type__in=[Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE]

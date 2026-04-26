@@ -153,7 +153,7 @@ class ClientsApiContractTests(APITestCase):
             format='json',
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'validation_error')
+        self.assertIn(resp.data.get('code'), ('validation_error', 'INACTIVE_CLIENT'))
         self.assertTrue(any(e.get('field') == 'client' for e in resp.data.get('errors', [])))
 
     def test_inactive_client_blocked_for_new_payment(self):
@@ -164,7 +164,7 @@ class ClientsApiContractTests(APITestCase):
             format='json',
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'validation_error')
+        self.assertIn(resp.data.get('code'), ('validation_error', 'INACTIVE_CLIENT'))
         self.assertTrue(any(e.get('field') == 'client' for e in resp.data.get('errors', [])))
 
     def test_inactive_client_can_have_return_for_old_sale(self):

@@ -613,6 +613,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='select-sources')
     def select_sources(self, request):
         from apps.warehouse.models import WarehouseBatch
+        from .reservations import get_available_quantity
 
         clients = list(
             Client.objects.filter(is_active=True)
@@ -623,26 +624,78 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         client_id = request.query_params.get('client_id')
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
-        orders = list(orders_qs.values('id', 'order_number')[:200])
+        orders = list(orders_qs.select_related('client')[:200])
+        order_id = request.query_params.get('order_id')
+        order_lines = []
+        if order_id:
+            lines_qs = OrderLine.objects.filter(order_id=order_id).order_by('id')[:300]
+            order_lines = [
+                {
+                    'id': line.id,
+                    'label': (
+                        f"{line.product} — заказано {api_decimal_str(line.ordered_quantity)} — "
+                        f"продано {api_decimal_str(line.shipped_quantity)} — "
+                        f"осталось {api_decimal_str(line.remaining_quantity)}"
+                    ),
+                    'product': line.product,
+                    'ordered_quantity': api_decimal_str(line.ordered_quantity),
+                    'shipped_quantity': api_decimal_str(line.shipped_quantity),
+                    'remaining_quantity': api_decimal_str(line.remaining_quantity),
+                    'unit_price': api_decimal_str(line.unit_price or Decimal('0')),
+                }
+                for line in lines_qs
+            ]
         wb_qs = (
             WarehouseBatch.objects.filter(
                 status=WarehouseBatch.STATUS_AVAILABLE,
                 quality=WarehouseBatch.QUALITY_GOOD,
             )
             .order_by('-date', '-id')
-            .values('id', 'product', 'quantity')
+            [:300]
         )
-        warehouse_batches = list(wb_qs[:300])
+        warehouse_batches = []
+        quality_labels = {
+            WarehouseBatch.QUALITY_GOOD: 'Годный',
+            WarehouseBatch.QUALITY_DEFECT: 'Брак',
+        }
+        inventory_labels = {
+            WarehouseBatch.INVENTORY_PACKED: 'Упаковано',
+            WarehouseBatch.INVENTORY_OPEN_PACKAGE: 'Открытая упаковка',
+            WarehouseBatch.INVENTORY_UNPACKED: 'Неупаковано',
+        }
+        for b in wb_qs:
+            available_qty = Decimal(str(get_available_quantity(b.pk)))
+            if available_qty <= 0:
+                continue
+            warehouse_batches.append(
+                {
+                    'id': b.pk,
+                    'label': (
+                        f"#{b.pk} — {b.product} — свободно {api_decimal_str(available_qty)} шт — "
+                        f"{quality_labels.get(b.quality, b.quality)} — "
+                        f"{inventory_labels.get(b.inventory_form, b.inventory_form)}"
+                    ),
+                    'product': b.product,
+                    'available_quantity': api_decimal_str(available_qty),
+                    'quality': b.quality,
+                    'status': b.status,
+                    'inventory_form': b.inventory_form,
+                },
+            )
         return Response({
             'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
-            'orders': [{'id': o['id'], 'label': o['order_number']} for o in orders],
-            'warehouse_batches': [
+            'orders': [
                 {
-                    'id': b['id'],
-                    'label': f"#{b['id']} {b['product']} ({b['quantity']})",
+                    'id': o.id,
+                    'label': (
+                        f"{o.order_number} — {(o.client.name if o.client_id else '—')} — "
+                        f"осталось {api_decimal_str(o.remaining_amount)}"
+                    ),
                 }
-                for b in warehouse_batches
+                for o in orders
             ],
+            'order_lines': order_lines,
+            'warehouse_batches': warehouse_batches,
         })
 
     @staticmethod
@@ -761,8 +814,11 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         except ValueError as e:
             return _err('INVALID_TRANSITION', str(e), http_status=422)
         with transaction.atomic():
-            reverse_warehouse_for_sale(sale)
-            restore_reservations_for_sale(sale, user=request.user, request=request)
+            try:
+                reverse_warehouse_for_sale(sale)
+            except Exception as e:
+                return _err('WAREHOUSE_ROLLBACK', str(e), http_status=422)
+            restore_reservations_for_sale(sale=sale, user=request.user, request=request)
             sale.sale_status = Sale.STATUS_CANCELED
             sale.save(update_fields=['sale_status', 'updated_at'])
         if sale.linked_order_id:
@@ -896,7 +952,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
-    queryset = Payment.objects.select_related('client', 'linked_order', 'linked_sale', 'created_by').all()
+    queryset = Payment.objects.select_related('client', 'linked_order', 'linked_sale', 'linked_return', 'created_by').all()
     serializer_class = PaymentSerializer
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'payments'
@@ -915,7 +971,7 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def cancel_payment(self, request, pk=None):
         p = self.get_object()
         if p.status == Payment.STATUS_CANCELED:
-            return _err('ALREADY_CANCELED', 'Оплата уже отменена', http_status=422)
+            return _err('PAYMENT_ALREADY_CANCELED', 'Оплата уже отменена', http_status=422)
         p.status = Payment.STATUS_CANCELED
         p.save(update_fields=['status'])
         from .commercial_audit import log_commercial_audit
@@ -943,6 +999,92 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             extra={'client_id': inst.client_id, 'payment_type': inst.payment_type},
         ))
 
+    @action(detail=False, methods=['get'], url_path='select-sources')
+    def select_sources(self, request):
+        client_id = request.query_params.get('client_id')
+        sale_id = request.query_params.get('sale_id')
+        order_id = request.query_params.get('order_id')
+        return_id = request.query_params.get('return_id')
+
+        from .payment_status import order_payment_metrics, sale_payment_metrics
+
+        clients_qs = Client.objects.filter(is_active=True).order_by('name', 'id')
+        if client_id:
+            clients_qs = clients_qs.filter(pk=client_id)
+        clients = [{'id': c.id, 'label': c.name} for c in clients_qs[:200]]
+
+        orders_qs = Order.objects.select_related('client').order_by('-date', '-id')
+        sales_qs = Sale.objects.select_related('client').order_by('-date', '-id')
+        returns_qs = Return.objects.select_related('sale', 'sale__client').filter(status=Return.STATUS_COMPLETED).order_by('-date', '-id')
+
+        if client_id:
+            orders_qs = orders_qs.filter(client_id=client_id)
+            sales_qs = sales_qs.filter(client_id=client_id)
+            returns_qs = returns_qs.filter(sale__client_id=client_id)
+        if order_id:
+            orders_qs = orders_qs.filter(pk=order_id)
+        if sale_id:
+            sales_qs = sales_qs.filter(pk=sale_id)
+            returns_qs = returns_qs.filter(sale_id=sale_id)
+        if return_id:
+            returns_qs = returns_qs.filter(pk=return_id)
+
+        orders_payload = []
+        for order in orders_qs[:200]:
+            m = order_payment_metrics(order)
+            debt = api_decimal_str(m['debt_amount'])
+            orders_payload.append(
+                {
+                    'id': order.id,
+                    'label': f'{order.order_number} — долг {debt}',
+                    'client': order.client_id,
+                    'debt_amount': debt,
+                    'payment_status': m['payment_status'],
+                    'status': order.status,
+                },
+            )
+
+        sales_payload = []
+        for sale in sales_qs[:200]:
+            m = sale_payment_metrics(sale)
+            debt = api_decimal_str(m['debt_amount'])
+            sales_payload.append(
+                {
+                    'id': sale.id,
+                    'label': f'{sale.sale_number or sale.order_number} — долг {debt}',
+                    'client': sale.client_id,
+                    'debt_amount': debt,
+                    'payment_status': m['payment_status'],
+                    'sale_status': sale.sale_status,
+                },
+            )
+
+        returns_payload = []
+        for ret in returns_qs[:200]:
+            amount = Decimal('0')
+            for line in ret.lines.select_related('sale_line').all():
+                unit_price = Decimal(str(line.sale_line.unit_price or 0)) if line.sale_line_id else Decimal('0')
+                amount += Decimal(str(line.quantity or 0)) * unit_price
+            amount_str = api_decimal_str(amount)
+            returns_payload.append(
+                {
+                    'id': ret.id,
+                    'label': f'{ret.return_number or f"RET-{ret.id}"} — к возврату {amount_str}',
+                    'client': ret.sale.client_id if ret.sale_id else None,
+                    'return_amount': amount_str,
+                    'status': ret.status,
+                },
+            )
+
+        return Response(
+            {
+                'clients': clients,
+                'orders': orders_payload,
+                'sales': sales_payload,
+                'returns': returns_payload,
+            },
+        )
+
     @action(detail=False, methods=['get'], url_path='summary')
     def summary(self, request):
         """Сводка оплат по клиенту."""
@@ -955,7 +1097,7 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             return _err('NOT_FOUND', 'Клиент не найден', http_status=404)
 
         payments = Payment.objects.filter(client=client, status=Payment.STATUS_ACTIVE)
-        sales = Sale.objects.filter(client=client)
+        sales = Sale.objects.filter(client=client).exclude(sale_status__in=(Sale.STATUS_DRAFT, Sale.STATUS_CANCELED))
 
         total_paid = payments.filter(
             payment_type__in=[Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE]

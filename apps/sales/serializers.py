@@ -3,6 +3,7 @@ from typing import Optional
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError as DrfValidationError
@@ -435,42 +436,204 @@ class PaymentSerializer(serializers.ModelSerializer):
             'created_by': {'required': False, 'allow_null': True},
         }
 
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as exc:
+            detail = getattr(exc, 'detail', {})
+            if isinstance(detail, dict):
+                if 'payment_type' in detail:
+                    self._raise_payment_error(
+                        'INVALID_PAYMENT_TYPE',
+                        'Некорректный payment_type. Допустимо: prepayment/payment/surcharge/refund.',
+                        field='payment_type',
+                    )
+                if 'payment_method' in detail:
+                    self._raise_payment_error(
+                        'INVALID_PAYMENT_METHOD',
+                        'Некорректный payment_method. Допустимо: cash/transfer/card/other.',
+                        field='payment_method',
+                    )
+            raise
+
+    @staticmethod
+    def _raise_payment_error(code: str, message: str, field: str = 'non_field_errors'):
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'detail': message,
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
+
     def validate_amount(self, v):
-        if v is None:
-            raise serializers.ValidationError('Сумма обязательна')
-        if v < 0:
-            raise serializers.ValidationError('Сумма не может быть отрицательной')
         return v
 
     def validate(self, attrs):
+        initial = self.initial_data or {}
+        is_create = self.instance is None
+        if not is_create:
+            frozen_in_update = ('amount', 'client', 'linked_sale', 'linked_order', 'linked_return', 'payment_type', 'status')
+            for key in frozen_in_update:
+                if key in initial:
+                    if key == 'status':
+                        self._raise_payment_error(
+                            'PAYMENT_STATUS_UPDATE_FORBIDDEN',
+                            'Статус оплаты меняется только через /cancel/.',
+                            field='status',
+                        )
+                    self._raise_payment_error(
+                        'PAYMENT_STATUS_UPDATE_FORBIDDEN',
+                        (
+                            f'После создания поле "{key}" нельзя менять; '
+                            'отмена записи — только POST/PATCH /api/payments/{id}/cancel/.'
+                        ),
+                        field=key,
+                    )
+        if 'status' in initial:
+            self._raise_payment_error(
+                'PAYMENT_STATUS_UPDATE_FORBIDDEN',
+                'Статус оплаты меняется только через /cancel/.',
+                field='status',
+            )
+
+        if is_create and ('client' not in initial or initial.get('client') in (None, '', 'null')):
+            self._raise_payment_error('MISSING_CLIENT', 'Поле client обязательно.', field='client')
         client = attrs.get('client', getattr(self.instance, 'client', None) if self.instance else None)
+        if client is None:
+            self._raise_payment_error('MISSING_CLIENT', 'Поле client обязательно.', field='client')
+        if is_create and not client.is_active:
+            self._raise_payment_error(
+                'INACTIVE_CLIENT',
+                'Клиент неактивен. Создание оплаты запрещено.',
+                field='client',
+            )
+
+        ptype = attrs.get('payment_type', getattr(self.instance, 'payment_type', None) if self.instance else None)
+        if is_create and ('payment_type' not in initial or initial.get('payment_type') in (None, '')):
+            self._raise_payment_error('INVALID_PAYMENT_TYPE', 'Поле payment_type обязательно.', field='payment_type')
+        valid_types = {x[0] for x in Payment.TYPE_CHOICES}
+        if ptype not in valid_types:
+            self._raise_payment_error(
+                'INVALID_PAYMENT_TYPE',
+                'Некорректный payment_type. Допустимо: prepayment/payment/surcharge/refund.',
+                field='payment_type',
+            )
+
+        pmethod = attrs.get('payment_method', getattr(self.instance, 'payment_method', None) if self.instance else None)
+        if is_create and ('payment_method' not in initial or initial.get('payment_method') in (None, '')):
+            self._raise_payment_error('INVALID_PAYMENT_METHOD', 'Поле payment_method обязательно.', field='payment_method')
+        valid_methods = {x[0] for x in Payment.METHOD_CHOICES}
+        if pmethod not in valid_methods:
+            self._raise_payment_error(
+                'INVALID_PAYMENT_METHOD',
+                'Некорректный payment_method. Допустимо: cash/transfer/card/other.',
+                field='payment_method',
+            )
+
+        amount_value = attrs.get('amount', getattr(self.instance, 'amount', None) if self.instance else None)
+        if amount_value is None:
+            self._raise_payment_error('INVALID_AMOUNT', 'Сумма обязательна.', field='amount')
+        if Decimal(str(amount_value)) <= 0:
+            self._raise_payment_error('INVALID_AMOUNT', 'Сумма должна быть больше 0.', field='amount')
+
         lo = attrs.get('linked_order', getattr(self.instance, 'linked_order', None) if self.instance else None)
         ls = attrs.get('linked_sale', getattr(self.instance, 'linked_sale', None) if self.instance else None)
-        if lo is not None and client is not None and lo.client_id and lo.client_id != client.pk:
-            raise serializers.ValidationError({'linked_order': 'Заявка привязана к другому клиенту, чем оплата.'})
-        if ls is not None and client is not None and ls.client_id and ls.client_id != client.pk:
-            raise serializers.ValidationError({'linked_sale': 'Продажа привязана к другому клиенту, чем оплата.'})
         lr = attrs.get('linked_return', getattr(self.instance, 'linked_return', None) if self.instance else None)
-        ptype = attrs.get('payment_type')
-        if ptype is None and self.instance is not None:
-            ptype = self.instance.payment_type
-        if ptype is None:
-            ptype = Payment.TYPE_PAYMENT
-        if ptype == Payment.TYPE_REFUND:
-            mrr = (attrs.get('manual_refund_reason') or '').strip() or (self.instance and (self.instance.manual_refund_reason or '').strip() if self.instance else '')
-            if lr is None and not mrr:
-                raise serializers.ValidationError(
-                    {'linked_return': 'Для refund укажите linked_return либо manual_refund_reason (ручной возврат).'},
+
+        if lo is not None and lo.client_id and lo.client_id != client.pk:
+            self._raise_payment_error('CLIENT_MISMATCH', 'Заявка привязана к другому клиенту.', field='linked_order')
+        if ls is not None and ls.client_id and ls.client_id != client.pk:
+            self._raise_payment_error('CLIENT_MISMATCH', 'Продажа привязана к другому клиенту.', field='linked_sale')
+        if lr is not None and lr.sale and lr.sale.client_id and lr.sale.client_id != client.pk:
+            self._raise_payment_error('CLIENT_MISMATCH', 'Возврат относится к другому клиенту.', field='linked_return')
+
+        if ptype == Payment.TYPE_PREPAYMENT:
+            if lo is None:
+                self._raise_payment_error(
+                    'MISSING_LINKED_ENTITY',
+                    'Для prepayment обязательно поле linked_order.',
+                    field='linked_order',
                 )
-            if lr is not None and client is not None and lr.sale and lr.sale.client_id and lr.sale.client_id != client.pk:
-                raise serializers.ValidationError({'linked_return': 'Возврат относится к другому клиенту.'})
-        if self.instance is None and client and not client.is_active:
-            raise serializers.ValidationError({'client': 'Клиент неактивен. Создание оплаты запрещено.'})
+            if lo.status in (Order.STATUS_CANCELED, Order.STATUS_CLOSED):
+                self._raise_payment_error(
+                    'MISSING_LINKED_ENTITY',
+                    'Нельзя делать prepayment по canceled/closed заявке.',
+                    field='linked_order',
+                )
+
+        if ptype in (Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE):
+            if lo is None and ls is None:
+                self._raise_payment_error(
+                    'MISSING_LINKED_ENTITY',
+                    'Для payment/surcharge укажите linked_sale или linked_order.',
+                    field='linked_sale',
+                )
+            if lo is not None and lo.status == Order.STATUS_CANCELED:
+                self._raise_payment_error(
+                    'MISSING_LINKED_ENTITY',
+                    'Нельзя проводить payment/surcharge по canceled заявке.',
+                    field='linked_order',
+                )
+            if ls is not None and ls.sale_status == Sale.STATUS_CANCELED:
+                self._raise_payment_error(
+                    'MISSING_LINKED_ENTITY',
+                    'Нельзя проводить payment/surcharge по canceled продаже.',
+                    field='linked_sale',
+                )
+
+        if ptype == Payment.TYPE_REFUND:
+            mrr = (attrs.get('manual_refund_reason') or '').strip() or (
+                self.instance and (self.instance.manual_refund_reason or '').strip() if self.instance else ''
+            )
+            if lr is None and not mrr:
+                self._raise_payment_error(
+                    'REFUND_RETURN_REQUIRED',
+                    'Для refund укажите linked_return либо manual_refund_reason (ручной возврат).',
+                    field='linked_return',
+                )
+            if lr is None and 'manual_refund_reason' in initial and not str(initial.get('manual_refund_reason') or '').strip():
+                self._raise_payment_error(
+                    'REFUND_REASON_REQUIRED',
+                    'Для ручного refund поле manual_refund_reason обязательно.',
+                    field='manual_refund_reason',
+                )
+            if lr is not None:
+                if lr.status != Return.STATUS_COMPLETED:
+                    self._raise_payment_error(
+                        'REFUND_RETURN_NOT_COMPLETED',
+                        'Refund разрешен только для return в статусе completed.',
+                        field='linked_return',
+                    )
+                return_total = Decimal('0')
+                for rl in lr.lines.select_related('sale_line').all():
+                    unit_price = Decimal(str(rl.sale_line.unit_price or 0)) if rl.sale_line_id else Decimal('0')
+                    qty = Decimal(str(rl.quantity or 0))
+                    return_total += (unit_price * qty)
+                active_refunds_qs = Payment.objects.filter(
+                    linked_return=lr,
+                    payment_type=Payment.TYPE_REFUND,
+                    status=Payment.STATUS_ACTIVE,
+                )
+                if self.instance is not None:
+                    active_refunds_qs = active_refunds_qs.exclude(pk=self.instance.pk)
+                already_refunded = active_refunds_qs.aggregate(s=Sum('amount'))['s'] or Decimal('0')
+                requested = Decimal(str(attrs.get('amount', self.instance.amount if self.instance else 0)))
+                available = max(Decimal('0'), return_total - Decimal(str(already_refunded)))
+                if requested > available:
+                    self._raise_payment_error(
+                        'REFUND_AMOUNT_EXCEEDED',
+                        f'Сумма refund превышает доступный лимит ({api_decimal_str(available)}).',
+                        field='amount',
+                    )
+
         return attrs
 
     def create(self, validated_data):
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
+        validated_data.pop('status', None)
+        validated_data['status'] = Payment.STATUS_ACTIVE
         if not validated_data.get('payment_number'):
             year = (validated_data.get('date') or timezone.now().date()).year
             last = Payment.objects.filter(payment_number__startswith=f'PAY-{year}-').order_by('-payment_number').first()
@@ -488,16 +651,24 @@ class PaymentSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         if instance.status == Payment.STATUS_CANCELED:
-            raise serializers.ValidationError({'status': 'Отменённую оплату нельзя редактировать'})
-        frozen = ('amount', 'client', 'linked_sale', 'linked_order', 'linked_return', 'payment_type')
+            self._raise_payment_error('PAYMENT_ALREADY_CANCELED', 'Отмененную оплату нельзя редактировать.', field='status')
+        frozen = ('amount', 'client', 'linked_sale', 'linked_order', 'linked_return', 'payment_type', 'status')
         for key in frozen:
             if key in validated_data:
-                raise serializers.ValidationError({
-                    key: (
-                        'После создания это поле нельзя менять; '
-                        'отмена записи — только POST /api/payments/{id}/cancel/'
+                if key == 'status':
+                    self._raise_payment_error(
+                        'PAYMENT_STATUS_UPDATE_FORBIDDEN',
+                        'Статус оплаты меняется только через /cancel/.',
+                        field='status',
+                    )
+                self._raise_payment_error(
+                    'PAYMENT_STATUS_UPDATE_FORBIDDEN',
+                    (
+                        f'После создания поле "{key}" нельзя менять; '
+                        'отмена записи — только POST/PATCH /api/payments/{id}/cancel/.'
                     ),
-                })
+                    field=key,
+                )
         return super().update(instance, validated_data)
 
 
@@ -538,6 +709,8 @@ class SaleSerializer(serializers.ModelSerializer):
     warehouse_batch = serializers.PrimaryKeyRelatedField(
         queryset=WarehouseBatch.objects.all(), required=False, allow_null=True,
     )
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=4, required=False, allow_null=True)
+    price = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, allow_null=True)
     warehouse_batch_id = serializers.IntegerField(read_only=True)
     sale_unit = serializers.CharField(required=False, allow_blank=True, max_length=50, default='')
     packaging = serializers.CharField(required=False, allow_blank=True, max_length=50, default='')
@@ -626,18 +799,234 @@ class SaleSerializer(serializers.ModelSerializer):
     def to_internal_value(self, data):
         return super().to_internal_value(data)
 
+    @staticmethod
+    def _raise_sale_error(code: str, message: str, field: str = 'non_field_errors'):
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'detail': message,
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
+
+    @staticmethod
+    def _is_shipping_target(status_value: str) -> bool:
+        return status_value in (
+            Sale.STATUS_PARTIALLY_SHIPPED,
+            Sale.STATUS_SHIPPED,
+        )
+
+    def _validate_sale_line_payload(self, row: dict, *, shipping_target: bool) -> dict:
+        payload = dict(row or {})
+        order_line = payload.get('order_line')
+        if order_line is not None and not isinstance(order_line, OrderLine):
+            try:
+                order_line = OrderLine.objects.get(pk=order_line)
+            except OrderLine.DoesNotExist:
+                self._raise_sale_error(
+                    'PRODUCT_OR_ORDER_LINE_REQUIRED',
+                    'Указанная order_line не найдена.',
+                    field='sale_lines',
+                )
+        wb = payload.get('warehouse_batch')
+        if wb is not None and not isinstance(wb, WarehouseBatch):
+            try:
+                wb = WarehouseBatch.objects.get(pk=wb)
+            except WarehouseBatch.DoesNotExist:
+                self._raise_sale_error(
+                    'MISSING_WAREHOUSE_BATCH',
+                    'Указанная warehouse_batch не найдена.',
+                    field='sale_lines',
+                )
+        payload['order_line'] = order_line
+        payload['warehouse_batch'] = wb
+        product = (payload.get('product') or '').strip()
+        if not product:
+            if order_line is not None and getattr(order_line, 'product', None):
+                product = order_line.product
+            elif wb is not None and getattr(wb, 'product', None):
+                product = wb.product
+        if not product:
+            self._raise_sale_error(
+                'PRODUCT_OR_ORDER_LINE_REQUIRED',
+                'Укажите product или передайте order_line/warehouse_batch для вывода product.',
+                field='sale_lines',
+            )
+        payload['product'] = product
+
+        if 'quantity' not in payload or payload.get('quantity') in (None, ''):
+            self._raise_sale_error(
+                'SALE_QUANTITY_REQUIRED',
+                'Для строки продажи поле quantity обязательно.',
+                field='sale_lines',
+            )
+        qty = Decimal(str(payload.get('quantity')))
+        if qty <= 0:
+            self._raise_sale_error(
+                'SALE_QUANTITY_INVALID',
+                'quantity должно быть больше 0.',
+                field='sale_lines',
+            )
+
+        if payload.get('unit_price') in (None, ''):
+            payload['unit_price'] = Decimal('0')
+        else:
+            unit_price = Decimal(str(payload.get('unit_price')))
+            if unit_price < 0:
+                self._raise_sale_error(
+                    'UNIT_PRICE_NEGATIVE',
+                    'unit_price не может быть отрицательной.',
+                    field='sale_lines',
+                )
+
+        if order_line is not None:
+            remaining = Decimal(str(order_line.remaining_quantity or 0))
+            if qty > remaining + Decimal('0.0001'):
+                self._raise_sale_error(
+                    'ORDER_LINE_QUANTITY_EXCEEDED',
+                    f'Нельзя продать больше остатка строки заявки ({remaining}).',
+                    field='sale_lines',
+                )
+
+        if wb is not None and wb.quality == WarehouseBatch.QUALITY_DEFECT and not payload.get('defect_flag', False):
+            self._raise_sale_error(
+                'DEFECT_BATCH_FORBIDDEN',
+                'Обычная продажа не может использовать defect batch.',
+                field='sale_lines',
+            )
+
+        if shipping_target:
+            if wb is None:
+                self._raise_sale_error(
+                    'MISSING_WAREHOUSE_BATCH',
+                    'Для partially_shipped/shipped в каждой строке обязателен warehouse_batch.',
+                    field='sale_lines',
+                )
+            if wb.status != WarehouseBatch.STATUS_AVAILABLE:
+                self._raise_sale_error(
+                    'INSUFFICIENT_STOCK',
+                    f'Партия #{wb.pk} недоступна для отгрузки (status={wb.status}).',
+                    field='sale_lines',
+                )
+            if wb.quality != WarehouseBatch.QUALITY_GOOD:
+                self._raise_sale_error(
+                    'DEFECT_BATCH_FORBIDDEN',
+                    'Для обычной продажи доступно только quality=good.',
+                    field='sale_lines',
+                )
+            from .reservations import get_available_quantity
+            available_qty = Decimal(str(get_available_quantity(wb.pk)))
+            if qty > available_qty + Decimal('0.0001'):
+                self._raise_sale_error(
+                    'INSUFFICIENT_STOCK',
+                    f'Недостаточно свободного остатка на партии (доступно {available_qty}).',
+                    field='sale_lines',
+                )
+
+        return payload
+
     def validate(self, attrs):
+        initial = self.initial_data or {}
+        if self.instance is not None and ('sale_status' in initial or 'status' in initial):
+            self._raise_sale_error(
+                'SALE_STATUS_UPDATE_FORBIDDEN',
+                'Статус продажи меняется только через /status/.',
+                field='sale_status',
+            )
+
+        if self.instance is not None:
+            incoming_keys = set(initial.keys())
+            safe_fields = {'date', 'comment', 'invoice_number', 'receipt_number'}
+            unsafe_fields = incoming_keys - safe_fields
+            if self.instance.sale_status in (
+                Sale.STATUS_SHIPPED,
+                Sale.STATUS_PARTIALLY_SHIPPED,
+                Sale.STATUS_CLOSED,
+                Sale.STATUS_CANCELED,
+            ) and incoming_keys:
+                self._raise_sale_error(
+                    'SALE_UPDATE_FORBIDDEN',
+                    f'Редактирование продажи в статусе "{self.instance.sale_status}" запрещено.',
+                )
+            if (
+                self.instance.sale_status not in (Sale.STATUS_DRAFT, Sale.STATUS_CONFIRMED)
+                and incoming_keys
+            ):
+                self._raise_sale_error(
+                    'SALE_UPDATE_FORBIDDEN',
+                    'Полное редактирование возможно только для draft/confirmed.',
+                )
+            if Payment.objects.filter(linked_sale=self.instance, status=Payment.STATUS_ACTIVE).exists() and incoming_keys:
+                self._raise_sale_error(
+                    'SALE_LOCKED_BY_PAYMENT',
+                    'Продажа заблокирована: есть активные оплаты.',
+                )
+            if Return.objects.filter(sale=self.instance).exclude(status=Return.STATUS_CANCELED).exists() and incoming_keys:
+                self._raise_sale_error(
+                    'SALE_LOCKED_BY_RETURN',
+                    'Продажа заблокирована: есть активные возвраты.',
+                )
+            if self.instance.warehouse_stock_applied and incoming_keys:
+                self._raise_sale_error(
+                    'SALE_LOCKED_BY_WAREHOUSE',
+                    'Продажа заблокирована: склад уже списан.',
+                )
+            if 'sale_lines' in initial:
+                self._raise_sale_error(
+                    'SALE_LINES_UPDATE_FORBIDDEN',
+                    'Изменение sale_lines через PATCH/PUT продажи не поддерживается.',
+                    field='sale_lines',
+                )
+
+        if self.instance is None:
+            client = attrs.get('client')
+            if client is None:
+                self._raise_sale_error(
+                    'MISSING_CLIENT',
+                    'Поле client обязательно для создания продажи.',
+                    field='client',
+                )
+            if client and not client.is_active:
+                self._raise_sale_error(
+                    'INACTIVE_CLIENT',
+                    'Клиент неактивен. Создание продажи запрещено.',
+                    field='client',
+                )
+            st = attrs.get('sale_status', Sale.STATUS_DRAFT)
+            if st == Sale.STATUS_CLOSED:
+                self._raise_sale_error(
+                    'CLOSED_CREATE_FORBIDDEN',
+                    'Создание продажи сразу в статусе closed запрещено.',
+                    field='sale_status',
+                )
+            lines = initial.get('sale_lines')
+            if not isinstance(lines, list) or len(lines) < 1:
+                self._raise_sale_error(
+                    'MISSING_SALE_LINES',
+                    'sale_lines обязателен и должен содержать минимум одну строку.',
+                    field='sale_lines',
+                )
+            shipping_target = self._is_shipping_target(st)
+            normalized_lines = [
+                self._validate_sale_line_payload(row, shipping_target=shipping_target)
+                for row in lines
+            ]
+            if not attrs.get('product'):
+                attrs['product'] = normalized_lines[0]['product']
+
         wb = attrs.get('warehouse_batch')
         prod = attrs.get('product')
-        if prod is not None and str(prod).strip() == '':
-            prod = None
-            attrs['product'] = None
-        if wb is not None and not prod:
-            attrs['product'] = wb.product
-        if not attrs.get('product'):
-            raise serializers.ValidationError(
-                {'product': 'Укажите product (наименование/артикул) или warehouse_batch_id партии склада ГП'},
-            )
+        must_validate_product = self.instance is None or ('product' in attrs) or ('warehouse_batch' in attrs)
+        if must_validate_product:
+            if prod is not None and str(prod).strip() == '':
+                prod = None
+                attrs['product'] = None
+            if wb is not None and not prod:
+                attrs['product'] = wb.product
+            if not attrs.get('product'):
+                raise serializers.ValidationError(
+                    {'product': 'Укажите product (наименование/артикул) или warehouse_batch_id партии склада ГП'},
+                )
 
         if 'sale_unit' in attrs:
             attrs['sale_unit'] = _normalize_sale_unit(attrs['sale_unit'])
@@ -716,9 +1105,6 @@ class SaleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {'warehouse_batch': 'Обычная продажа не может выбирать партию с качеством «брак».'},
             )
-
-        if self.instance is None and attrs.get('client') and not attrs['client'].is_active:
-            raise serializers.ValidationError({'client': 'Клиент неактивен. Создание продажи запрещено.'})
 
         return attrs
 
@@ -888,6 +1274,7 @@ class SaleSerializer(serializers.ModelSerializer):
                             {'sale_lines': f'Недопустимые поля в строке: {", ".join(sorted(extra))}'},
                         )
                     sld = {k: v for k, v in row.items() if k in allowed}
+                    sld = self._validate_sale_line_payload(sld, shipping_target=shipping)
                     up = Decimal(str(sld.get('unit_price') or 0))
                     qn = Decimal(str(sld.get('quantity') or 0))
                     sld['line_total'] = (up * qn).quantize(Decimal('0.01'))
@@ -895,8 +1282,14 @@ class SaleSerializer(serializers.ModelSerializer):
                     sld['profit'] = 0
                     sld['sale'] = instance
                     SaleLine.objects.create(**sld)
-            else:
+            elif self.context.get('allow_legacy_header_flow', False):
                 self._build_legacy_sale_line(instance)
+            else:
+                self._raise_sale_error(
+                    'MISSING_SALE_LINES',
+                    'sale_lines обязателен. Header-only create запрещен для frontend.',
+                    field='sale_lines',
+                )
             instance = Sale.objects.select_for_update().get(pk=instance.pk)
             if not instance.sale_lines.exists():
                 raise serializers.ValidationError(
