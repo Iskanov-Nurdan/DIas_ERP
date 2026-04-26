@@ -41,15 +41,51 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.exclude(Q(product__iexact='test') | Q(product__iexact='тест'))
         return qs
 
+    def retrieve(self, request, *args, **kwargs):
+        batch = self.get_object()
+        data = WarehouseBatchSerializer(batch, context={'request': request}).data
+        transitions = {
+            WarehouseBatch.STATUS_AVAILABLE: [WarehouseBatch.STATUS_RESERVED, WarehouseBatch.STATUS_SHIPPED],
+            WarehouseBatch.STATUS_RESERVED: [WarehouseBatch.STATUS_AVAILABLE, WarehouseBatch.STATUS_SHIPPED],
+            WarehouseBatch.STATUS_SHIPPED: [],
+        }
+        can_reserve = (
+            batch.status == WarehouseBatch.STATUS_AVAILABLE
+            and batch.quality == WarehouseBatch.QUALITY_GOOD
+        )
+        can_package = (
+            batch.status == WarehouseBatch.STATUS_AVAILABLE
+            and batch.inventory_form == WarehouseBatch.INVENTORY_UNPACKED
+            and batch.quality == WarehouseBatch.QUALITY_GOOD
+        )
+        data['linked_entities'] = {
+            'profile': (
+                {
+                    'id': batch.profile_id,
+                    'label': batch.profile.name,
+                } if batch.profile_id else None
+            ),
+            'source_batch': (
+                {
+                    'id': batch.source_batch_id,
+                    'label': f"#{batch.source_batch_id} {batch.source_batch.product}",
+                } if batch.source_batch_id else None
+            ),
+        }
+        data['available_actions'] = {
+            'reserve': can_reserve,
+            'package': can_package,
+            'trace': True,
+        }
+        data['available_status_transitions'] = transitions.get(batch.status, [])
+        return Response(data)
+
     @extend_schema(
         summary='Резерв партии склада',
         request=inline_serializer(
             name='WarehouseReserveRequest',
             fields={
-                'batch_id': serializers.IntegerField(help_text='ID партии (канон); принимается и batchId.'),
-                'batchId': serializers.IntegerField(
-                    required=False, help_text='Устаревший алиас; предпочтительно batch_id.',
-                ),
+                'batch_id': serializers.IntegerField(help_text='ID партии (канон).'),
                 'quantity': serializers.DecimalField(max_digits=24, decimal_places=8),
                 'sale_id': serializers.IntegerField(
                     required=False,
@@ -66,7 +102,7 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
     )
     @action(detail=False, methods=['post'], url_path='reserve')
     def reserve(self, request):
-        batch_id = request.data.get('batch_id') or request.data.get('batchId')
+        batch_id = request.data.get('batch_id')
         quantity_raw = request.data.get('quantity')
         sale_id = request.data.get('sale_id')
 
@@ -84,6 +120,8 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
 
         if batch.status != WarehouseBatch.STATUS_AVAILABLE:
             return _err('bad_request', 'Партия недоступна для резервирования')
+        if batch.quality != WarehouseBatch.QUALITY_GOOD:
+            return _err('bad_request', 'Резервирование разрешено только для годной партии (quality=good)')
 
         try:
             q = Decimal(str(quantity_raw))
@@ -149,7 +187,7 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
         """
         d = request.data
 
-        wb_id = d.get('warehouse_batch_id') if d.get('warehouse_batch_id') not in (None, '') else d.get('batchId')
+        wb_id = d.get('warehouse_batch_id')
         if wb_id in (None, ''):
             return _err(
                 'validation_error',
@@ -233,6 +271,12 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
                     'bad_request',
                     'Строка недоступна для упаковки (не в статусе «доступна»)',
                     errors=[{'field': 'warehouse_batch_id', 'message': 'Недоступна'}],
+                )
+            if row.quality != WarehouseBatch.QUALITY_GOOD:
+                return _err(
+                    'bad_request',
+                    'Упаковка разрешена только для годной партии (quality=good)',
+                    errors=[{'field': 'warehouse_batch_id', 'message': 'Для брака упаковка запрещена'}],
                 )
 
             unit_m = effective_unit_meters(row)
@@ -328,3 +372,165 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             {'items': WarehouseBatchSerializer(created, many=True).data},
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=['get'], url_path='trace')
+    def trace(self, request, pk=None):
+        """
+        GET /api/warehouse/batches/{id}/trace/
+
+        Полная трассировка партии склада ГП:
+        производство → ОТК → склад → продажи → возвраты → брак → переделка.
+        """
+        wb = self.get_object()
+        result: dict = {
+            'warehouse_batch_id': wb.pk,
+            'product': wb.product,
+            'quality': wb.quality,
+            'status': wb.status,
+            'date': wb.date.isoformat() if wb.date else None,
+        }
+
+        # Производственная партия-источник
+        if wb.source_batch_id:
+            pb = wb.source_batch
+            result['production_batch'] = {
+                'id': pb.pk,
+                'product': pb.product,
+                'date': pb.date.isoformat() if pb.date else None,
+                'otk_status': pb.otk_status,
+                'lifecycle_status': pb.lifecycle_status,
+                'total_meters': str(pb.total_meters) if pb.total_meters else None,
+                'material_cost_total': str(pb.material_cost_total) if pb.material_cost_total else None,
+                'cost_per_meter': str(pb.cost_per_meter) if pb.cost_per_meter else None,
+                'order_id': pb.order_id,
+                'line_id': pb.line_id,
+            }
+            # ОТК
+            otk_checks = list(pb.otk_checks.select_related('inspector').order_by('checked_date', 'id'))
+            result['otk_checks'] = [
+                {
+                    'id': c.pk,
+                    'check_status': c.check_status,
+                    'accepted': str(c.accepted) if c.accepted else None,
+                    'rejected': str(c.rejected) if c.rejected else None,
+                    'reject_reason': c.reject_reason or '',
+                    'inspector_name': c.inspector_name or '',
+                    'checked_date': c.checked_date.isoformat() if c.checked_date else None,
+                }
+                for c in otk_checks
+            ]
+        else:
+            result['production_batch'] = None
+            result['otk_checks'] = []
+
+        # Продажи из этой партии
+        from apps.sales.models import SaleLine, ReturnLine, DefectRecord, ReworkRequest, OrderReservation
+        sale_lines = (
+            SaleLine.objects.filter(warehouse_batch=wb)
+            .select_related('sale', 'sale__client', 'order_line__order')
+            .order_by('sale__date', 'id')
+        )
+        result['sale_lines'] = [
+            {
+                'sale_line_id': sl.pk,
+                'sale_id': sl.sale_id,
+                'sale_order_number': sl.sale.order_number,
+                'sale_date': sl.sale.date.isoformat() if sl.sale.date else None,
+                'client_name': sl.sale.client.name if sl.sale.client_id else '—',
+                'quantity': str(sl.quantity),
+                'unit_price': str(sl.unit_price) if sl.unit_price else None,
+                'line_total': str(sl.line_total),
+                'cost': str(sl.cost),
+                'profit': str(sl.profit),
+                'order_number': sl.order_line.order.order_number if sl.order_line_id else None,
+            }
+            for sl in sale_lines
+        ]
+
+        # Возвраты по продажам из этой партии
+        sale_ids = [sl.sale_id for sl in sale_lines]
+        return_lines = (
+            ReturnLine.objects.filter(sale_line__warehouse_batch=wb)
+            .select_related('return_doc', 'sale_line__sale')
+            .order_by('return_doc__date', 'id')
+        )
+        result['return_lines'] = [
+            {
+                'return_line_id': rl.pk,
+                'return_doc_id': rl.return_doc_id,
+                'return_number': rl.return_doc.return_number,
+                'return_date': rl.return_doc.date.isoformat() if rl.return_doc.date else None,
+                'quantity': str(rl.quantity),
+                'return_target': rl.return_target,
+                'condition_type': rl.condition_type,
+            }
+            for rl in return_lines
+        ]
+
+        # Записи брака
+        defects = DefectRecord.objects.filter(source_type='return').filter(
+            source_id__in=[rl.pk for rl in return_lines]
+        )
+        result['defect_records'] = [
+            {
+                'defect_id': d.pk,
+                'status': d.status,
+                'quantity_pcs': str(d.quantity_pcs),
+                'quantity_kg': str(d.quantity_kg) if d.quantity_kg else None,
+                'defect_reason': d.defect_reason,
+            }
+            for d in defects
+        ]
+
+        # Переделки
+        defect_ids = [d.pk for d in defects]
+        reworks = ReworkRequest.objects.filter(defect_record_id__in=defect_ids).select_related(
+            'result_warehouse_batch'
+        )
+        result['rework_requests'] = [
+            {
+                'rework_id': r.pk,
+                'rework_number': r.rework_number,
+                'status': r.status,
+                'quantity_kg': str(r.quantity_kg),
+                'output_quantity_kg': str(r.output_quantity_kg) if r.output_quantity_kg else None,
+                'loss_kg': str(r.loss_kg) if r.loss_kg else None,
+                'result_batch_id': r.result_warehouse_batch_id,
+            }
+            for r in reworks
+        ]
+
+        # Все резервы (активные + исполненные + снятые) — полная коммерческая цепочка
+        all_reservations = (
+            OrderReservation.objects.filter(warehouse_batch=wb)
+            .select_related('order_line__order', 'sale_line__sale')
+            .order_by('created_at')
+        )
+        result['reservations'] = [
+            {
+                'reservation_id': res.pk,
+                'status': res.status,
+                'order_line_id': res.order_line_id,
+                'order_number': (
+                    res.order_line.order.order_number
+                    if res.order_line_id and res.order_line.order_id
+                    else None
+                ),
+                'quantity': str(res.quantity),
+                'fulfilled_quantity': str(res.fulfilled_quantity or 0),
+                'sale_line_id': res.sale_line_id,
+                'sale_order_number': (
+                    res.sale_line.sale.order_number
+                    if res.sale_line_id and res.sale_line.sale_id
+                    else None
+                ),
+                'created_at': res.created_at.isoformat() if res.created_at else None,
+            }
+            for res in all_reservations
+        ]
+        # Backward-compat alias: active_reservations
+        result['active_reservations'] = [
+            r for r in result['reservations'] if r['status'] == 'active'
+        ]
+
+        return Response(result)

@@ -99,6 +99,12 @@ def _extract_validation_errors(detail) -> list[dict]:
     return errors
 
 
+def _first_scalar(value):
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
 def dias_exception_handler(exc, context):
     if isinstance(exc, DjangoValidationError):
         exc = ValidationError(detail=exc.message_dict if hasattr(exc, 'message_dict') else exc.messages)
@@ -137,14 +143,14 @@ def dias_exception_handler(exc, context):
     if isinstance(exc, ValidationError):
         errors = _extract_validation_errors(exc.detail)
         if isinstance(exc.detail, dict) and exc.detail.get('detail'):
-            first_msg = str(exc.detail['detail'])
+            first_msg = str(_first_scalar(exc.detail['detail']))
         elif isinstance(exc.detail, dict) and exc.detail.get('error'):
-            first_msg = str(exc.detail['error'])
+            first_msg = str(_first_scalar(exc.detail['error']))
         else:
             first_msg = errors[0]['message'] if errors else 'Ошибка валидации'
         code = 'validation_error'
         if isinstance(exc.detail, dict) and exc.detail.get('code'):
-            code = str(exc.detail['code'])
+            code = str(_first_scalar(exc.detail['code']))
         return _make_error_response(code, first_msg, errors=errors or None, http_status=400)
 
     if isinstance(exc, MethodNotAllowed):

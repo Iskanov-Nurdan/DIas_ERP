@@ -402,6 +402,8 @@ ACCESS_KEYS = [
     'users', 'lines', 'materials', 'chemistry', 'recipes', 'orders',
     'production', 'otk', 'warehouse', 'clients', 'sales', 'shipments', 'analytics',
     'shifts', 'my_shift',
+    # Коммерческий контур
+    'client_orders', 'payments', 'returns', 'defects',
 ]
 
 # Имена ролей из seed_roles: при создании User без role назначается «Планировщик»,

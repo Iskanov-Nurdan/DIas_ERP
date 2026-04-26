@@ -199,10 +199,42 @@ def deduct_unpacked_quantity(pb, qty: Decimal, *, quality: str) -> None:
             row.save(update_fields=['quantity'])
 
 
-def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: str, piece_pick) -> None:
+def warehouse_row_snapshot(b: WarehouseBatch) -> dict:
+    """Снимок полей строки, меняемых apply_sale / reverse."""
+    return {
+        'quantity': str(q4(Decimal(str(b.quantity or 0)))),
+        'status': b.status,
+        'packages_count': (str(q4(Decimal(str(b.packages_count)))) if b.packages_count is not None else None),
+        'inventory_form': b.inventory_form,
+    }
+
+
+def warehouse_row_apply_snapshot(b: WarehouseBatch, snap: dict) -> None:
+    b.quantity = q4(Decimal(str(snap['quantity'])))
+    b.status = snap['status']
+    b.inventory_form = snap['inventory_form']
+    if snap.get('packages_count') is not None:
+        b.packages_count = q4(Decimal(str(snap['packages_count'])))
+    else:
+        b.packages_count = None
+
+
+MUTATION_VERSION = 1
+
+
+def _make_mutation(batch_id: int, before: dict, child_batch_id: int | None) -> dict:
+    return {
+        'v': MUTATION_VERSION,
+        'batch_id': batch_id,
+        'before': before,
+        'child_batch_id': child_batch_id,
+    }
+
+
+def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: str, piece_pick) -> dict:
     """
     Списание со строки склада ГП при продаже (select_for_update внутри).
-    piece_pick обязателен для packed/open_package при продаже штук (см. validate в сериализаторе).
+    Возвращает mutation-для обратимого reverse_warehouse_mutation.
     """
     with transaction.atomic():
         b = WarehouseBatch.objects.select_for_update().get(pk=batch_id)
@@ -212,6 +244,7 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
             )
         _maybe_split_legacy_combined_open_row(b)
         b.refresh_from_db()
+        before = warehouse_row_snapshot(b)
         if quantity <= 0:
             raise drf_serializers.ValidationError({'quantity': 'Должно быть > 0'})
         if quantity > b.quantity:
@@ -233,6 +266,7 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
             )
 
         pp = normalize_piece_pick(piece_pick)
+        child_batch_id: int | None = None
 
         if b.inventory_form == WarehouseBatch.INVENTORY_UNPACKED:
             if pp and pp != PIECE_LOOSE:
@@ -244,7 +278,7 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                 _close_warehouse_row_after_full_sale(b)
             else:
                 b.save(update_fields=['quantity'])
-            return
+            return _make_mutation(batch_id, before, None)
 
         if b.inventory_form == WarehouseBatch.INVENTORY_OPEN_PACKAGE:
             if pp and pp != PIECE_FROM_OPEN:
@@ -256,9 +290,8 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                 _close_warehouse_row_after_full_sale(b)
             else:
                 b.save(update_fields=['quantity'])
-            return
+            return _make_mutation(batch_id, before, None)
 
-        # PACKED
         if pp is None:
             raise drf_serializers.ValidationError(
                 {'piece_pick': 'Для упакованного остатка укажите loose_remainder / from_sealed_package / from_open_package'}
@@ -311,10 +344,9 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                     _close_warehouse_row_after_full_sale(b)
                 else:
                     b.save(update_fields=['quantity', 'packages_count'])
-                return
+                return _make_mutation(batch_id, before, None)
 
-            packages_to_remove = k_full + 1
-            sealed_after = old_pc - packages_to_remove
+            sealed_after = old_pc - (k_full + 1)
             tail = q4(ppc - remainder)
 
             if sealed_after > 0:
@@ -322,17 +354,41 @@ def apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal, stock_form: 
                 b.quantity = q4(Decimal(sealed_after) * ppc)
                 b.inventory_form = WarehouseBatch.INVENTORY_PACKED
                 b.save(update_fields=['quantity', 'packages_count', 'inventory_form'])
-                _duplicate_warehouse_batch(
+                child = _duplicate_warehouse_batch(
                     b,
                     quantity=tail,
                     packages_count=q4(Decimal('0')),
                     inventory_form=WarehouseBatch.INVENTORY_OPEN_PACKAGE,
                 )
+                child_batch_id = child.pk
             else:
                 b.packages_count = q4(Decimal('0'))
                 b.quantity = tail
                 b.inventory_form = WarehouseBatch.INVENTORY_OPEN_PACKAGE
                 b.save(update_fields=['quantity', 'packages_count', 'inventory_form'])
-            return
+            return _make_mutation(batch_id, before, child_batch_id)
 
         raise drf_serializers.ValidationError({'piece_pick': 'Неизвестное значение'})
+
+
+def reverse_warehouse_mutation(mutation: dict) -> None:
+    """
+    Восстанавливает строку склада по снимку «before»; удаляет дочернюю строку (open tail), если была создана.
+    """
+    with transaction.atomic():
+        cid = mutation.get('child_batch_id')
+        if cid:
+            WarehouseBatch.objects.filter(pk=cid).delete()
+        b = WarehouseBatch.objects.select_for_update().get(pk=mutation['batch_id'])
+        warehouse_row_apply_snapshot(b, mutation['before'])
+        b.save(update_fields=['quantity', 'status', 'packages_count', 'inventory_form'])
+
+
+def reverse_apply_sale_to_warehouse_batch(batch_id: int, quantity: Decimal) -> None:
+    """@deprecated: используйте reverse_warehouse_mutation — оставлено для совместимости."""
+    with transaction.atomic():
+        b = WarehouseBatch.objects.select_for_update().get(pk=batch_id)
+        b.quantity = q4(Decimal(str(b.quantity)) + Decimal(str(quantity)))
+        if b.status == WarehouseBatch.STATUS_SHIPPED and b.quantity > 0:
+            b.status = WarehouseBatch.STATUS_AVAILABLE
+        b.save(update_fields=['quantity', 'status'])

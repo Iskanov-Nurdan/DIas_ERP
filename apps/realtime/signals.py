@@ -19,7 +19,7 @@ from apps.production.models import (
     ShiftNote,
 )
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
-from apps.sales.models import Sale
+from apps.sales.models import DefectRecord, Order, Payment, Return, ReworkRequest, Sale
 from apps.warehouse.models import WarehouseBatch
 
 from .broadcast import schedule_push
@@ -392,13 +392,93 @@ def sale_saved(sender, instance, created, **kwargs):
         resource='sale',
         action=_act(created),
         entity_id=instance.pk,
-        extra={'client_id': instance.client_id, 'warehouse_batch_id': instance.warehouse_batch_id},
+        extra={
+            'client_id': instance.client_id,
+            'warehouse_batch_id': instance.warehouse_batch_id,
+            'sale_status': instance.sale_status,
+            'is_defect_sale': instance.is_defect_sale,
+        },
     )
 
 
 @receiver(post_delete, sender=Sale)
 def sale_deleted(sender, instance, **kwargs):
     schedule_push(resource='sale', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=Order)
+def order_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='order',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'client_id': instance.client_id, 'status': instance.status},
+    )
+
+
+@receiver(post_delete, sender=Order)
+def order_deleted(sender, instance, **kwargs):
+    schedule_push(resource='order', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=Payment)
+def payment_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='payment',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'client_id': instance.client_id, 'payment_type': instance.payment_type},
+    )
+
+
+@receiver(post_delete, sender=Payment)
+def payment_deleted(sender, instance, **kwargs):
+    schedule_push(resource='payment', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=Return)
+def return_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='return',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'sale_id': instance.sale_id},
+    )
+
+
+@receiver(post_delete, sender=Return)
+def return_deleted(sender, instance, **kwargs):
+    schedule_push(resource='return', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=DefectRecord)
+def defect_record_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='defect_record',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'source_type': instance.source_type, 'status': instance.status},
+    )
+
+
+@receiver(post_delete, sender=DefectRecord)
+def defect_record_deleted(sender, instance, **kwargs):
+    schedule_push(resource='defect_record', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=ReworkRequest)
+def rework_request_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='rework_request',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'status': instance.status},
+    )
+
+
+@receiver(post_delete, sender=ReworkRequest)
+def rework_request_deleted(sender, instance, **kwargs):
+    schedule_push(resource='rework_request', action='deleted', entity_id=instance.pk)
 
 
 @receiver(post_save, sender=UserActivity)
