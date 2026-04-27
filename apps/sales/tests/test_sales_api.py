@@ -1,6 +1,7 @@
 from datetime import date
 from io import BytesIO
 from decimal import Decimal
+import unittest
 
 from django.contrib.auth import get_user_model
 from rest_framework import status
@@ -300,6 +301,90 @@ class SalesApiContractTests(APITestCase):
         self.assertIn('order_lines', resp.data)
         self.assertTrue(all(row['id'] == self.order.pk for row in resp.data['orders']))
         self.assertTrue(all(b['quality'] == WarehouseBatch.QUALITY_GOOD for b in resp.data['warehouse_batches']))
+        order_row = resp.data['orders'][0]
+        self.assertIn('paid_amount', order_row)
+        self.assertIn('debt_amount', order_row)
+        self.assertIn('payment_type', order_row)
+        self.assertIn('payment_method', order_row)
+
+    def test_create_sale_applies_order_prepayment_without_double_payment_doc(self):
+        Payment.objects.create(
+            client=self.client_active,
+            linked_order=self.order,
+            date=date(2026, 4, 26),
+            payment_type=Payment.TYPE_PREPAYMENT,
+            payment_method=Payment.METHOD_CARD,
+            amount=Decimal('300'),
+            status=Payment.STATUS_ACTIVE,
+        )
+        payload = self._payload(qty='5', unit_price='100')
+        payload.pop('payment_type', None)
+        payload.pop('payment_method', None)
+        payload.pop('paid_amount', None)
+        payload['order_paid_amount_applied'] = '300'
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        sale = Sale.objects.get(pk=resp.data['id'])
+        self.assertEqual(sale.order_paid_amount_applied, Decimal('300'))
+        self.assertEqual(
+            Payment.objects.filter(linked_sale=sale, status=Payment.STATUS_ACTIVE).count(),
+            0,
+        )
+
+    def test_create_mixed_line_unit_types(self):
+        payload = self._payload(qty='5', unit_price='100')
+        payload['unit_type'] = 'pieces'
+        payload['sale_lines'] = [
+            {
+                'warehouse_batch': self.good_batch.pk,
+                'quantity': '0.5',
+                'unit_price': '100',
+                'unit_type': 'packages',
+                'product': '60 мм белый',
+            },
+            {
+                'warehouse_batch': self.good_batch.pk,
+                'quantity': '3',
+                'unit_price': '100',
+                'unit_type': 'pieces',
+                'product': '60 мм белый',
+            },
+        ]
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_create_invalid_line_unit_type(self):
+        payload = self._payload()
+        payload['sale_lines'][0]['unit_type'] = 'meters'
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data.get('code'), 'INVALID_LINE_UNIT_TYPE')
+
+    def test_preview_mixed_line_unit_types(self):
+        payload = {
+            'client': self.client_active.pk,
+            'unit_type': 'pieces',
+            'sale_lines': [
+                {
+                    'warehouse_batch': self.good_batch.pk,
+                    'quantity': '1',
+                    'unit_price': '100',
+                    'unit_type': 'packages',
+                },
+                {
+                    'warehouse_batch': self.good_batch.pk,
+                    'quantity': '2',
+                    'unit_price': '100',
+                    'unit_type': 'pieces',
+                },
+            ],
+            'payment_type': 'partial',
+            'payment_method': 'cash',
+            'paid_amount': '100',
+        }
+        resp = self.client.post('/api/sales/preview/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data.get('normalized_lines') or []), 2)
 
     def test_waybill_and_receipt_are_html(self):
         sale = self._create_sale()
@@ -324,6 +409,10 @@ class SalesApiContractTests(APITestCase):
         self.assertIn('тел: ____________________', body)
 
     def test_waybill_pdf_format(self):
+        try:
+            import xhtml2pdf  # noqa: F401
+        except Exception:
+            raise unittest.SkipTest('xhtml2pdf is not installed')
         sale = self._create_sale()
         resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=pdf')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)

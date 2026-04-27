@@ -74,7 +74,8 @@ def sale_payment_metrics(sale) -> dict[str, Any]:
     ref = sum(
         (p.amount or Decimal('0')) for p in active if p.payment_type == Payment.TYPE_REFUND
     )
-    net = total_in - ref
+    order_applied = Decimal(str(getattr(sale, 'order_paid_amount_applied', 0) or 0))
+    net = total_in - ref + order_applied
     lines = list(sale.sale_lines.all())
     if lines:
         due = sum(
@@ -97,6 +98,7 @@ def sale_payment_metrics(sale) -> dict[str, Any]:
         'refund_amount': ref,
         'net_paid': net,
         'total_due': due,
+        'order_paid_amount_applied': order_applied,
     }
 
 

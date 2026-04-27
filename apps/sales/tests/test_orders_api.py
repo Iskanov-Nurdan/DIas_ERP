@@ -15,6 +15,7 @@ from apps.sales.models import (
     Sale,
     SaleLine,
 )
+from apps.recipes.models import PlasticProfile, Recipe
 from apps.warehouse.models import WarehouseBatch
 
 
@@ -29,21 +30,22 @@ class OrdersApiContractTests(APITestCase):
         self.client.force_authenticate(self.user)
         self.active_client = Client.objects.create(name='Активный', is_active=True)
         self.inactive_client = Client.objects.create(name='Неактивный', is_active=False)
+        self.profile = PlasticProfile.objects.create(name='Профиль 60', code='P-60', is_active=True)
+        self.recipe = Recipe.objects.create(recipe='Рецепт 60', profile=self.profile, is_active=True)
 
     def _order_payload(self, client_id=None):
         return {
             'date': '2026-04-26',
             'client': client_id if client_id is not None else self.active_client.pk,
+            'profile': self.profile.pk,
+            'recipe': self.recipe.pk,
+            'length': '6',
+            'quantity': 10,
+            'payment_type': 'partial',
+            'payment_method': 'cash',
+            'paid_amount': '100',
             'source_type': 'manager',
             'comment': 'Срочная',
-            'lines': [
-                {
-                    'product': '60 мм белый',
-                    'ordered_quantity': '10',
-                    'unit_price': '100',
-                    'comment': '',
-                }
-            ],
         }
 
     def _create_order(self, status_value=Order.STATUS_NEW):
@@ -75,53 +77,56 @@ class OrdersApiContractTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(resp.data.get('code'), 'INACTIVE_CLIENT')
 
-    def test_create_fails_without_lines(self):
+    def test_create_fails_without_profile(self):
         payload = self._order_payload()
-        payload.pop('lines')
+        payload.pop('profile')
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'MISSING_LINES')
+        self.assertEqual(resp.data.get('code'), 'MISSING_PROFILE')
 
-    def test_create_fails_with_empty_lines(self):
+    def test_create_fails_without_recipe(self):
         payload = self._order_payload()
-        payload['lines'] = []
+        payload.pop('recipe')
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'MISSING_LINES')
+        self.assertEqual(resp.data.get('code'), 'MISSING_RECIPE')
 
-    def test_create_fails_line_without_product_or_profile(self):
+    def test_create_fails_recipe_profile_mismatch(self):
+        other_profile = PlasticProfile.objects.create(name='Профиль 80', code='P-80', is_active=True)
         payload = self._order_payload()
-        payload['lines'][0]['product'] = ''
+        payload['profile'] = other_profile.pk
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'PRODUCT_OR_PROFILE_REQUIRED')
+        self.assertEqual(resp.data.get('code'), 'RECIPE_PROFILE_MISMATCH')
 
     def test_create_fails_ordered_quantity_non_positive(self):
         payload = self._order_payload()
-        payload['lines'][0]['ordered_quantity'] = '0'
+        payload['quantity'] = 0
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'ORDERED_QUANTITY_INVALID')
+        self.assertEqual(resp.data.get('code'), 'INVALID_QUANTITY')
 
-    def test_create_fails_negative_unit_price(self):
+    def test_create_fails_negative_paid_amount(self):
         payload = self._order_payload()
-        payload['lines'][0]['unit_price'] = '-1'
+        payload['paid_amount'] = '-1'
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'UNIT_PRICE_NEGATIVE')
+        self.assertEqual(resp.data.get('code'), 'INVALID_PAID_AMOUNT')
 
-    def test_create_allows_zero_unit_price(self):
+    def test_create_allows_debt_zero_paid_amount(self):
         payload = self._order_payload()
-        payload['lines'][0]['unit_price'] = '0'
+        payload['payment_type'] = 'debt'
+        payload['paid_amount'] = '0'
+        payload['payment_method'] = ''
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(str(resp.data['lines'][0]['unit_price']), '0.00')
+        self.assertEqual(resp.data.get('payment_type'), 'full')
 
     def test_create_success_with_one_line(self):
         resp = self.client.post('/api/orders/', data=self._order_payload(), format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(resp.data['client'], self.active_client.pk)
-        self.assertEqual(len(resp.data['lines']), 1)
+        self.assertEqual(resp.data.get('recipe_id'), self.recipe.pk)
 
     def test_update_status_forbidden_on_regular_patch(self):
         order = self._create_order()
