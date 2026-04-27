@@ -168,6 +168,7 @@ REST_FRAMEWORK = {
         'sensitive_user': '30/min',
     },
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'URL_FORMAT_OVERRIDE': None,
 }
 
 from datetime import timedelta
@@ -197,6 +198,9 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-shift-id',
     'cache-control',
 ]
+
+WAYBILL_SUPPLIER_NAME = os.environ.get('WAYBILL_SUPPLIER_NAME', '')
+WAYBILL_SUPPLIER_PHONE = os.environ.get('WAYBILL_SUPPLIER_PHONE', '')
 
 # WebSocket handshake: браузер шлёт заголовок Origin страницы фронта (как при CORS), а не только Host API.
 # Список ниже переопределяет источники для channels.security.websocket.OriginValidator; пусто = взять CORS_ALLOWED_ORIGINS

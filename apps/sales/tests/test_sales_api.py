@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.sales.models import Client, Order, OrderLine, Payment, Return, Sale
+from apps.sales.models import Client, Order, OrderLine, Payment, Return, Sale, SaleLine
 from apps.warehouse.models import WarehouseBatch
 
 
@@ -308,6 +308,69 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertIn('text/html', w['Content-Type'])
         self.assertIn('text/html', r['Content-Type'])
+
+    def test_waybill_html_contains_required_sections(self):
+        sale = self._create_sale()
+        sale.refresh_from_db()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.content.decode('utf-8')
+        self.assertIn('Расходная накладная №', body)
+        self.assertIn('Поставщик:', body)
+        self.assertIn('Покупатель:', body)
+        self.assertIn('Итого', body)
+
+    def test_waybill_pdf_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=pdf')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp['Content-Type'], 'application/pdf')
+        self.assertIn(f'waybill-{sale.pk}.pdf', resp['Content-Disposition'])
+
+    def test_waybill_xlsx_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xlsx')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            resp['Content-Type'],
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        self.assertIn(f'waybill-{sale.pk}.xlsx', resp['Content-Disposition'])
+
+    def test_waybill_sale_not_found(self):
+        resp = self.client.get('/api/sales/999999/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(resp.data.get('code'), 'SALE_NOT_FOUND')
+
+    def test_waybill_invalid_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xml')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data.get('code'), 'INVALID_FORMAT')
+
+    def test_waybill_total_matches_sale_lines_sum(self):
+        sale = self._create_sale()
+        SaleLine.objects.filter(sale=sale).delete()
+        SaleLine.objects.create(
+            sale=sale,
+            product='Товар 1',
+            quantity=Decimal('2'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('200'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Товар 2',
+            quantity=Decimal('1'),
+            unit_price=Decimal('150'),
+            line_total=Decimal('150'),
+        )
+        sale.revenue = Decimal('350')
+        sale.save(update_fields=['revenue'])
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.content.decode('utf-8')
+        self.assertIn('350', body)
 
     def test_credit_check_hard_block_and_override_access(self):
         self.client_active.credit_limit_mode = 'hard'

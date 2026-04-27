@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>Расходная накладная {waybill_number}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; color: #111; }}
+        .title {{ text-align: center; font-weight: 700; font-size: 20px; margin: 8px 0 20px; }}
+        .row {{ margin: 8px 0; font-size: 14px; }}
+        table {{ border-collapse: collapse; width: 100%; margin-top: 14px; }}
+        th, td {{ border: 1px solid #222; padding: 8px 10px; font-size: 14px; }}
+        th {{ font-weight: 700; text-align: center; }}
+        td.num {{ width: 48px; text-align: center; }}
+        td.money {{ text-align: right; white-space: nowrap; }}
+        .total-row td {{ font-weight: 700; }}
+        .footer {{ margin-top: 36px; font-size: 14px; line-height: 2.1; }}
+    </style>
+</head>
+<body>
+    <div class="title">Расходная накладная № {waybill_number} от {waybill_date} г.</div>
+    <div class="row"><strong>Поставщик:</strong> {supplier_name}, тел: {supplier_phone}</div>
+    <div class="row"><strong>Покупатель:</strong> {buyer_name}</div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>№</th>
+                <th>Наименование товара</th>
+                <th>Единица измерение</th>
+                <th>Цена</th>
+                <th>Сумма</th>
+            </tr>
+        </thead>
+        <tbody>
+            {lines_rows}
+            <tr class="total-row">
+                <td colspan="4" class="money">Итого</td>
+                <td class="money">{total}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="footer">
+        <div>Отпустил ____________________</div>
+        <div>Получил _____________________</div>
+        <div>Место печати ________________</div>
+    </div>
+</body>
+</html>
