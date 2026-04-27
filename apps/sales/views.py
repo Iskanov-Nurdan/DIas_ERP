@@ -70,8 +70,8 @@ def _err(code: str, message: str, errors: list = None, http_status: int = 400) -
 
 def _waybill_supplier_payload() -> dict:
     return {
-        'name': getattr(settings, 'WAYBILL_SUPPLIER_NAME', ''),
-        'phone': getattr(settings, 'WAYBILL_SUPPLIER_PHONE', ''),
+        'name': '____________________',
+        'phone': '____________________',
     }
 
 
@@ -88,6 +88,82 @@ def _waybill_line_name(line: SaleLine) -> str:
     )
 
 
+def _safe_decimal(value):
+    if value in (None, ''):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _first_decimal_attr(obj, names):
+    for name in names:
+        if not hasattr(obj, name):
+            continue
+        val = _safe_decimal(getattr(obj, name))
+        if val is not None:
+            return val
+    return None
+
+
+def _is_packages_mode(sale: Sale, line: SaleLine) -> bool:
+    package_aliases = {'packages', 'упаковки', 'упак'}
+    line_mode = str(getattr(line, 'unit_type', '') or '').strip().lower()
+    sale_mode = str(getattr(sale, 'unit_type', '') or '').strip().lower()
+    if line_mode in package_aliases or sale_mode in package_aliases:
+        return True
+    return sale.sale_mode == Sale.MODE_PACKAGES
+
+
+def _sale_line_packaging_payload(sale: Sale, line: SaleLine, lines_count: int) -> dict:
+    pieces_qty = _first_decimal_attr(line, ('quantity', 'qty', 'pieces_quantity', 'quantity_pieces'))
+    packages_qty = _first_decimal_attr(line, ('packages_quantity', 'quantity_packages', 'packages'))
+    if packages_qty is None and lines_count == 1:
+        sold_packages = _safe_decimal(getattr(sale, 'sold_packages', None))
+        if sold_packages is not None and sold_packages > 0:
+            packages_qty = sold_packages
+    ppp = _first_decimal_attr(line, ('pieces_per_package', 'pieces_per_pack', 'pack_size', 'package_size', 'pack_qty'))
+    if ppp is None and line.warehouse_batch_id:
+        ppp = _first_decimal_attr(
+            line.warehouse_batch,
+            ('pieces_per_package', 'pieces_per_pack', 'pack_size', 'package_size', 'pack_qty'),
+        )
+    if packages_qty is None and ppp is not None and ppp > 0 and pieces_qty is not None and pieces_qty > 0:
+        packages_qty = (pieces_qty / ppp)
+    if ppp is None and packages_qty and packages_qty > 0 and pieces_qty and pieces_qty > 0:
+        ppp = (pieces_qty / packages_qty)
+
+    is_packages = _is_packages_mode(sale, line)
+    unit_type = 'packages' if is_packages else 'pieces'
+    quantity_display = '0 шт'
+    if is_packages:
+        if packages_qty is not None and ppp is not None and pieces_qty is not None:
+            quantity_display = (
+                f"{api_decimal_str(packages_qty)} упак × {api_decimal_str(ppp)} шт = {api_decimal_str(pieces_qty)} шт"
+            )
+        elif packages_qty is not None and pieces_qty is not None:
+            quantity_display = f"{api_decimal_str(packages_qty)} упак = {api_decimal_str(pieces_qty)} шт"
+        elif packages_qty is not None:
+            quantity_display = f"{api_decimal_str(packages_qty)} упак"
+        elif pieces_qty is not None:
+            quantity_display = f"{api_decimal_str(pieces_qty)} шт"
+    elif pieces_qty is not None:
+        quantity_display = f"{api_decimal_str(pieces_qty)} шт"
+
+    return {
+        'unit_type': unit_type,
+        'quantity': api_decimal_str(pieces_qty or Decimal('0')),
+        'packages_quantity': (api_decimal_str(packages_qty) if packages_qty is not None else None),
+        'pieces_per_package': (api_decimal_str(ppp) if ppp is not None else None),
+        'quantity_display': quantity_display,
+    }
+
+
+def _format_waybill_quantity(sale: Sale, line: SaleLine, lines_count: int) -> str:
+    return _sale_line_packaging_payload(sale, line, lines_count=lines_count)['quantity_display']
+
+
 def _ensure_sale_waybill_number(sale: Sale) -> str:
     if sale.invoice_number:
         return sale.invoice_number
@@ -100,9 +176,7 @@ def _ensure_sale_waybill_number(sale: Sale) -> str:
 
 
 def _build_sale_waybill_payload(sale: Sale) -> dict:
-    waybill_number = _ensure_sale_waybill_number(sale)
-    doc_date = sale.date or (sale.created_at.date() if sale.created_at else None)
-    date_ru = doc_date.strftime('%d.%m.%Y') if doc_date else ''
+    _ensure_sale_waybill_number(sale)
 
     unit_label = 'шт'
     if sale.sale_mode == Sale.MODE_PACKAGES:
@@ -111,6 +185,7 @@ def _build_sale_waybill_payload(sale: Sale) -> dict:
     lines_payload = []
     lines_total = Decimal('0')
     sale_lines = list(sale.sale_lines.select_related('warehouse_batch__profile').all())
+    lines_count = len(sale_lines)
     for idx, line in enumerate(sale_lines, 1):
         price = Decimal(str(line.unit_price or 0)).quantize(Decimal('0.01'))
         row_total = Decimal(str(line.line_total or 0)).quantize(Decimal('0.01'))
@@ -118,7 +193,8 @@ def _build_sale_waybill_payload(sale: Sale) -> dict:
         lines_payload.append({
             'index': idx,
             'name': _waybill_line_name(line),
-            'unit': unit_label,
+            'quantity_display': _format_waybill_quantity(sale, line, lines_count=lines_count),
+            'unit': _format_waybill_quantity(sale, line, lines_count=lines_count),
             'price': api_decimal_str(price),
             'sum': api_decimal_str(row_total),
         })
@@ -130,7 +206,8 @@ def _build_sale_waybill_payload(sale: Sale) -> dict:
         lines_payload.append({
             'index': 1,
             'name': (sale.product or '').strip() or '—',
-            'unit': unit_label,
+            'quantity_display': f"{api_decimal_str(Decimal(str(sale.quantity or 0)))} {'упак' if sale.sale_mode == Sale.MODE_PACKAGES else 'шт'}",
+            'unit': f"{api_decimal_str(Decimal(str(sale.quantity or 0)))} {'упак' if sale.sale_mode == Sale.MODE_PACKAGES else 'шт'}",
             'price': api_decimal_str(legacy_price),
             'sum': api_decimal_str(legacy_sum),
         })
@@ -140,8 +217,8 @@ def _build_sale_waybill_payload(sale: Sale) -> dict:
     client_name = sale.client.name if sale.client_id else '—'
     return {
         'sale_id': sale.id,
-        'waybill_number': waybill_number,
-        'waybill_date': date_ru,
+        'waybill_number': str(sale.id),
+        'waybill_date': '_________',
         'supplier': _waybill_supplier_payload(),
         'buyer_name': client_name,
         'lines': lines_payload,
@@ -149,104 +226,143 @@ def _build_sale_waybill_payload(sale: Sale) -> dict:
     }
 
 
+def _waybill_json_payload(payload: dict) -> dict:
+    return {
+        'title': payload.get('title') or f"Расходная накладная № {payload['sale_id']} от ________ г.",
+        'buyer_name': payload.get('buyer_name') or '—',
+        'date_line': '________',
+        'supplier_line': '_______________________',
+        'phone_line': '_______________________',
+        'sale_lines': [
+            {
+                'name': str(line.get('name') or '—'),
+                'quantity_display': str(line.get('quantity_display') or line.get('unit') or '0 шт'),
+                'unit_price': str(line.get('price') or '0'),
+                'line_total': str(line.get('sum') or '0'),
+            }
+            for line in payload.get('lines') or []
+        ],
+        'total': str(payload.get('total') or '0'),
+    }
+
+
+def _waybill_layout_spec(payload: dict) -> dict:
+    return {
+        'title': f"Расходная накладная № {payload['waybill_number']} от {payload['waybill_date']} г.",
+        'supplier': f"Поставщик: {payload['supplier']['name']}, тел: {payload['supplier']['phone']}",
+        'buyer': f"Покупатель: {payload['buyer_name']}",
+        'headers': ['№', 'Наименование товара', 'Единица измерение', 'Цена', 'Сумма'],
+        'signatures': [
+            'Отпустил',
+            'Получил',
+            'Место печати',
+        ],
+        'signature_line': '____________________',
+        'total_label': 'Итого',
+    }
+
+
 def _sale_waybill_pdf_response(payload: dict) -> HttpResponse:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
+    from xhtml2pdf import pisa
 
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    pdf.setTitle(f"waybill-{payload['sale_id']}")
-    pdf.setFont('Helvetica', 12)
-    y = 800
-
-    pdf.drawString(40, y, f"Расходная накладная № {payload['waybill_number']} от {payload['waybill_date']} г.")
-    y -= 28
-    pdf.drawString(40, y, f"Поставщик: {payload['supplier']['name']}  тел: {payload['supplier']['phone']}")
-    y -= 20
-    pdf.drawString(40, y, f"Покупатель: {payload['buyer_name']}")
-    y -= 28
-
-    headers = ['№', 'Наименование товара', 'Единица измерение', 'Цена', 'Сумма']
-    col_x = [40, 80, 340, 440, 510]
-    for i, header in enumerate(headers):
-        pdf.drawString(col_x[i], y, header)
-    y -= 14
-    pdf.line(40, y, 555, y)
-    y -= 18
-
-    for line in payload['lines']:
-        pdf.drawString(col_x[0], y, str(line['index']))
-        pdf.drawString(col_x[1], y, str(line['name'])[:46])
-        pdf.drawString(col_x[2], y, line['unit'])
-        pdf.drawString(col_x[3], y, line['price'])
-        pdf.drawString(col_x[4], y, line['sum'])
-        y -= 18
-        if y < 140:
-            pdf.showPage()
-            pdf.setFont('Helvetica', 12)
-            y = 800
-
-    y -= 6
-    pdf.line(40, y, 555, y)
-    y -= 20
-    pdf.drawString(440, y, f"Итого: {payload['total']}")
-    y -= 40
-    pdf.drawString(40, y, "Отпустил ____________________")
-    y -= 26
-    pdf.drawString(40, y, "Получил _____________________")
-    y -= 26
-    pdf.drawString(40, y, "Место печати ________________")
-
-    pdf.save()
-    buffer.seek(0)
-    response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+    html = _render_waybill_html(payload)
+    pdf_buffer = BytesIO()
+    result = pisa.CreatePDF(
+        src=html,
+        dest=pdf_buffer,
+        encoding='utf-8',
+    )
+    if result.err:
+        raise RuntimeError('PDF_RENDER_FAILED')
+    pdf_buffer.seek(0)
+    response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
     response['Content-Disposition'] = f'inline; filename="waybill-{payload["sale_id"]}.pdf"'
     return response
 
 
 def _sale_waybill_xlsx_response(payload: dict) -> HttpResponse:
     from openpyxl import Workbook
-    from openpyxl.styles import Font
+    from openpyxl.styles import Font, Alignment, Border, Side
 
+    layout = _waybill_layout_spec(payload)
     wb = Workbook()
     ws = wb.active
     ws.title = 'Waybill'
 
-    ws['A1'] = f"Расходная накладная № {payload['waybill_number']} от {payload['waybill_date']} г."
-    ws['A1'].font = Font(bold=True, size=12)
-    ws['A3'] = f"Поставщик: {payload['supplier']['name']}, тел: {payload['supplier']['phone']}"
-    ws['A4'] = f"Покупатель: {payload['buyer_name']}"
+    ws.merge_cells('A1:E1')
+    ws['A1'] = layout['title']
+    ws['A1'].font = Font(name='Times New Roman', bold=True, size=14)
+    ws['A1'].alignment = Alignment(horizontal='center')
+    ws.merge_cells('A3:E3')
+    ws['A3'] = layout['supplier']
+    ws.merge_cells('A4:E4')
+    ws['A4'] = layout['buyer']
+    ws['A3'].font = Font(name='Times New Roman', size=12)
+    ws['A4'].font = Font(name='Times New Roman', size=12)
 
-    headers = ['№', 'Наименование товара', 'Единица измерение', 'Цена', 'Сумма']
+    headers = layout['headers']
+    thin = Side(style='thin', color='000000')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
     row = 6
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=row, column=col, value=header)
-        cell.font = Font(bold=True)
+        cell.font = Font(name='Times New Roman', bold=True, size=12)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = border
 
     for line in payload['lines']:
         row += 1
-        ws.cell(row=row, column=1, value=line['index'])
-        ws.cell(row=row, column=2, value=line['name'])
-        ws.cell(row=row, column=3, value=line['unit'])
-        ws.cell(row=row, column=4, value=line['price'])
-        ws.cell(row=row, column=5, value=line['sum'])
+        row_cells = [
+            line['index'],
+            line['name'],
+            line['unit'],
+            line['price'],
+            line['sum'],
+        ]
+        for col, value in enumerate(row_cells, 1):
+            cell = ws.cell(row=row, column=col, value=value)
+            cell.font = Font(name='Times New Roman', size=12)
+            cell.border = border
+            if col in (1, 3):
+                cell.alignment = Alignment(horizontal='center')
+            if col in (4, 5):
+                cell.alignment = Alignment(horizontal='right')
 
-    row += 2
-    ws.cell(row=row, column=4, value='Итого').font = Font(bold=True)
-    ws.cell(row=row, column=5, value=payload['total']).font = Font(bold=True)
+    row += 1
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+    total_label_cell = ws.cell(row=row, column=1, value=layout['total_label'])
+    total_label_cell.font = Font(name='Times New Roman', bold=True, size=12)
+    total_label_cell.alignment = Alignment(horizontal='right')
+    total_label_cell.border = border
+    for col in (2, 3, 4):
+        ws.cell(row=row, column=col).border = border
+    total_value_cell = ws.cell(row=row, column=5, value=payload['total'])
+    total_value_cell.font = Font(name='Times New Roman', bold=True, size=12)
+    total_value_cell.alignment = Alignment(horizontal='right')
+    total_value_cell.border = border
 
     row += 3
-    ws.cell(row=row, column=1, value='Отпустил ____________________')
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    ws.cell(row=row, column=1, value=layout['signatures'][0])
+    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+    ws.cell(row=row, column=3, value=layout['signatures'][1])
+    ws.merge_cells(start_row=row, start_column=5, end_row=row, end_column=5)
+    ws.cell(row=row, column=5, value=layout['signatures'][2])
     row += 2
-    ws.cell(row=row, column=1, value='Получил _____________________')
-    row += 2
-    ws.cell(row=row, column=1, value='Место печати ________________')
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    ws.cell(row=row, column=1, value=layout['signature_line'])
+    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+    ws.cell(row=row, column=3, value=layout['signature_line'])
+    ws.merge_cells(start_row=row, start_column=5, end_row=row, end_column=5)
+    ws.cell(row=row, column=5, value=layout['signature_line'])
+    for coord in ('A11', 'C11', 'E11', 'A13', 'C13', 'E13'):
+        ws[coord].font = Font(name='Times New Roman', size=12)
 
     ws.column_dimensions['A'].width = 6
-    ws.column_dimensions['B'].width = 42
-    ws.column_dimensions['C'].width = 22
-    ws.column_dimensions['D'].width = 14
-    ws.column_dimensions['E'].width = 14
+    ws.column_dimensions['B'].width = 34
+    ws.column_dimensions['C'].width = 20
+    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['E'].width = 18
 
     out = BytesIO()
     wb.save(out)
@@ -260,8 +376,9 @@ def _sale_waybill_xlsx_response(payload: dict) -> HttpResponse:
 
 
 def _render_waybill_html(payload: dict) -> str:
-    template_path = Path(settings.BASE_DIR) / 'apps' / 'sales' / 'templates' / 'sales' / 'waybill.html'
+    template_path = Path(settings.BASE_DIR) / 'apps' / 'sales' / 'templates' / 'sales' / 'waybill_template.html'
     template_raw = template_path.read_text(encoding='utf-8')
+    layout = _waybill_layout_spec(payload)
     rows = []
     for line in payload['lines']:
         rows.append(
@@ -274,15 +391,27 @@ def _render_waybill_html(payload: dict) -> str:
             '</tr>'
         )
     lines_rows = ''.join(rows)
-    return template_raw.format(
-        waybill_number=escape(str(payload['waybill_number'])),
-        waybill_date=escape(str(payload['waybill_date'])),
-        supplier_name=escape(str(payload['supplier']['name'])),
-        supplier_phone=escape(str(payload['supplier']['phone'])),
-        buyer_name=escape(str(payload['buyer_name'])),
-        lines_rows=lines_rows,
-        total=escape(str(payload['total'])),
-    )
+    substitutions = {
+        'title': escape(layout['title']),
+        'supplier': escape(layout['supplier']),
+        'buyer': escape(layout['buyer']),
+        'h1': escape(layout['headers'][0]),
+        'h2': escape(layout['headers'][1]),
+        'h3': escape(layout['headers'][2]),
+        'h4': escape(layout['headers'][3]),
+        'h5': escape(layout['headers'][4]),
+        'total_label': escape(layout['total_label']),
+        'sign1': escape(layout['signatures'][0]),
+        'sign2': escape(layout['signatures'][1]),
+        'sign3': escape(layout['signatures'][2]),
+        'sign_line': escape(layout['signature_line']),
+        'lines_rows': lines_rows,
+        'total': escape(str(payload['total'])),
+    }
+    html = template_raw
+    for key, value in substitutions.items():
+        html = html.replace(f'{{{key}}}', value)
+    return html
 
 
 def _order_display_payload(order: Order) -> dict:
@@ -1112,7 +1241,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         }.get(payment_status, '—')
 
         sale_lines = []
-        for sl in instance.sale_lines.select_related('warehouse_batch', 'warehouse_batch__profile').all():
+        all_sale_lines = list(instance.sale_lines.select_related('warehouse_batch', 'warehouse_batch__profile').all())
+        lines_count = len(all_sale_lines)
+        for sl in all_sale_lines:
             wb = sl.warehouse_batch
             wb_display = None
             if wb is not None:
@@ -1121,11 +1252,17 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     f"{api_decimal_str(Decimal(str(wb.length_per_piece or 0)))} м"
                 )
             line_display = wb_display or sl.product
+            pkg = _sale_line_packaging_payload(instance, sl, lines_count=lines_count)
             sale_lines.append({
                 'id': sl.id,
+                'unit_type': pkg['unit_type'],
                 'warehouse_batch_display': wb_display,
+                'warehouse_batch': sl.warehouse_batch_id,
                 'display': line_display,
-                'quantity': api_decimal_str(Decimal(str(sl.quantity or 0))),
+                'quantity': pkg['quantity'],
+                'packages_quantity': pkg['packages_quantity'],
+                'pieces_per_package': pkg['pieces_per_package'],
+                'quantity_display': pkg['quantity_display'],
                 'unit_price': api_decimal_str(Decimal(str(sl.unit_price or 0))),
                 'total_amount': api_decimal_str(Decimal(str(sl.line_total or 0))),
                 'line_total': api_decimal_str(Decimal(str(sl.line_total or 0))),
@@ -1457,18 +1594,29 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return resp
 
     def _serve_nakladnaya(self, request, *args, **kwargs):
-        fmt = (request.query_params.get('format') or 'html').strip().lower()
-        if fmt not in ('html', 'pdf', 'xlsx'):
-            return _err('INVALID_FORMAT', 'Поддерживаемые форматы: html, pdf, xlsx', http_status=400)
+        accept = (request.headers.get('Accept') or '').lower()
+        requested_format = (request.query_params.get('format') or '').strip().lower()
+        if requested_format:
+            fmt = requested_format
+        elif 'application/json' in accept:
+            fmt = 'json'
+        else:
+            fmt = 'html'
+        if fmt not in ('html', 'pdf', 'xlsx', 'json'):
+            return _err('INVALID_FORMAT', 'Поддерживаемые форматы: html, pdf, xlsx, json', http_status=400)
         try:
             sale = self.get_object()
         except Http404:
             return _err('SALE_NOT_FOUND', 'Продажа не найдена', http_status=404)
 
+        payload = _build_sale_waybill_payload(sale)
+        payload['title'] = f"Расходная накладная № {sale.id} от ________ г."
+        payload['buyer_name'] = sale.client.name if sale.client_id else '—'
+
+        if fmt == 'json':
+            return Response(_waybill_json_payload(payload))
         if fmt == 'html':
             return SaleViewSet._nakladnaya_html_response(sale)
-
-        payload = _build_sale_waybill_payload(sale)
         if fmt == 'pdf':
             return _sale_waybill_pdf_response(payload)
         return _sale_waybill_xlsx_response(payload)
