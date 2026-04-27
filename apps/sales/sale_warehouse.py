@@ -27,7 +27,7 @@ def _is_shipping_status(status: str) -> bool:
 
 
 def apply_warehouse_for_sale(sale: Sale) -> bool:
-    if sale.warehouse_stock_applied or not _is_shipping_status(sale.sale_status):
+    if sale.warehouse_stock_applied:
         return False
     if sale.sale_status == Sale.STATUS_CANCELED:
         return False

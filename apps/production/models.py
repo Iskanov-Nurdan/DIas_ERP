@@ -178,6 +178,14 @@ class ProductionBatch(models.Model):
         null=True,
         blank=True,
     )
+    client_order = models.ForeignKey(
+        'sales.Order',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='production_batches',
+        verbose_name='Заявка клиента',
+    )
     profile = models.ForeignKey(
         'recipes.PlasticProfile',
         on_delete=models.PROTECT,

@@ -218,3 +218,32 @@ class ClientsApiContractTests(APITestCase):
         row = next(item for item in rows if item['id'] == c.pk)
         self.assertEqual(row['sales_count'], 1)
         self.assertEqual(row['sales_total'], '100')
+
+    def test_profile_summary_and_debts_sync_after_partial_payment(self):
+        c = self._create_client()
+        sale = Sale.objects.create(
+            order_number='ORD-DEBT-1',
+            product='Профиль',
+            quantity=Decimal('1'),
+            date=date(2026, 4, 26),
+            client=c,
+            sale_status=Sale.STATUS_DRAFT,
+            revenue=Decimal('400'),
+            cost=Decimal('100'),
+        )
+        Payment.objects.create(
+            client=c,
+            linked_sale=sale,
+            date=date(2026, 4, 26),
+            payment_type=Payment.TYPE_PAYMENT,
+            payment_method=Payment.METHOD_CASH,
+            amount=Decimal('200'),
+            status=Payment.STATUS_ACTIVE,
+        )
+
+        resp = self.client.get(f'/api/clients/{c.pk}/profile/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['summary']['total_sales_amount'], '400')
+        self.assertEqual(resp.data['summary']['total_paid_amount'], '200')
+        self.assertEqual(resp.data['summary']['total_debt'], '200')
+        self.assertTrue(any(d['id'] == sale.pk and d['debt_amount'] == '200' for d in resp.data['debts']))

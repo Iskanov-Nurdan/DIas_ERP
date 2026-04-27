@@ -157,6 +157,24 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(resp.data.get('code'), 'ORDER_LINE_QUANTITY_EXCEEDED')
 
+    def test_create_with_order_full_shipping_sets_order_closed(self):
+        payload = self._payload(qty='10')
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.order.refresh_from_db()
+        self.order_line.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CLOSED)
+        self.assertEqual(self.order_line.shipped_quantity, Decimal('10'))
+
+    def test_create_with_order_partial_shipping_sets_order_partially_shipped(self):
+        payload = self._payload(qty='4')
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.order.refresh_from_db()
+        self.order_line.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PARTIALLY_SHIPPED)
+        self.assertEqual(self.order_line.shipped_quantity, Decimal('4'))
+
     def test_update_rejects_status_via_patch(self):
         sale = self._create_sale()
         resp = self.client.patch(f'/api/sales/{sale.pk}/', data={'sale_status': Sale.STATUS_CONFIRMED}, format='json')

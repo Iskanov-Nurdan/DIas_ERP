@@ -1,5 +1,5 @@
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape
 
 from django.db import transaction
@@ -33,6 +33,7 @@ from .models import (
     SaleLine,
     Shipment,
 )
+from .client_order_production import apply_resource_check_to_order
 from .serializers import (
     ClientPriceSerializer,
     ClientSerializer,
@@ -62,6 +63,56 @@ def _err(code: str, message: str, errors: list = None, http_status: int = 400) -
     if errors:
         payload['errors'] = errors
     return Response(payload, status=http_status)
+
+
+def _order_display_payload(order: Order) -> dict:
+    profile_name = None
+    length = None
+    qty = None
+    total_meters = None
+    request_status = getattr(order, 'request_status', None)
+    if getattr(order, 'production_profile_id', None):
+        profile_name = (order.production_profile.name if order.production_profile_id else None) or None
+    if getattr(order, 'production_length', None) is not None:
+        length = api_decimal_str(Decimal(str(order.production_length)))
+    if getattr(order, 'production_quantity', None) is not None:
+        qty = int(order.production_quantity)
+    if getattr(order, 'request_total_meters', None) is not None:
+        total_meters = api_decimal_str(Decimal(str(order.request_total_meters)))
+    elif length is not None and qty is not None:
+        total_meters = api_decimal_str((Decimal(str(length)) * Decimal(qty)).quantize(Decimal('0.0001')))
+    shipping_statuses = {
+        Order.STATUS_PARTIALLY_SHIPPED,
+        Order.STATUS_SHIPPED,
+        Order.STATUS_CLOSED,
+    }
+    prefer_order_status = order.status in shipping_statuses
+    status_label = (
+        order.get_status_display()
+        if (prefer_order_status or not request_status)
+        else order.get_request_status_display()
+    )
+    display_parts = [profile_name or '—']
+    if qty is not None and length is not None:
+        display_parts.append(f'{qty} шт × {length} м')
+    elif qty is not None:
+        display_parts.append(f'{qty} шт')
+    if request_status and not prefer_order_status:
+        display_parts.append(status_label.lower())
+    return {
+        'id': order.id,
+        'display': ' — '.join(display_parts),
+        'order_number': order.order_number,
+        'date': order.date.isoformat() if order.date else None,
+        'order_display': ' — '.join(display_parts),
+        'client_name': order.client.name if order.client_id else None,
+        'profile_name': profile_name,
+        'quantity': qty,
+        'length': length,
+        'total_meters': total_meters,
+        'request_status': request_status,
+        'status_label': status_label,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +251,113 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'credit_warning': credit_check.warning,
         })
 
+    @action(detail=True, methods=['get'], url_path='profile')
+    def profile(self, request, pk=None):
+        """
+        Карточка клиента под продажи:
+        - client info
+        - total_debt
+        - purchases (sales)
+        - orders
+        - returns
+        """
+        from .payment_status import sale_payment_metrics
+
+        client = self.get_object()
+        sales_qs = (
+            Sale.objects.filter(client=client)
+            .exclude(sale_status=Sale.STATUS_CANCELED)
+            .order_by('-date', '-id')
+        )
+        orders_qs = Order.objects.filter(client=client).select_related('production_profile').order_by('-date', '-id')
+        returns_qs = Return.objects.filter(sale__client=client).order_by('-date', '-id')
+
+        total_debt = Decimal('0')
+        total_sales_amount = Decimal('0')
+        total_paid_amount = Decimal('0')
+        debts = []
+        sales_payload = []
+        for s in sales_qs:
+            m = sale_payment_metrics(s)
+            sale_total = Decimal(str(s.revenue or 0)).quantize(Decimal('0.01'))
+            paid = Decimal(str(m.get('paid_amount') or 0)).quantize(Decimal('0.01'))
+            debt = Decimal(str(m.get('debt_amount') or 0)).quantize(Decimal('0.01'))
+            total_sales_amount += sale_total
+            total_paid_amount += paid
+            total_debt += debt
+            sale_item = {
+                'id': s.id,
+                'display': f'{s.sale_number or s.order_number} — {api_decimal_str(sale_total)}',
+                'date': s.date.isoformat() if s.date else None,
+                'sale_number': s.sale_number or s.order_number,
+                'items': [
+                    {
+                        'product': sl.product,
+                        'quantity': api_decimal_str(Decimal(str(sl.quantity or 0))),
+                        'unit_price': api_decimal_str(Decimal(str(sl.unit_price or 0))),
+                        'line_total': api_decimal_str(Decimal(str(sl.line_total or 0))),
+                    }
+                    for sl in s.sale_lines.all()
+                ],
+                'total_amount': api_decimal_str(sale_total),
+                'paid_amount': api_decimal_str(paid),
+                'debt_amount': api_decimal_str(debt),
+                'payment_status': m.get('payment_status'),
+                'payment_status_label': (
+                    'Оплачено' if debt == 0 else ('Частично оплачено' if paid > 0 else 'В долг')
+                ),
+            }
+            sales_payload.append(sale_item)
+            if debt > 0:
+                debts.append({
+                    'id': s.id,
+                    'sale_id': s.id,
+                    'display': f'{s.sale_number or s.order_number} — долг {api_decimal_str(debt)}',
+                    'sale_number': s.sale_number or s.order_number,
+                    'date': s.date.isoformat() if s.date else None,
+                    'total_amount': api_decimal_str(sale_total),
+                    'paid_amount': api_decimal_str(paid),
+                    'debt_amount': api_decimal_str(debt),
+                })
+
+        total_debt = sum((Decimal(str(d['debt_amount'])) for d in debts), Decimal('0'))
+        orders_payload = [_order_display_payload(o) for o in orders_qs]
+        returns_payload = []
+        for ret in returns_qs:
+            ret_label = ret.return_number or f'RET-{ret.id}'
+            returns_payload.append({
+                'id': ret.id,
+                'display': f'Возврат {ret_label}',
+                'date': ret.date.isoformat() if ret.date else None,
+                'return_reason': ret.comment or '',
+                'status': ret.status,
+            })
+
+        return Response({
+            'client': {
+                'id': client.id,
+                'name': client.name,
+                'phone': client.phone or '',
+                'phone_extra': client.phone_alt or '',
+                'status': 'active' if client.is_active else 'inactive',
+                'status_label': 'Активен' if client.is_active else 'Неактивен',
+                'comment': client.notes or '',
+            },
+            'summary': {
+                'total_sales_amount': api_decimal_str(total_sales_amount.quantize(Decimal('0.01'))),
+                'total_paid_amount': api_decimal_str(total_paid_amount.quantize(Decimal('0.01'))),
+                'total_debt': api_decimal_str(total_debt.quantize(Decimal('0.01'))),
+                'total_orders': orders_qs.count(),
+                'total_returns': returns_qs.count(),
+            },
+            'total_debt': api_decimal_str(total_debt.quantize(Decimal('0.01'))),
+            'purchases': sales_payload,
+            'sales': sales_payload,
+            'orders': orders_payload,
+            'returns': returns_payload,
+            'debts': debts,
+        })
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ORDER (Заявка)
@@ -286,6 +444,121 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
             'profiles': [{'id': p['id'], 'label': p['name']} for p in profiles],
         })
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        """
+        Производство: draft → approved (коммит) → checking (коммит) → ready | not_ready (коммит),
+        чтобы фронт и опросы видели «приняли» и «идёт проверка».
+        """
+        try:
+            pre = Order.objects.get(pk=pk)
+        except Order.DoesNotExist:
+            return _err('NOT_FOUND', 'Заявка не найдена', http_status=404)
+        if pre.request_status != Order.REQUEST_STATUS_DRAFT:
+            return _err(
+                'INVALID_REQUEST_STATUS',
+                'Принять можно только заявку в статусе draft (производство).',
+                http_status=400,
+            )
+        if not pre.production_profile_id or pre.production_length is None or not pre.production_quantity:
+            return _err('INCOMPLETE_PRODUCTION', 'Укажите profile, length и quantity у заявки.', http_status=400)
+
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=pk)
+            if order.request_status != Order.REQUEST_STATUS_DRAFT:
+                return _err(
+                    'INVALID_REQUEST_STATUS',
+                    'Принять можно только заявку в статусе draft (производство).',
+                    http_status=400,
+                )
+            order.request_status = Order.REQUEST_STATUS_APPROVED
+            order.save(update_fields=['request_status', 'updated_at'])
+
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=pk)
+            if order.request_status != Order.REQUEST_STATUS_APPROVED:
+                return _err('INVALID_REQUEST_STATUS', 'Неконсистентный статус заявки (ожидался approved).', http_status=409)
+            order.request_status = Order.REQUEST_STATUS_CHECKING
+            order.save(update_fields=['request_status', 'updated_at'])
+
+        with transaction.atomic():
+            order = (
+                Order.objects.select_for_update()
+                .select_related('production_profile', 'client', 'resolved_recipe')
+                .get(pk=pk)
+            )
+            if order.request_status != Order.REQUEST_STATUS_CHECKING:
+                return _err('INVALID_REQUEST_STATUS', 'Неконсистентный статус заявки (ожидался checking).', http_status=409)
+            apply_resource_check_to_order(order)
+            order.save(
+                update_fields=[
+                    'resolved_recipe', 'resource_check_snapshot', 'request_status', 'updated_at',
+                ],
+            )
+        return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='recheck')
+    def recheck(self, request, pk=None):
+        """Повторная проверка ресурсов из not_ready: checking (коммит) → ready | not_ready."""
+        try:
+            pre = Order.objects.get(pk=pk)
+        except Order.DoesNotExist:
+            return _err('NOT_FOUND', 'Заявка не найдена', http_status=404)
+        if pre.request_status != Order.REQUEST_STATUS_NOT_READY:
+            return _err(
+                'INVALID_REQUEST_STATUS',
+                'Повторная проверка доступна только в статусе not_ready.',
+                http_status=400,
+            )
+        if not pre.production_profile_id or pre.production_length is None or not pre.production_quantity:
+            return _err('INCOMPLETE_PRODUCTION', 'Укажите profile, length и quantity у заявки.', http_status=400)
+
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=pk)
+            if order.request_status != Order.REQUEST_STATUS_NOT_READY:
+                return _err(
+                    'INVALID_REQUEST_STATUS',
+                    'Повторная проверка доступна только в статусе not_ready.',
+                    http_status=400,
+                )
+            order.request_status = Order.REQUEST_STATUS_CHECKING
+            order.save(update_fields=['request_status', 'updated_at'])
+
+        with transaction.atomic():
+            order = (
+                Order.objects.select_for_update()
+                .select_related('production_profile', 'client', 'resolved_recipe')
+                .get(pk=pk)
+            )
+            if order.request_status != Order.REQUEST_STATUS_CHECKING:
+                return _err('INVALID_REQUEST_STATUS', 'Неконсистентный статус заявки (ожидался checking).', http_status=409)
+            apply_resource_check_to_order(order)
+            order.save(
+                update_fields=[
+                    'resolved_recipe', 'resource_check_snapshot', 'request_status', 'updated_at',
+                ],
+            )
+        return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request, pk=None):
+        """Отклонить заявку (производство) → rejected."""
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=pk)
+            if order.request_status == Order.REQUEST_STATUS_IN_PRODUCTION:
+                return _err(
+                    'INVALID_REQUEST_STATUS',
+                    'Нельзя отклонить заявку, уже запущенную в производство.',
+                    http_status=400,
+                )
+            if order.request_status is None:
+                return _err('INVALID_REQUEST_STATUS', 'Заявка не в цепочке производства (request_status).', http_status=400)
+            if order.request_status == Order.REQUEST_STATUS_REJECTED:
+                return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
+            order.request_status = Order.REQUEST_STATUS_REJECTED
+            order.save(update_fields=['request_status', 'updated_at'])
+        return Response(OrderSerializer(order, context={'request': request}).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['patch'], url_path='status')
     def set_status(self, request, pk=None):
@@ -581,6 +854,77 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         instance = self.get_object()
         data = SaleSerializer(instance, context={'request': request}).data
         from .state_machine import SALE_TRANSITIONS
+        from .payment_status import sale_payment_metrics
+        pay = sale_payment_metrics(instance)
+        paid_amount = Decimal(str(pay.get('paid_amount') or 0)).quantize(Decimal('0.01'))
+        debt_amount = Decimal(str(pay.get('debt_amount') or 0)).quantize(Decimal('0.01'))
+        payment_status = pay.get('payment_status') or ('paid' if debt_amount == 0 else ('partial' if paid_amount > 0 else 'debt'))
+
+        active_payments = list(
+            instance.payments.filter(
+                status=Payment.STATUS_ACTIVE,
+                payment_type__in=(Payment.TYPE_PAYMENT, Payment.TYPE_PREPAYMENT, Payment.TYPE_SURCHARGE),
+            ).order_by('-id')
+        )
+        payment_method_raw = active_payments[0].payment_method if active_payments else None
+        payment_method = (
+            'cash' if payment_method_raw == Payment.METHOD_CASH
+            else ('card' if payment_method_raw == Payment.METHOD_CARD
+            else ('transfer' if payment_method_raw == Payment.METHOD_TRANSFER else None))
+        )
+        if debt_amount == 0:
+            payment_type = 'full'
+        elif paid_amount > 0:
+            payment_type = 'partial'
+        else:
+            payment_type = 'debt'
+        payment_type_label = {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[payment_type]
+        payment_method_label = {'cash': 'Наличные', 'card': 'Карта', 'transfer': 'Перевод'}.get(payment_method, '')
+        payment_status_label = {
+            'paid': 'Оплачено',
+            'unpaid': 'Долг',
+            'debt': 'Долг',
+            'partially_paid': 'Частично оплачено',
+            'partial': 'Частично оплачено',
+            'overpaid': 'Переплата',
+            'refunded': 'Возвращено',
+        }.get(payment_status, '—')
+
+        sale_lines = []
+        for sl in instance.sale_lines.select_related('warehouse_batch', 'warehouse_batch__profile').all():
+            wb = sl.warehouse_batch
+            wb_display = None
+            if wb is not None:
+                wb_display = (
+                    f"{(wb.profile.name if wb.profile_id else wb.product)} — "
+                    f"{api_decimal_str(Decimal(str(wb.length_per_piece or 0)))} м"
+                )
+            line_display = wb_display or sl.product
+            sale_lines.append({
+                'id': sl.id,
+                'warehouse_batch_display': wb_display,
+                'display': line_display,
+                'quantity': api_decimal_str(Decimal(str(sl.quantity or 0))),
+                'unit_price': api_decimal_str(Decimal(str(sl.unit_price or 0))),
+                'total_amount': api_decimal_str(Decimal(str(sl.line_total or 0))),
+                'line_total': api_decimal_str(Decimal(str(sl.line_total or 0))),
+            })
+
+        data['order_display'] = (
+            _order_display_payload(instance.linked_order)['display']
+            if instance.linked_order_id else None
+        )
+        data['payment_type'] = payment_type
+        data['payment_type_label'] = payment_type_label
+        data['payment_method'] = payment_method
+        data['payment_method_label'] = payment_method_label
+        data['payment_status'] = payment_status
+        data['payment_status_label'] = payment_status_label
+        data['total_amount'] = api_decimal_str(Decimal(str(instance.revenue or 0)))
+        data['paid_amount'] = api_decimal_str(paid_amount)
+        data['debt_amount'] = api_decimal_str(debt_amount)
+        data['sale_lines'] = sale_lines
+        data['unit_type'] = instance.sale_mode
         data['linked_entities'] = {
             'client': (
                 {
@@ -622,10 +966,13 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         )
         orders_qs = Order.objects.order_by('-date', '-id')
         client_id = request.query_params.get('client_id')
+        if not client_id:
+            client_id = request.query_params.get('client')
+        unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
-        orders = list(orders_qs.select_related('client')[:200])
-        order_id = request.query_params.get('order_id')
+        orders = list(orders_qs.select_related('client', 'production_profile')[:200])
+        order_id = request.query_params.get('order_id') or request.query_params.get('order')
         order_lines = []
         if order_id:
             lines_qs = OrderLine.objects.filter(order_id=order_id).order_by('id')[:300]
@@ -654,6 +1001,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             [:300]
         )
         warehouse_batches = []
+        available_batches = []
         quality_labels = {
             WarehouseBatch.QUALITY_GOOD: 'Годный',
             WarehouseBatch.QUALITY_DEFECT: 'Брак',
@@ -667,6 +1015,32 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             available_qty = Decimal(str(get_available_quantity(b.pk)))
             if available_qty <= 0:
                 continue
+            ppp = Decimal(str(b.pieces_per_package or 0))
+            avail_packages = None
+            if ppp > 0:
+                avail_packages = api_decimal_str((available_qty / ppp).quantize(Decimal('0.0001')))
+            if unit_type == Sale.MODE_PACKAGES:
+                if b.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+                    continue
+                if ppp <= 0:
+                    continue
+                if (available_qty / ppp) < Decimal('1'):
+                    continue
+            elif unit_type == Sale.MODE_PIECES:
+                # pieces: доступны все строки, где можно списать штуки (включая packed через вскрытие)
+                pass
+            total_meters = None
+            if b.length_per_piece is not None:
+                total_meters = api_decimal_str(
+                    (available_qty * Decimal(str(b.length_per_piece))).quantize(Decimal('0.0001')),
+                )
+            display = (
+                f"{(b.profile.name if b.profile_id else b.product)} — "
+                f"{api_decimal_str(Decimal(str(b.length_per_piece or 0)))} м — "
+                f"остаток: {api_decimal_str(available_qty)} шт"
+            )
+            if avail_packages is not None:
+                display += f" / {avail_packages} уп."
             warehouse_batches.append(
                 {
                     'id': b.pk,
@@ -682,6 +1056,25 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     'inventory_form': b.inventory_form,
                 },
             )
+            available_batches.append(
+                {
+                    'id': b.pk,
+                    'display': display,
+                    'warehouse_batch_display': display,
+                    'profile_name': b.profile.name if b.profile_id else None,
+                    'length_per_piece': (
+                        api_decimal_str(Decimal(str(b.length_per_piece)))
+                        if b.length_per_piece is not None else None
+                    ),
+                    'available_pieces': api_decimal_str(available_qty),
+                    'available_packages': avail_packages,
+                    'total_meters': total_meters,
+                    'quality': b.quality,
+                    'status': b.status,
+                    'unit_labels': {'pieces': 'шт', 'packages': 'уп', 'meters': 'м'},
+                },
+            )
+        available_orders = [_order_display_payload(o) for o in orders]
         return Response({
             'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
             'orders': [
@@ -696,6 +1089,142 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             ],
             'order_lines': order_lines,
             'warehouse_batches': warehouse_batches,
+            'available_orders': available_orders,
+            'available_warehouse_batches': available_batches,
+        })
+
+    @action(detail=False, methods=['post'], url_path='preview')
+    def preview(self, request):
+        """
+        Предпросмотр продажи без списаний и без сохранения.
+        """
+        from apps.warehouse.models import WarehouseBatch
+        from .reservations import get_available_quantity
+
+        data = request.data or {}
+        client_id = data.get('client')
+        if client_id in (None, ''):
+            return _err('MISSING_CLIENT', 'Поле client обязательно.', http_status=400)
+        sale_lines = data.get('sale_lines')
+        if not isinstance(sale_lines, list) or len(sale_lines) < 1:
+            return _err('MISSING_SALE_LINES', 'sale_lines обязателен и должен содержать минимум одну строку.', http_status=400)
+
+        unit_type = (data.get('unit_type') or Sale.MODE_PIECES).strip().lower()
+        if unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+            return _err('INVALID_UNIT_TYPE', 'unit_type: pieces или packages', http_status=400)
+
+        total_amount = Decimal('0')
+        normalized_lines = []
+        errors = []
+        for idx, row in enumerate(sale_lines, start=1):
+            wb_id = row.get('warehouse_batch')
+            qty_raw = row.get('quantity')
+            up_raw = row.get('unit_price')
+            if wb_id in (None, ''):
+                errors.append({'field': f'sale_lines[{idx}].warehouse_batch', 'message': 'warehouse_batch обязателен'})
+                continue
+            if qty_raw in (None, ''):
+                errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity обязателен'})
+                continue
+            if up_raw in (None, ''):
+                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price обязателен'})
+                continue
+            try:
+                wb = WarehouseBatch.objects.select_related('profile').get(pk=wb_id)
+            except WarehouseBatch.DoesNotExist:
+                errors.append({'field': f'sale_lines[{idx}].warehouse_batch', 'message': 'Партия не найдена'})
+                continue
+            try:
+                qty_in = Decimal(str(qty_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity должен быть числом'})
+                continue
+            try:
+                unit_price = Decimal(str(up_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price должен быть числом'})
+                continue
+            if qty_in <= 0:
+                errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity должен быть > 0'})
+                continue
+            if unit_price < 0:
+                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price не может быть < 0'})
+                continue
+            available_pieces = Decimal(str(get_available_quantity(wb.pk)))
+            if unit_type == Sale.MODE_PACKAGES:
+                try:
+                    ppp = Decimal(str(wb.pieces_per_package or 0))
+                except (InvalidOperation, TypeError, ValueError):
+                    ppp = Decimal('0')
+                if ppp <= 0:
+                    errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'Для продажи в упаковках у партии нет pieces_per_package'})
+                    continue
+                qty_pieces = (qty_in * ppp).quantize(Decimal('0.0001'))
+            else:
+                qty_pieces = qty_in.quantize(Decimal('0.0001'))
+            if qty_pieces > available_pieces + Decimal('0.0001'):
+                errors.append({
+                    'field': f'sale_lines[{idx}].quantity',
+                    'message': f'Недостаточно остатка: доступно {api_decimal_str(available_pieces)} шт',
+                })
+                continue
+            line_total = (qty_in * unit_price).quantize(Decimal('0.01'))
+            total_amount += line_total
+            normalized_lines.append({
+                'warehouse_batch': wb.pk,
+                'warehouse_batch_display': f"{(wb.profile.name if wb.profile_id else wb.product)}",
+                'input_quantity': api_decimal_str(qty_in),
+                'quantity_pieces': api_decimal_str(qty_pieces),
+                'unit_price': api_decimal_str(unit_price),
+                'line_total': api_decimal_str(line_total),
+            })
+
+        if errors:
+            return _err('VALIDATION_ERROR', 'Ошибки в предпросмотре продажи.', errors=errors, http_status=400)
+
+        payment_type = (data.get('payment_type') or '').strip().lower()
+        payment_method = (data.get('payment_method') or '').strip().lower()
+        paid_raw = data.get('paid_amount')
+        total_amount = total_amount.quantize(Decimal('0.01'))
+        paid_amount = Decimal('0')
+        debt_amount = Decimal('0')
+        if payment_type == 'full':
+            paid_amount = total_amount
+            debt_amount = Decimal('0')
+        elif payment_type == 'partial':
+            if paid_raw in (None, ''):
+                return _err('PAID_AMOUNT_REQUIRED', 'Для partial укажите paid_amount.', http_status=400)
+            try:
+                paid_amount = Decimal(str(paid_raw)).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть числом.', http_status=400)
+            if paid_amount <= 0 or paid_amount > total_amount:
+                return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть в диапазоне (0, total_amount].', http_status=400)
+            debt_amount = (total_amount - paid_amount).quantize(Decimal('0.01'))
+        elif payment_type == 'debt':
+            paid_amount = Decimal('0')
+            debt_amount = total_amount
+        else:
+            return _err('INVALID_PAYMENT_TYPE', 'payment_type: full | partial | debt', http_status=400)
+
+        if payment_method not in ('cash', 'card', 'transfer'):
+            return _err('INVALID_PAYMENT_METHOD', 'payment_method: cash | card | transfer', http_status=400)
+
+        payment_status = 'paid' if debt_amount == 0 else ('partial' if paid_amount > 0 else 'debt')
+        return Response({
+            'total_amount': api_decimal_str(total_amount),
+            'paid_amount': api_decimal_str(paid_amount),
+            'debt_amount': api_decimal_str(debt_amount),
+            'payment_status': payment_status,
+            'payment_type_label': {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[payment_type],
+            'payment_method_label': {'cash': 'Наличные', 'card': 'Карта', 'transfer': 'Перевод'}[payment_method],
+            'payment_status_label': {'paid': 'Оплачено', 'partial': 'Частично оплачено', 'debt': 'В долг'}[payment_status],
+            'summary': (
+                f"Итого {api_decimal_str(total_amount)}; оплачено {api_decimal_str(paid_amount)}; "
+                f"долг {api_decimal_str(debt_amount)}"
+            ),
+            'unit_type': unit_type,
+            'normalized_lines': normalized_lines,
         })
 
     @staticmethod
@@ -1047,10 +1576,14 @@ class PaymentViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         sales_payload = []
         for sale in sales_qs[:200]:
             m = sale_payment_metrics(sale)
-            debt = api_decimal_str(m['debt_amount'])
+            debt_amount_raw = Decimal(str(m['debt_amount'] or 0))
+            if debt_amount_raw <= 0:
+                continue
+            debt = api_decimal_str(debt_amount_raw)
             sales_payload.append(
                 {
                     'id': sale.id,
+                    'client_id': sale.client_id,
                     'label': f'{sale.sale_number or sale.order_number} — долг {debt}',
                     'client': sale.client_id,
                     'debt_amount': debt,

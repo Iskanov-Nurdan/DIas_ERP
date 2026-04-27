@@ -27,13 +27,14 @@ class SaleFilter(django_filters.FilterSet):
 class OrderFilter(django_filters.FilterSet):
     client_id = django_filters.NumberFilter(field_name='client_id')
     status = django_filters.CharFilter(field_name='status')
+    request_status = django_filters.CharFilter(field_name='request_status')
     source_type = django_filters.CharFilter(field_name='source_type')
     date_from = django_filters.DateFilter(field_name='date', lookup_expr='gte')
     date_to = django_filters.DateFilter(field_name='date', lookup_expr='lte')
 
     class Meta:
         model = Order
-        fields = ['client', 'status', 'source_type']
+        fields = ['client', 'status', 'request_status', 'source_type']
 
 
 class PaymentFilter(django_filters.FilterSet):
