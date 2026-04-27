@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from django.core.exceptions import ObjectDoesNotExist
@@ -9,8 +9,11 @@ from rest_framework import serializers
 from rest_framework.exceptions import ValidationError as DrfValidationError
 
 from config.api_numbers import api_decimal_str
+from config.fields import CleanDecimalField
+from apps.recipes.models import PlasticProfile
 from apps.warehouse.models import WarehouseBatch
 from apps.warehouse.stock_ops import (
+    PIECE_FROM_SEALED,
     PIECE_FROM_OPEN,
     PIECE_LOOSE,
     normalize_inventory_form,
@@ -85,13 +88,19 @@ class ClientSerializer(serializers.ModelSerializer):
     )
     has_sales = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    phone_extra = serializers.CharField(
+        source='phone_alt', required=False, allow_blank=True, max_length=50,
+    )
+    comment = serializers.CharField(
+        source='notes', required=False, allow_blank=True, default='',
+    )
 
     class Meta:
         model = Client
         fields = (
-            'id', 'name', 'contact', 'phone', 'phone_alt',
+            'id', 'name', 'contact', 'phone', 'phone_alt', 'phone_extra',
             'inn', 'address', 'email', 'messenger',
-            'client_type', 'notes', 'is_active', 'status',
+            'client_type', 'notes', 'comment', 'is_active', 'status',
             'sales_count', 'sales_total', 'has_sales',
             'credit_limit', 'credit_limit_mode',
         )
@@ -103,6 +112,18 @@ class ClientSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'sales_count'):
             return int(obj.sales_count or 0) > 0
         return obj.sales.exists()
+
+    def to_internal_value(self, data):
+        if hasattr(data, 'get'):
+            d = data.copy() if isinstance(data, dict) else dict(data)
+            st = d.pop('status', None)
+            if st is not None and str(st).strip() != '':
+                if st == 'active':
+                    d['is_active'] = True
+                elif st == 'inactive':
+                    d['is_active'] = False
+            return super().to_internal_value(d)
+        return super().to_internal_value(data)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -169,6 +190,25 @@ class OrderSerializer(serializers.ModelSerializer):
     payment_status = serializers.SerializerMethodField()
     debt_amount = serializers.SerializerMethodField()
     refund_amount = serializers.SerializerMethodField()
+    # Производство (заявка): рецепт и проверка только с сервера
+    request_status = serializers.CharField(
+        read_only=True, allow_null=True, required=False, default=None,
+    )
+    profile = serializers.PrimaryKeyRelatedField(
+        queryset=PlasticProfile.objects.all(),
+        source='production_profile',
+        required=False,
+        allow_null=True,
+    )
+    length = CleanDecimalField(
+        max_digits=14, decimal_places=4, source='production_length', required=False, allow_null=True, coerce_to_string=True,
+    )
+    quantity = serializers.IntegerField(
+        min_value=1, source='production_quantity', required=False, allow_null=True,
+    )
+    recipe = serializers.SerializerMethodField()
+    total_meters = serializers.SerializerMethodField()
+    resource_check = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -182,12 +222,14 @@ class OrderSerializer(serializers.ModelSerializer):
             'total_amount', 'shipped_amount', 'remaining_amount',
             'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
             'has_company_debt_by_goods',
+            'request_status', 'profile', 'length', 'quantity', 'recipe', 'total_meters', 'resource_check',
         )
         read_only_fields = (
             'order_number', 'created_at', 'updated_at',
             'total_amount', 'shipped_amount', 'remaining_amount',
             'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
             'has_company_debt_by_goods',
+            'request_status', 'recipe', 'total_meters', 'resource_check',
         )
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
@@ -222,6 +264,33 @@ class OrderSerializer(serializers.ModelSerializer):
     def get_refund_amount(self, obj):
         from .payment_status import order_payment_metrics
         return api_decimal_str(order_payment_metrics(obj)['refund_amount'])
+
+    def get_recipe(self, obj):
+        r = obj.resolved_recipe
+        if r is None:
+            return None
+        return {
+            'id': r.id,
+            'name': (r.recipe or '').strip() or (r.product or '')[:255],
+            'profile_id': r.profile_id,
+        }
+
+    def get_total_meters(self, obj):
+        if obj.request_total_meters is not None:
+            return api_decimal_str(Decimal(str(obj.request_total_meters)))
+        if obj.production_length is not None and obj.production_quantity is not None:
+            return api_decimal_str(
+                Decimal(str(obj.production_length)) * Decimal(int(obj.production_quantity)),
+            )
+        return None
+
+    def get_resource_check(self, obj):
+        snap = obj.resource_check_snapshot
+        if snap is None:
+            return None
+        if isinstance(snap, dict) and not snap:
+            return None
+        return snap
 
     @staticmethod
     def _raise_order_error(code: str, message: str, field: str = 'non_field_errors'):
@@ -294,7 +363,27 @@ class OrderSerializer(serializers.ModelSerializer):
 
         return payload
 
+    @staticmethod
+    def _is_production_payload(raw: dict) -> bool:
+        if not raw:
+            return False
+        if raw.get('profile') in (None, ''):
+            return False
+        if raw.get('length') in (None, ''):
+            return False
+        if raw.get('quantity') in (None, ''):
+            return False
+        return True
+
     def validate(self, attrs):
+        idata = self.initial_data or {}
+        for forbidden in (
+            'resolved_recipe', 'request_total_meters', 'resource_check_snapshot', 'request_status',
+        ):
+            if forbidden in idata:
+                self._raise_order_error('FORBIDDEN_FIELD', f'Поле {forbidden} задаётся только на сервере.', field=forbidden)
+        if 'recipe' in idata and idata.get('recipe') is not None:
+            self._raise_order_error('RECIPE_READ_ONLY', 'Рецепт нельзя задать вручную.', field='recipe')
         if self.instance is None:
             client = attrs.get('client')
             if client is None:
@@ -309,11 +398,28 @@ class OrderSerializer(serializers.ModelSerializer):
                     'Клиент неактивен. Создание заявки запрещено.',
                     field='client',
                 )
+            if self._is_production_payload(idata):
+                self._is_production_order_create = True
+                ln = idata.get('length')
+                qt = idata.get('quantity')
+                try:
+                    ln_d = Decimal(str(ln))
+                except Exception:
+                    self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
+                try:
+                    q_i = int(qt)
+                except Exception:
+                    self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
+                if ln_d <= 0:
+                    self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
+                if q_i <= 0:
+                    self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
+                return attrs
             lines = (self.initial_data or {}).get('lines')
             if not isinstance(lines, list) or len(lines) < 1:
                 self._raise_order_error(
                     'MISSING_LINES',
-                    'Нужна минимум одна строка заявки.',
+                    'Нужна минимум одна строка заявки, либо укажите profile, length и quantity.',
                     field='lines',
                 )
             for line in lines:
@@ -331,6 +437,23 @@ class OrderSerializer(serializers.ModelSerializer):
             self._raise_order_error(
                 'ORDER_UPDATE_FORBIDDEN',
                 f'Редактирование заявки в статусе "{self.instance.status}" запрещено.',
+            )
+        if self.instance.request_status in (
+            Order.REQUEST_STATUS_APPROVED,
+            Order.REQUEST_STATUS_CHECKING,
+            Order.REQUEST_STATUS_READY,
+            Order.REQUEST_STATUS_IN_PRODUCTION,
+        ) and any(k in idata for k in ('profile', 'length', 'quantity')):
+            self._raise_order_error(
+                'PRODUCTION_FIELD_LOCKED',
+                'Нельзя менять profile, length, quantity, если request_status: approved, checking, ready или in_production.',
+                field='profile',
+            )
+        if self.instance.request_status == Order.REQUEST_STATUS_IN_PRODUCTION and 'lines' in idata:
+            self._raise_order_error(
+                'PRODUCTION_FIELD_LOCKED',
+                'Заявка в производстве: строки не редактируются.',
+                field='lines',
             )
 
         if 'lines' in (self.initial_data or {}):
@@ -364,7 +487,17 @@ class OrderSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
+        is_prod = getattr(self, '_is_production_order_create', False)
         lines_data = validated_data.pop('lines', [])
+        if is_prod:
+            ln_d = validated_data.get('production_length')
+            q_i = int(validated_data.get('production_quantity') or 0)
+            validated_data['request_status'] = Order.REQUEST_STATUS_DRAFT
+            validated_data['request_total_meters'] = (
+                Decimal(str(ln_d)) * Decimal(int(q_i))
+            ).quantize(Decimal('0.0001'))
+            validated_data['resolved_recipe'] = None
+            validated_data.setdefault('resource_check_snapshot', {})
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
 
@@ -379,13 +512,34 @@ class OrderSerializer(serializers.ModelSerializer):
 
         with transaction.atomic():
             order = super().create(validated_data)
+            if is_prod:
+                return order
             for line_data in lines_data:
                 normalized = self._validate_order_line_payload(line_data)
                 OrderLine.objects.create(order=order, **normalized)
         return order
 
     def update(self, instance, validated_data):
+        idata = self.initial_data or {}
         lines_data = validated_data.pop('lines', None)
+        if any(
+            k in idata for k in ('profile', 'length', 'quantity')
+        ) and instance.request_status in (
+            None, Order.REQUEST_STATUS_DRAFT, Order.REQUEST_STATUS_NOT_READY,
+        ):
+            l = validated_data.get('production_length', instance.production_length)
+            q = validated_data.get('production_quantity', instance.production_quantity)
+            if l is not None and q is not None:
+                try:
+                    validated_data['request_total_meters'] = (
+                        Decimal(str(l)) * Decimal(int(q))
+                    ).quantize(Decimal('0.0001'))
+                except (ArithmeticError, TypeError, ValueError):
+                    pass
+            validated_data['resolved_recipe'] = None
+            validated_data['resource_check_snapshot'] = {}
+            if instance.request_status in (None, Order.REQUEST_STATUS_NOT_READY):
+                validated_data['request_status'] = Order.REQUEST_STATUS_DRAFT
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if lines_data is not None:
@@ -408,6 +562,59 @@ class OrderSerializer(serializers.ModelSerializer):
                         normalized = self._validate_order_line_payload(line_data)
                         OrderLine.objects.create(order=instance, **normalized)
         return instance
+
+
+class ClientOrderProductionRequestSerializer(serializers.ModelSerializer):
+    """GET /api/production/requests/ — заявки в статусе ready (производство)."""
+    client = serializers.SerializerMethodField()
+    profile = serializers.SerializerMethodField()
+    recipe = serializers.SerializerMethodField()
+    length = serializers.SerializerMethodField()
+    quantity = serializers.SerializerMethodField()
+    total_meters = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = ('id', 'client', 'profile', 'recipe', 'length', 'quantity', 'total_meters')
+
+    def get_client(self, obj):
+        c = obj.client
+        if c is None:
+            return None
+        return {'id': c.id, 'name': c.name}
+
+    def get_profile(self, obj):
+        p = obj.production_profile
+        if p is None:
+            return None
+        return {'id': p.id, 'name': p.name, 'code': p.code}
+
+    def get_recipe(self, obj):
+        r = obj.resolved_recipe
+        if r is None:
+            return None
+        return {
+            'id': r.id,
+            'name': (r.recipe or '').strip() or (r.product or '')[:255],
+            'profile_id': r.profile_id,
+        }
+
+    def get_length(self, obj):
+        if obj.production_length is None:
+            return None
+        return api_decimal_str(Decimal(str(obj.production_length)))
+
+    def get_quantity(self, obj):
+        return obj.production_quantity
+
+    def get_total_meters(self, obj):
+        if obj.request_total_meters is not None:
+            return api_decimal_str(Decimal(str(obj.request_total_meters)))
+        if obj.production_length is not None and obj.production_quantity is not None:
+            return api_decimal_str(
+                Decimal(str(obj.production_length)) * Decimal(int(obj.production_quantity)),
+            )
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -699,6 +906,12 @@ class SaleLineSerializer(serializers.ModelSerializer):
 
 
 class SaleSerializer(serializers.ModelSerializer):
+    PAYMENT_FULL = 'full'
+    PAYMENT_PARTIAL = 'partial'
+    PAYMENT_DEBT = 'debt'
+    PAYMENT_KIND_CHOICES = (PAYMENT_FULL, PAYMENT_PARTIAL, PAYMENT_DEBT)
+    PAYMENT_METHOD_CHOICES = ('cash', 'card', 'transfer')
+
     client_name = serializers.CharField(source='client.name', read_only=True, allow_null=True, default='')
     inventory_form = serializers.SerializerMethodField()
     order_number = serializers.CharField(required=False, allow_blank=True)
@@ -706,20 +919,30 @@ class SaleSerializer(serializers.ModelSerializer):
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True,
     )
-    warehouse_batch = serializers.PrimaryKeyRelatedField(
-        queryset=WarehouseBatch.objects.all(), required=False, allow_null=True,
-    )
-    quantity = serializers.DecimalField(max_digits=14, decimal_places=4, required=False, allow_null=True)
-    price = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, allow_null=True)
-    warehouse_batch_id = serializers.IntegerField(read_only=True)
     sale_unit = serializers.CharField(required=False, allow_blank=True, max_length=50, default='')
     packaging = serializers.CharField(required=False, allow_blank=True, max_length=50, default='')
     stock_form = serializers.CharField(required=False, allow_blank=True, max_length=20, default='')
     piece_pick = serializers.CharField(required=False, allow_blank=True, max_length=40, default='')
+    order = serializers.PrimaryKeyRelatedField(
+        source='linked_order',
+        queryset=Order.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    total_amount = serializers.SerializerMethodField()
+    payment_type = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    payment_method = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    paid_amount = serializers.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    unit_type = serializers.CharField(required=False, allow_blank=False, write_only=True)
     profile_name = serializers.SerializerMethodField()
     sale_lines = SaleLineSerializer(many=True, read_only=True)
     payment_status = serializers.SerializerMethodField()
-    paid_amount = serializers.SerializerMethodField()
     debt_amount = serializers.SerializerMethodField()
     refund_amount = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
@@ -729,10 +952,11 @@ class SaleSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'order_number', 'sale_number', 'invoice_number', 'receipt_number',
             'sale_status', 'linked_order',
-            'client', 'client_name', 'warehouse_batch', 'warehouse_batch_id',
-            'product', 'quantity', 'sale_mode', 'sold_pieces', 'sold_packages',
+            'order',
+            'client', 'client_name',
+            'product', 'sale_mode', 'unit_type', 'sold_pieces', 'sold_packages',
             'length_per_piece', 'total_meters',
-            'quantity_input', 'price', 'revenue', 'cost', 'date',
+            'quantity_input', 'price', 'revenue', 'total_amount', 'cost', 'date',
             'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
             'profile_name', 'stock_quality',
@@ -740,13 +964,15 @@ class SaleSerializer(serializers.ModelSerializer):
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
             'created_by', 'created_by_name', 'created_at',
             'sale_lines', 'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
+            'payment_type', 'payment_method',
         )
         read_only_fields = (
             'profit', 'revenue', 'cost', 'total_meters', 'inventory_form',
-            'warehouse_batch_id', 'profile_name', 'stock_quality',
+            'profile_name', 'stock_quality',
             'created_at', 'sale_lines',
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
-            'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
+            'payment_status', 'debt_amount', 'refund_amount',
+            'total_amount',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
@@ -756,9 +982,6 @@ class SaleSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        wb = self.fields.get('warehouse_batch')
-        if wb is not None:
-            wb.queryset = WarehouseBatch.objects.filter(status=WarehouseBatch.STATUS_AVAILABLE)
 
     def get_profile_name(self, obj):
         if not obj.warehouse_batch_id:
@@ -784,9 +1007,8 @@ class SaleSerializer(serializers.ModelSerializer):
         from .payment_status import sale_payment_metrics
         return sale_payment_metrics(obj)['payment_status']
 
-    def get_paid_amount(self, obj):
-        from .payment_status import sale_payment_metrics
-        return api_decimal_str(sale_payment_metrics(obj)['paid_amount'])
+    def get_total_amount(self, obj):
+        return api_decimal_str(Decimal(str(obj.revenue or 0)))
 
     def get_debt_amount(self, obj):
         from .payment_status import sale_payment_metrics
@@ -797,7 +1019,92 @@ class SaleSerializer(serializers.ModelSerializer):
         return api_decimal_str(sale_payment_metrics(obj)['refund_amount'])
 
     def to_internal_value(self, data):
+        if hasattr(data, 'get'):
+            d = data.copy() if isinstance(data, dict) else dict(data)
+            unit_type = d.get('unit_type')
+            if unit_type not in (None, ''):
+                d['sale_mode'] = unit_type
+            return super().to_internal_value(d)
         return super().to_internal_value(data)
+
+    @staticmethod
+    def _parse_paid_amount_input(initial: dict) -> Decimal | None:
+        if not hasattr(initial, 'get'):
+            return None
+        raw = initial.get('paid_amount')
+        if raw in (None, ''):
+            return None
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            raise serializers.ValidationError(
+                {
+                    'code': 'INVALID_PAID_AMOUNT',
+                    'detail': 'paid_amount должен быть числом.',
+                    'errors': [{'field': 'paid_amount', 'message': 'paid_amount должен быть числом.'}],
+                },
+            )
+
+    def _validate_embedded_payment(self, *, total_amount: Decimal, initial: dict) -> tuple[str | None, str | None, Decimal]:
+        ptype = (initial.get('payment_type') or '').strip().lower() if hasattr(initial, 'get') else ''
+        pmethod = (initial.get('payment_method') or '').strip().lower() if hasattr(initial, 'get') else ''
+        paid_input = self._parse_paid_amount_input(initial)
+
+        if not ptype and not pmethod and paid_input is None:
+            return None, None, Decimal('0')
+        if ptype not in self.PAYMENT_KIND_CHOICES:
+            self._raise_sale_error(
+                'INVALID_PAYMENT_TYPE',
+                'payment_type: full | partial | debt',
+                field='payment_type',
+            )
+        if pmethod not in self.PAYMENT_METHOD_CHOICES:
+            self._raise_sale_error(
+                'INVALID_PAYMENT_METHOD',
+                'payment_method: cash | card | transfer',
+                field='payment_method',
+            )
+        if paid_input is not None and paid_input < 0:
+            self._raise_sale_error(
+                'INVALID_PAID_AMOUNT',
+                'paid_amount не может быть отрицательной.',
+                field='paid_amount',
+            )
+
+        total = Decimal(str(total_amount or 0)).quantize(Decimal('0.01'))
+        if ptype == self.PAYMENT_FULL:
+            paid = total if paid_input is None else Decimal(str(paid_input)).quantize(Decimal('0.01'))
+            if paid_input is not None and paid != total:
+                self._raise_sale_error(
+                    'FULL_PAYMENT_MUST_EQUAL_TOTAL',
+                    'Для payment_type=full paid_amount должен быть равен total_amount.',
+                    field='paid_amount',
+                )
+            return ptype, pmethod, paid
+        if ptype == self.PAYMENT_DEBT:
+            return ptype, pmethod, Decimal('0')
+
+        # partial
+        if paid_input is None:
+            self._raise_sale_error(
+                'PAID_AMOUNT_REQUIRED',
+                'Для payment_type=partial поле paid_amount обязательно.',
+                field='paid_amount',
+            )
+        paid = Decimal(str(paid_input)).quantize(Decimal('0.01'))
+        if paid <= 0:
+            self._raise_sale_error(
+                'INVALID_PAID_AMOUNT',
+                'Для payment_type=partial paid_amount должен быть > 0.',
+                field='paid_amount',
+            )
+        if paid > total:
+            self._raise_sale_error(
+                'PAID_AMOUNT_EXCEEDS_TOTAL',
+                'Нельзя оплатить больше чем total_amount.',
+                field='paid_amount',
+            )
+        return ptype, pmethod, paid
 
     @staticmethod
     def _raise_sale_error(code: str, message: str, field: str = 'non_field_errors'):
@@ -860,7 +1167,14 @@ class SaleSerializer(serializers.ModelSerializer):
                 'Для строки продажи поле quantity обязательно.',
                 field='sale_lines',
             )
-        qty = Decimal(str(payload.get('quantity')))
+        try:
+            qty = Decimal(str(payload.get('quantity')))
+        except (InvalidOperation, TypeError, ValueError):
+            self._raise_sale_error(
+                'SALE_QUANTITY_INVALID',
+                'quantity должен быть числом больше 0.',
+                field='sale_lines',
+            )
         if qty <= 0:
             self._raise_sale_error(
                 'SALE_QUANTITY_INVALID',
@@ -871,7 +1185,14 @@ class SaleSerializer(serializers.ModelSerializer):
         if payload.get('unit_price') in (None, ''):
             payload['unit_price'] = Decimal('0')
         else:
-            unit_price = Decimal(str(payload.get('unit_price')))
+            try:
+                unit_price = Decimal(str(payload.get('unit_price')))
+            except (InvalidOperation, TypeError, ValueError):
+                self._raise_sale_error(
+                    'UNIT_PRICE_INVALID',
+                    'unit_price должен быть числом.',
+                    field='sale_lines',
+                )
             if unit_price < 0:
                 self._raise_sale_error(
                     'UNIT_PRICE_NEGATIVE',
@@ -925,6 +1246,77 @@ class SaleSerializer(serializers.ModelSerializer):
 
         return payload
 
+    def _bind_order_line_for_linked_order(self, line_payload: dict, linked_order: Order) -> dict:
+        """
+        Гарантирует совместимость sale_lines с linked_order и выставляет order_line, если он не передан.
+        """
+        order_line = line_payload.get('order_line')
+        if order_line is not None:
+            if order_line.order_id != linked_order.id:
+                self._raise_sale_error(
+                    'ORDER_LINE_ORDER_MISMATCH',
+                    'order_line не принадлежит переданной заявке.',
+                    field='sale_lines',
+                )
+            return line_payload
+
+        product = (line_payload.get('product') or '').strip()
+        if not product:
+            self._raise_sale_error(
+                'ORDER_LINE_REQUIRED',
+                'Для продажи по заявке нужно указать order_line или продукт для сопоставления.',
+                field='sale_lines',
+            )
+
+        def _norm(v: str) -> str:
+            return ''.join(ch for ch in (v or '').strip().casefold() if ch.isalnum())
+
+        lines = list(linked_order.lines.all().order_by('id'))
+        normalized_product = _norm(product)
+        candidates = [
+            ln for ln in lines
+            if _norm(ln.product or '') == normalized_product
+        ]
+        # Мягкий матч для случаев вроде "60 мм белый" vs "60мм белый профиль"
+        if not candidates and normalized_product:
+            candidates = [
+                ln for ln in lines
+                if normalized_product in _norm(ln.product or '') or _norm(ln.product or '') in normalized_product
+            ]
+        candidates.sort(key=lambda ln: ln.id)
+
+        # UI может передать строку товара, отличающуюся от текста в заявке.
+        # В этом случае привязываем к первой "живой" строке заявки.
+        if not candidates:
+            open_lines = [
+                ln for ln in lines
+                if Decimal(str(ln.remaining_quantity or 0)) > Decimal('0')
+            ]
+            open_lines.sort(key=lambda ln: ln.id)
+            if open_lines:
+                candidates = [open_lines[0]]
+            elif lines:
+                # Последний fallback: если строки в заявке есть, привязываем к первой,
+                # а дальше проверка остатка даст точную бизнес-ошибку.
+                candidates = [lines[0]]
+            else:
+                self._raise_sale_error(
+                    'ORDER_HAS_NO_LINES',
+                    'В заявке нет строк для продажи.',
+                    field='sale_lines',
+                )
+
+        line_payload['order_line'] = candidates[0]
+        qty = Decimal(str(line_payload.get('quantity') or 0))
+        remaining = Decimal(str(line_payload['order_line'].remaining_quantity or 0))
+        if qty > remaining + Decimal('0.0001'):
+            self._raise_sale_error(
+                'ORDER_LINE_QUANTITY_EXCEEDED',
+                f'Нельзя продать больше остатка строки заявки ({remaining}).',
+                field='sale_lines',
+            )
+        return line_payload
+
     def validate(self, attrs):
         initial = self.initial_data or {}
         if self.instance is not None and ('sale_status' in initial or 'status' in initial):
@@ -966,7 +1358,7 @@ class SaleSerializer(serializers.ModelSerializer):
                     'SALE_LOCKED_BY_RETURN',
                     'Продажа заблокирована: есть активные возвраты.',
                 )
-            if self.instance.warehouse_stock_applied and incoming_keys:
+            if self.instance.warehouse_stock_applied and unsafe_fields:
                 self._raise_sale_error(
                     'SALE_LOCKED_BY_WAREHOUSE',
                     'Продажа заблокирована: склад уже списан.',
@@ -1006,7 +1398,14 @@ class SaleSerializer(serializers.ModelSerializer):
                     'sale_lines обязателен и должен содержать минимум одну строку.',
                     field='sale_lines',
                 )
-            shipping_target = self._is_shipping_target(st)
+            for forbidden in ('warehouse_batch', 'quantity', 'price_per_unit'):
+                if forbidden in initial:
+                    self._raise_sale_error(
+                        'ROOT_FIELDS_FORBIDDEN',
+                        f'Поле {forbidden} в корне не используется. Передавайте данные только в sale_lines.',
+                        field=forbidden,
+                    )
+            shipping_target = True
             normalized_lines = [
                 self._validate_sale_line_payload(row, shipping_target=shipping_target)
                 for row in lines
@@ -1126,9 +1525,12 @@ class SaleSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
+        ret['unit_type'] = instance.sale_mode
         for key in ('quantity', 'sold_pieces', 'sold_packages', 'length_per_piece', 'total_meters', 'price', 'revenue', 'cost', 'profit'):
             if key in ret and ret[key] is not None:
                 ret[key] = api_decimal_str(Decimal(str(ret[key])))
+        from .payment_status import sale_payment_metrics
+        ret['paid_amount'] = api_decimal_str(sale_payment_metrics(instance)['paid_amount'])
         if _sale_unit_is_package(instance.sale_unit):
             qi = instance.quantity_input
             if qi is None and instance.warehouse_batch_id:
@@ -1207,11 +1609,101 @@ class SaleSerializer(serializers.ModelSerializer):
         )
 
     def create(self, validated_data):
-        validated_data = self._fill_quantity_input(validated_data)
-        self._apply_finance(validated_data)
+        # Служебные поля запроса не являются полями модели Sale.
+        validated_data.pop('unit_type', None)
+        validated_data.pop('payment_type', None)
+        validated_data.pop('payment_method', None)
+        validated_data.pop('paid_amount', None)
 
-        ss = validated_data.get('sale_status', Sale.STATUS_DRAFT)
-        shipping = self._is_shipping_status(ss)
+        lines_payload = (self.initial_data or {}).get('sale_lines') or []
+        unit_type = validated_data.get('sale_mode') or Sale.MODE_PIECES
+        linked_order = validated_data.get('linked_order')
+        sale_client = validated_data.get('client')
+        if linked_order is not None and sale_client is not None and linked_order.client_id != sale_client.id:
+            self._raise_sale_error(
+                'ORDER_CLIENT_MISMATCH',
+                'Заявка принадлежит другому клиенту.',
+                field='order',
+            )
+        normalized_lines = []
+        for row in lines_payload:
+            row_in = dict(row or {})
+            try:
+                input_qty = Decimal(str(row_in.get('quantity') or 0))
+            except (InvalidOperation, TypeError, ValueError):
+                self._raise_sale_error(
+                    'SALE_QUANTITY_INVALID',
+                    'quantity в строке должен быть числом больше 0.',
+                    field='sale_lines',
+                )
+            if unit_type == Sale.MODE_PACKAGES:
+                wb_id = row_in.get('warehouse_batch')
+                if wb_id in (None, ''):
+                    self._raise_sale_error(
+                        'MISSING_WAREHOUSE_BATCH',
+                        'Для unit_type=packages в строке обязателен warehouse_batch.',
+                        field='sale_lines',
+                    )
+                try:
+                    wb_pkg = WarehouseBatch.objects.get(pk=wb_id)
+                except WarehouseBatch.DoesNotExist:
+                    self._raise_sale_error(
+                        'MISSING_WAREHOUSE_BATCH',
+                        'Указанная warehouse_batch не найдена.',
+                        field='sale_lines',
+                    )
+                try:
+                    ppp = Decimal(str(wb_pkg.pieces_per_package or 0))
+                except (InvalidOperation, TypeError, ValueError):
+                    ppp = Decimal('0')
+                if ppp <= 0:
+                    self._raise_sale_error(
+                        'INVALID_PACKAGE_BATCH',
+                        'Для продажи упаковками у партии должен быть pieces_per_package > 0.',
+                        field='sale_lines',
+                    )
+                row_in['quantity'] = (input_qty * ppp).quantize(Decimal('0.0001'))
+                row_in.setdefault('piece_pick', PIECE_FROM_SEALED)
+            else:
+                if row_in.get('warehouse_batch') not in (None, ''):
+                    try:
+                        wb_pcs = WarehouseBatch.objects.get(pk=row_in.get('warehouse_batch'))
+                        if wb_pcs.inventory_form == WarehouseBatch.INVENTORY_PACKED and not row_in.get('piece_pick'):
+                            row_in['piece_pick'] = PIECE_FROM_SEALED
+                    except WarehouseBatch.DoesNotExist:
+                        pass
+            sld = self._validate_sale_line_payload(row_in, shipping_target=True)
+            if linked_order is not None and linked_order.lines.exists():
+                sld = self._bind_order_line_for_linked_order(sld, linked_order)
+            up = Decimal(str(sld.get('unit_price') or 0))
+            qn_input = input_qty
+            sld['line_total'] = (up * qn_input).quantize(Decimal('0.01'))
+            sld['_input_quantity'] = qn_input
+            normalized_lines.append(sld)
+
+        total_qty = sum((Decimal(str(x['quantity'])) for x in normalized_lines), Decimal('0')).quantize(Decimal('0.0001'))
+        total_revenue = sum((Decimal(str(x['line_total'])) for x in normalized_lines), Decimal('0')).quantize(Decimal('0.01'))
+        self._payment_input = self._validate_embedded_payment(
+            total_amount=total_revenue,
+            initial=(self.initial_data or {}),
+        )
+
+        validated_data['quantity'] = total_qty
+        validated_data['sold_pieces'] = total_qty
+        if unit_type == Sale.MODE_PACKAGES:
+            validated_data['sold_packages'] = sum(
+                (Decimal(str(x.get('_input_quantity') or 0)) for x in normalized_lines),
+                Decimal('0'),
+            ).quantize(Decimal('0.0001'))
+        else:
+            validated_data['sold_packages'] = Decimal('0')
+        validated_data['price'] = (total_revenue / total_qty).quantize(Decimal('0.01')) if total_qty > 0 else Decimal('0')
+        validated_data['revenue'] = total_revenue
+        validated_data['cost'] = Decimal('0')
+        validated_data['profit'] = total_revenue
+        validated_data['warehouse_batch'] = None
+        validated_data['sale_status'] = validated_data.get('sale_status') or Sale.STATUS_DRAFT
+        shipping = True
         client = validated_data.get('client')
         request = self.context.get('request')
         user = getattr(request, 'user', None)
@@ -1250,67 +1742,66 @@ class SaleSerializer(serializers.ModelSerializer):
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
 
-        wb = validated_data.get('warehouse_batch')
-        if wb is not None:
-            validated_data['stock_quality'] = wb.quality
-        wb_pk = wb.pk if wb else None
-        qty = validated_data['quantity']
-        linked_order = validated_data.get('linked_order')
-        lines_payload = (self.initial_data or {}).get('sale_lines')
+        validated_data['stock_quality'] = WarehouseBatch.QUALITY_GOOD
         from .sale_warehouse import apply_warehouse_for_sale
         from .reservations import auto_fulfill_sale_lines_after_shipping
         from .state_machine import validate_sale_ship
+        sale_model_fields = {f.name for f in Sale._meta.concrete_fields}
+        create_payload = {k: v for k, v in validated_data.items() if k in sale_model_fields}
         with transaction.atomic():
-            instance = super().create(validated_data)
-            if lines_payload and isinstance(lines_payload, list) and len(lines_payload) > 0:
-                allowed = {
-                    'order_line', 'product', 'warehouse_batch', 'stock_form', 'piece_pick',
-                    'quantity', 'unit_price', 'defect_flag', 'comment',
-                }
-                for row in lines_payload:
-                    extra = set(row.keys()) - allowed
-                    if extra:
-                        raise serializers.ValidationError(
-                            {'sale_lines': f'Недопустимые поля в строке: {", ".join(sorted(extra))}'},
-                        )
-                    sld = {k: v for k, v in row.items() if k in allowed}
-                    sld = self._validate_sale_line_payload(sld, shipping_target=shipping)
-                    up = Decimal(str(sld.get('unit_price') or 0))
-                    qn = Decimal(str(sld.get('quantity') or 0))
-                    sld['line_total'] = (up * qn).quantize(Decimal('0.01'))
-                    sld['cost'] = 0
-                    sld['profit'] = 0
-                    sld['sale'] = instance
-                    SaleLine.objects.create(**sld)
-            elif self.context.get('allow_legacy_header_flow', False):
-                self._build_legacy_sale_line(instance)
-            else:
+            try:
+                instance = super().create(create_payload)
+            except TypeError as exc:
                 self._raise_sale_error(
-                    'MISSING_SALE_LINES',
-                    'sale_lines обязателен. Header-only create запрещен для frontend.',
-                    field='sale_lines',
+                    'INVALID_SALE_PAYLOAD',
+                    f'Некорректные поля для создания продажи: {exc}',
                 )
+            for sld in normalized_lines:
+                sld.pop('_input_quantity', None)
+                sld['cost'] = Decimal('0')
+                sld['profit'] = Decimal(str(sld['line_total'] or 0))
+                sld['sale'] = instance
+                SaleLine.objects.create(**sld)
             instance = Sale.objects.select_for_update().get(pk=instance.pk)
             if not instance.sale_lines.exists():
                 raise serializers.ValidationError(
-                    {'sale_lines': 'Должна быть минимум одна строка продажи (sale_lines или данные «шапки»)'},
+                    {'sale_lines': 'Должна быть минимум одна строка продажи (sale_lines).'},
                 )
-            if shipping:
-                try:
-                    validate_sale_ship(instance)
-                except ValueError as e:
-                    raise serializers.ValidationError({'non_field_errors': [str(e)]})
-                try:
-                    apply_warehouse_for_sale(instance)
-                except (ValueError, DrfValidationError) as e:
-                    msg = getattr(e, 'detail', e) if isinstance(e, DrfValidationError) else str(e)
-                    raise serializers.ValidationError({'non_field_errors': [str(msg)]})
-            if shipping and linked_order is not None:
+            try:
+                validate_sale_ship(instance)
+            except ValueError as e:
+                raise serializers.ValidationError({'non_field_errors': [str(e)]})
+            try:
+                apply_warehouse_for_sale(instance)
+            except (ValueError, DrfValidationError) as e:
+                msg = getattr(e, 'detail', e) if isinstance(e, DrfValidationError) else str(e)
+                raise serializers.ValidationError({'non_field_errors': [str(msg)]})
+            if linked_order is not None:
                 auto_fulfill_sale_lines_after_shipping(
                     sale=instance,
                     order=linked_order,
                     user=user,
                     request=request,
+                )
+                from .order_sync import sync_order_shipping_status
+                sync_order_shipping_status(linked_order)
+
+            payment_input = getattr(self, '_payment_input', (None, None, Decimal('0')))
+            pay_type, pay_method, pay_amount = payment_input
+            if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL):
+                Payment.objects.create(
+                    date=instance.date,
+                    client=instance.client,
+                    linked_order=instance.linked_order,
+                    linked_sale=instance,
+                    payment_type=Payment.TYPE_PAYMENT,
+                    amount=Decimal(str(pay_amount)).quantize(Decimal('0.01')),
+                    payment_method=(
+                        Payment.METHOD_CASH if pay_method == 'cash'
+                        else (Payment.METHOD_CARD if pay_method == 'card' else Payment.METHOD_TRANSFER)
+                    ),
+                    status=Payment.STATUS_ACTIVE,
+                    created_by=user if getattr(user, 'is_authenticated', False) else None,
                 )
         return instance
 

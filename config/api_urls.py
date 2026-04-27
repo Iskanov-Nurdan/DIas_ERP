@@ -18,6 +18,7 @@ from apps.recipes.views import PlasticProfileViewSet, RecipeViewSet
 from apps.production.views import (
     LineViewSet,
     BatchViewSet,
+    ProductionRequestViewSet,
     RecipeRunViewSet,
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
 )
@@ -73,6 +74,7 @@ router.register(r'production/recipe-runs', RecipeRunViewSet, basename='productio
 router.register(r'plastic-profiles', PlasticProfileViewSet, basename='plastic-profile')
 router.register(r'recipes', RecipeViewSet, basename='recipe')
 router.register(r'batches', BatchViewSet, basename='batch')
+router.register(r'production/requests', ProductionRequestViewSet, basename='production-request')
 router.register(r'warehouse/batches', WarehouseBatchViewSet, basename='warehouse-batch')
 router.register(r'clients', ClientViewSet, basename='client')
 router.register(r'sales', SaleViewSet, basename='sale')

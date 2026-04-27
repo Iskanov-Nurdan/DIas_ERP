@@ -1,11 +1,12 @@
 from datetime import date
+from io import BytesIO
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.sales.models import Client, Order, OrderLine, Payment, Return, Sale
+from apps.sales.models import Client, Order, OrderLine, Payment, Return, Sale, SaleLine
 from apps.warehouse.models import WarehouseBatch
 
 
@@ -157,6 +158,49 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(resp.data.get('code'), 'ORDER_LINE_QUANTITY_EXCEEDED')
 
+    def test_create_with_order_full_shipping_sets_order_closed(self):
+        payload = self._payload(qty='10')
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.order.refresh_from_db()
+        self.order_line.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CLOSED)
+        self.assertEqual(self.order_line.shipped_quantity, Decimal('10'))
+
+    def test_create_with_order_partial_shipping_sets_order_partially_shipped(self):
+        payload = self._payload(qty='4')
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.order.refresh_from_db()
+        self.order_line.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PARTIALLY_SHIPPED)
+        self.assertEqual(self.order_line.shipped_quantity, Decimal('4'))
+
+    def test_create_with_order_line_autobind_when_product_text_differs(self):
+        payload = self._payload(qty='3')
+        payload['sale_lines'][0].pop('order_line', None)
+        payload['sale_lines'][0]['product'] = ' 60 ММ БЕЛЫЙ '
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_production_order_without_lines_closes_on_full_sale(self):
+        prod_order = Order.objects.create(
+            order_number='ORD-2026-PROD-NOLINES',
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            status=Order.STATUS_CONFIRMED,
+            request_status=Order.REQUEST_STATUS_IN_PRODUCTION,
+            production_quantity=4,
+        )
+        payload = self._payload(qty='4')
+        payload['linked_order'] = prod_order.pk
+        payload['sale_lines'][0].pop('order_line', None)
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        prod_order.refresh_from_db()
+        self.assertEqual(prod_order.status, Order.STATUS_CLOSED)
+        self.assertIsNone(prod_order.request_status)
+
     def test_update_rejects_status_via_patch(self):
         sale = self._create_sale()
         resp = self.client.patch(f'/api/sales/{sale.pk}/', data={'sale_status': Sale.STATUS_CONFIRMED}, format='json')
@@ -265,6 +309,259 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertIn('text/html', w['Content-Type'])
         self.assertIn('text/html', r['Content-Type'])
+
+    def test_waybill_html_contains_required_sections(self):
+        sale = self._create_sale()
+        sale.refresh_from_db()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.content.decode('utf-8')
+        self.assertIn('Расходная накладная №', body)
+        self.assertIn('Поставщик:', body)
+        self.assertIn('Покупатель:', body)
+        self.assertIn('Итого', body)
+        self.assertIn('от _________ г.', body)
+        self.assertIn('тел: ____________________', body)
+
+    def test_waybill_pdf_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=pdf')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp['Content-Type'], 'application/pdf')
+        self.assertIn(f'waybill-{sale.pk}.pdf', resp['Content-Disposition'])
+
+    def test_waybill_xlsx_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xlsx')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            resp['Content-Type'],
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        self.assertIn(f'waybill-{sale.pk}.xlsx', resp['Content-Disposition'])
+
+    def test_waybill_xlsx_layout_cells(self):
+        from openpyxl import load_workbook
+
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xlsx')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        wb = load_workbook(BytesIO(resp.content))
+        ws = wb.active
+        self.assertIn(f'Расходная накладная № {sale.pk}', str(ws['A1'].value))
+        self.assertEqual(ws['A3'].value, 'Поставщик: ____________________, тел: ____________________')
+        self.assertIn('Покупатель:', str(ws['A4'].value))
+        self.assertEqual(ws['A6'].value, '№')
+        self.assertEqual(ws['B6'].value, 'Наименование товара')
+        self.assertEqual(ws['C6'].value, 'Единица измерение')
+        self.assertEqual(ws['D6'].value, 'Цена')
+        self.assertEqual(ws['E6'].value, 'Сумма')
+        self.assertEqual(ws['A11'].value, 'Отпустил')
+        self.assertEqual(ws['C11'].value, 'Получил')
+        self.assertEqual(ws['E11'].value, 'Место печати')
+        self.assertEqual(ws['A13'].value, '____________________')
+        self.assertEqual(ws['C13'].value, '____________________')
+        self.assertEqual(ws['E13'].value, '____________________')
+
+    def test_waybill_sale_not_found(self):
+        resp = self.client.get('/api/sales/999999/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(resp.data.get('code'), 'SALE_NOT_FOUND')
+
+    def test_waybill_invalid_format(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xml')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data.get('code'), 'INVALID_FORMAT')
+
+    def test_waybill_json_format_strict_shape(self):
+        sale = self._create_sale()
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data.get('title'), f'Расходная накладная № {sale.pk} от ________ г.')
+        self.assertEqual(resp.data.get('buyer_name'), self.client_active.name)
+        self.assertEqual(resp.data.get('date_line'), '________')
+        self.assertEqual(resp.data.get('supplier_line'), '_______________________')
+        self.assertEqual(resp.data.get('phone_line'), '_______________________')
+        self.assertIsInstance(resp.data.get('sale_lines'), list)
+        self.assertTrue(len(resp.data['sale_lines']) >= 1)
+        row = resp.data['sale_lines'][0]
+        self.assertIn('name', row)
+        self.assertIn('quantity_display', row)
+        self.assertIn('unit_price', row)
+        self.assertIn('line_total', row)
+        self.assertIn('total', resp.data)
+
+    def test_waybill_json_by_accept_header(self):
+        sale = self._create_sale()
+        resp = self.client.get(
+            f'/api/sales/{sale.pk}/waybill/',
+            HTTP_ACCEPT='application/json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data.get('title'), f'Расходная накладная № {sale.pk} от ________ г.')
+
+    def test_waybill_total_matches_sale_lines_sum(self):
+        sale = self._create_sale()
+        SaleLine.objects.filter(sale=sale).delete()
+        SaleLine.objects.create(
+            sale=sale,
+            product='Товар 1',
+            quantity=Decimal('2'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('200'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Товар 2',
+            quantity=Decimal('1'),
+            unit_price=Decimal('150'),
+            line_total=Decimal('150'),
+        )
+        sale.revenue = Decimal('350')
+        sale.save(update_fields=['revenue'])
+        resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        body = resp.content.decode('utf-8')
+        self.assertIn('350', body)
+
+    def test_waybill_packages_quantity_format_1x3_equals_3(self):
+        batch = WarehouseBatch.objects.create(
+            product='Пакет 3',
+            quantity=Decimal('9'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_PACKED,
+            pieces_per_package=Decimal('3'),
+            packages_count=Decimal('3'),
+        )
+        sale = Sale.objects.create(
+            order_number='WB-PACK-1',
+            product='Пакет 3',
+            sale_mode=Sale.MODE_PACKAGES,
+            sold_packages=Decimal('1'),
+            sold_pieces=Decimal('3'),
+            quantity=Decimal('3'),
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            sale_status=Sale.STATUS_DRAFT,
+            revenue=Decimal('300'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Пакет 3',
+            warehouse_batch=batch,
+            quantity=Decimal('3'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('300'),
+        )
+        html = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(html.status_code, status.HTTP_200_OK)
+        self.assertIn('1 упак × 3 шт = 3 шт', html.content.decode('utf-8'))
+        from openpyxl import load_workbook
+        wb_resp = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=xlsx')
+        ws = load_workbook(BytesIO(wb_resp.content)).active
+        self.assertEqual(ws['C7'].value, '1 упак × 3 шт = 3 шт')
+
+    def test_waybill_packages_quantity_format_3x6_equals_18(self):
+        batch = WarehouseBatch.objects.create(
+            product='Пакет 6',
+            quantity=Decimal('30'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_PACKED,
+            pieces_per_package=Decimal('6'),
+            packages_count=Decimal('5'),
+        )
+        sale = Sale.objects.create(
+            order_number='WB-PACK-2',
+            product='Пакет 6',
+            sale_mode=Sale.MODE_PACKAGES,
+            sold_packages=Decimal('3'),
+            sold_pieces=Decimal('18'),
+            quantity=Decimal('18'),
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            sale_status=Sale.STATUS_DRAFT,
+            revenue=Decimal('1800'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Пакет 6',
+            warehouse_batch=batch,
+            quantity=Decimal('18'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('1800'),
+        )
+        html = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(html.status_code, status.HTTP_200_OK)
+        self.assertIn('3 упак × 6 шт = 18 шт', html.content.decode('utf-8'))
+
+    def test_waybill_pieces_quantity_format_15(self):
+        sale = Sale.objects.create(
+            order_number='WB-PIECES-1',
+            product='Штучный',
+            sale_mode=Sale.MODE_PIECES,
+            quantity=Decimal('15'),
+            sold_pieces=Decimal('15'),
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            sale_status=Sale.STATUS_DRAFT,
+            revenue=Decimal('1500'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Штучный',
+            quantity=Decimal('15'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('1500'),
+        )
+        html = self.client.get(f'/api/sales/{sale.pk}/waybill/?format=html')
+        self.assertEqual(html.status_code, status.HTTP_200_OK)
+        self.assertIn('15 шт', html.content.decode('utf-8'))
+
+    def test_retrieve_sale_lines_include_packaging_fields_with_fallback(self):
+        batch = WarehouseBatch.objects.create(
+            product='Пакет fallback',
+            quantity=Decimal('20'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_PACKED,
+            pieces_per_package=Decimal('6'),
+            packages_count=Decimal('5'),
+        )
+        sale = Sale.objects.create(
+            order_number='SALE-RETRIEVE-PACK',
+            product='Пакет fallback',
+            sale_mode=Sale.MODE_PACKAGES,
+            quantity=Decimal('12'),
+            sold_pieces=Decimal('12'),
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            sale_status=Sale.STATUS_DRAFT,
+            revenue=Decimal('1200'),
+        )
+        SaleLine.objects.create(
+            sale=sale,
+            product='Пакет fallback',
+            warehouse_batch=batch,
+            quantity=Decimal('12'),
+            unit_price=Decimal('100'),
+            line_total=Decimal('1200'),
+        )
+        resp = self.client.get(f'/api/sales/{sale.pk}/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        line = resp.data['sale_lines'][0]
+        self.assertEqual(line.get('unit_type'), 'packages')
+        self.assertEqual(line.get('quantity'), '12')
+        self.assertEqual(line.get('packages_quantity'), '2')
+        self.assertEqual(line.get('pieces_per_package'), '6')
+        self.assertEqual(line.get('warehouse_batch'), batch.pk)
+        self.assertIn('Пакет fallback', line.get('warehouse_batch_display') or '')
+        self.assertEqual(line.get('quantity_display'), '2 упак × 6 шт = 12 шт')
 
     def test_credit_check_hard_block_and_override_access(self):
         self.client_active.credit_limit_mode = 'hard'

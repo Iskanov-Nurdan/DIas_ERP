@@ -16,6 +16,8 @@ from apps.activity.mixins import ActivityLoggingMixin
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
 from config.exceptions import _extract_validation_errors, _make_error_response
 from config.openapi_common import DiasErrorSerializer, paginated_inline
+from apps.sales.models import Order as ClientOrder
+from apps.sales.serializers import ClientOrderProductionRequestSerializer
 from config.permissions import CanAccessShiftComplaints, IsAdminOrHasAccess, IsAdminOrHasProductionOrOtk
 from config.pagination import StandardResultsSetPagination
 from .shift_state import (
@@ -613,7 +615,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     POST /api/batches/{id}/otk_accept/ — результат ОТК.
     """
     queryset = ProductionBatch.objects.select_related(
-        'order', 'order__recipe', 'order__line', 'operator',
+        'order', 'order__recipe', 'order__line', 'client_order', 'operator',
         'profile', 'recipe', 'recipe__profile', 'line', 'shift',
     ).prefetch_related('otk_checks__inspector').all()
     serializer_class = BatchListSerializer
@@ -1794,3 +1796,56 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     if ord_row is not None and not ord_row.batches.exists():
                         Order.objects.filter(pk=order_pk).delete()
         super().perform_destroy(instance)
+
+
+class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    GET /api/production/requests/ — заявки клиента в статусе ready (к производству).
+    POST /api/production/requests/{id}/start/ — создание партии, FIFO сырьё/химия, заявка → in_production.
+    """
+    permission_classes = [IsAdminOrHasProductionOrOtk]
+    serializer_class = ClientOrderProductionRequestSerializer
+    pagination_class = StandardResultsSetPagination
+    filterset_fields = []
+    search_fields = ['order_number', 'client__name']
+    ordering_fields = ['id', 'date', 'order_number']
+    activity_section = 'Производство'
+    activity_label = 'заявка к производству'
+    required_access_key = 'batches'
+
+    def get_queryset(self):
+        return (
+            ClientOrder.objects.filter(
+                request_status=ClientOrder.REQUEST_STATUS_READY,
+            )
+            .select_related('client', 'production_profile', 'resolved_recipe')
+            .order_by('-date', '-id')
+        )
+
+    @action(detail=True, methods=['post'], url_path='start')
+    def start(self, request, pk=None):
+        from .client_order_start import start_production_for_client_order
+
+        raw = getattr(request, 'data', None) or {}
+        line_id = raw.get('line') if isinstance(raw, dict) else None
+        if line_id is None or str(line_id).strip() == '':
+            return _err('MISSING_LINE', 'Укажите line (id линии) в теле.', http_status=400)
+        try:
+            line_pk = int(line_id)
+        except (TypeError, ValueError):
+            return _err('INVALID_LINE', 'line должен быть числом.', http_status=400)
+        line = Line.objects.filter(pk=line_pk).first()
+        if line is None:
+            return _err('LINE_NOT_FOUND', 'Линия не найдена.', http_status=404)
+        try:
+            batch = start_production_for_client_order(
+                user=request.user,
+                line=line,
+                client_order_id=int(pk),
+            )
+        except DRFValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            BatchListSerializer(batch, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )

@@ -49,8 +49,40 @@ class Client(models.Model):
 # ЗАЯВКА (Order)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Производственная ветка: заявка на выпуск (client_orders) → проверка ресурсов → партия
+REQUEST_STATUS_DRAFT = 'draft'
+REQUEST_STATUS_APPROVED = 'approved'
+REQUEST_STATUS_REJECTED = 'rejected'
+REQUEST_STATUS_CHECKING = 'checking'
+REQUEST_STATUS_READY = 'ready'
+REQUEST_STATUS_NOT_READY = 'not_ready'
+REQUEST_STATUS_IN_PRODUCTION = 'in_production'
+REQUEST_STATUS_CHOICES = [
+    (REQUEST_STATUS_DRAFT, 'Создана (черновик)'),
+    (REQUEST_STATUS_APPROVED, 'Принята'),
+    (REQUEST_STATUS_REJECTED, 'Отказ'),
+    (REQUEST_STATUS_CHECKING, 'Идёт проверка'),
+    (REQUEST_STATUS_READY, 'Ресурсов достаточно'),
+    (REQUEST_STATUS_NOT_READY, 'Ресурсов не хватает'),
+    (REQUEST_STATUS_IN_PRODUCTION, 'В производстве'),
+]
+
+
+def _default_resource_check_snapshot():
+    return {}
+
+
 class Order(models.Model):
     """Заявка клиента — намерение, не перемещение склада."""
+
+    # Производство: ссылки на модульные константы (удобно в коде: Order.REQUEST_STATUS_*)
+    REQUEST_STATUS_DRAFT = REQUEST_STATUS_DRAFT
+    REQUEST_STATUS_APPROVED = REQUEST_STATUS_APPROVED
+    REQUEST_STATUS_REJECTED = REQUEST_STATUS_REJECTED
+    REQUEST_STATUS_CHECKING = REQUEST_STATUS_CHECKING
+    REQUEST_STATUS_READY = REQUEST_STATUS_READY
+    REQUEST_STATUS_NOT_READY = REQUEST_STATUS_NOT_READY
+    REQUEST_STATUS_IN_PRODUCTION = REQUEST_STATUS_IN_PRODUCTION
 
     SOURCE_CASHIER = 'cashier'
     SOURCE_MANAGER = 'manager'
@@ -108,6 +140,54 @@ class Order(models.Model):
     )
     created_at = models.DateTimeField('Создано', auto_now_add=True)
     updated_at = models.DateTimeField('Обновлено', auto_now=True)
+
+    # --- Производство: заявка на профиль (длина × количество), рецепт с сервера
+    request_status = models.CharField(
+        'Статус (производство)',
+        max_length=20,
+        choices=REQUEST_STATUS_CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    production_profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='client_orders',
+        verbose_name='Профиль (производство)',
+    )
+    production_length = models.DecimalField(
+        'Длина, м/шт (производство)',
+        max_digits=14,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+    production_quantity = models.PositiveIntegerField(
+        'Количество шт (производство)',
+        null=True,
+        blank=True,
+    )
+    resolved_recipe = models.ForeignKey(
+        'recipes.Recipe',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='client_orders',
+        verbose_name='Рецепт (рассчитан сервером)',
+    )
+    request_total_meters = models.DecimalField(
+        'Всего м (производство, снимок)',
+        max_digits=16,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+    resource_check_snapshot = models.JSONField(
+        'Снимок проверки ресурсов', default=_default_resource_check_snapshot, blank=True,
+    )
 
     class Meta:
         db_table = 'client_orders'

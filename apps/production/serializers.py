@@ -653,7 +653,7 @@ class BatchListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionBatch
         fields = (
-            'id', 'order', 'order_name', 'profile', 'profile_id', 'profile_name', 'recipe', 'line', 'shift',
+            'id', 'order', 'client_order', 'order_name', 'profile', 'profile_id', 'profile_name', 'recipe', 'line', 'shift',
             'product', 'pieces', 'length_per_piece', 'total_meters',
             'operator', 'operator_name', 'date', 'created_at',
             'otk_status', 'otk_status_display', 'otk_accepted', 'otk_defect', 'otk_defect_reason',
