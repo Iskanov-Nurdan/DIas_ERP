@@ -175,6 +175,31 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(self.order.status, Order.STATUS_PARTIALLY_SHIPPED)
         self.assertEqual(self.order_line.shipped_quantity, Decimal('4'))
 
+    def test_create_with_order_line_autobind_when_product_text_differs(self):
+        payload = self._payload(qty='3')
+        payload['sale_lines'][0].pop('order_line', None)
+        payload['sale_lines'][0]['product'] = ' 60 ММ БЕЛЫЙ '
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_production_order_without_lines_closes_on_full_sale(self):
+        prod_order = Order.objects.create(
+            order_number='ORD-2026-PROD-NOLINES',
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            status=Order.STATUS_CONFIRMED,
+            request_status=Order.REQUEST_STATUS_IN_PRODUCTION,
+            production_quantity=4,
+        )
+        payload = self._payload(qty='4')
+        payload['linked_order'] = prod_order.pk
+        payload['sale_lines'][0].pop('order_line', None)
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        prod_order.refresh_from_db()
+        self.assertEqual(prod_order.status, Order.STATUS_CLOSED)
+        self.assertIsNone(prod_order.request_status)
+
     def test_update_rejects_status_via_patch(self):
         sale = self._create_sale()
         resp = self.client.patch(f'/api/sales/{sale.pk}/', data={'sale_status': Sale.STATUS_CONFIRMED}, format='json')

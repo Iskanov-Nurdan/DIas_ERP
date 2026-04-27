@@ -57,11 +57,26 @@ def sync_order_shipping_status(order: Order | int) -> Order:
     order_obj = Order.objects.prefetch_related('lines').get(pk=oid)
 
     lines = [ln for ln in order_obj.lines.all() if _d(ln.ordered_quantity) > 0]
-    if not lines:
-        return order_obj
-
-    any_shipped = any(_d(ln.shipped_quantity) > 0 for ln in lines)
-    all_full = all(_d(ln.shipped_quantity) >= _d(ln.ordered_quantity) for ln in lines)
+    if lines:
+        any_shipped = any(_d(ln.shipped_quantity) > 0 for ln in lines)
+        all_full = all(_d(ln.shipped_quantity) >= _d(ln.ordered_quantity) for ln in lines)
+    else:
+        # Производственные заявки могут не иметь order.lines.
+        # Тогда ориентируемся на production_quantity и суммарно проданное по linked_order.
+        ship_states = (
+            Sale.STATUS_DRAFT,
+            Sale.STATUS_CONFIRMED,
+            Sale.STATUS_PARTIALLY_SHIPPED,
+            Sale.STATUS_SHIPPED,
+            Sale.STATUS_CLOSED,
+        )
+        sold_total = Sale.objects.filter(
+            linked_order_id=order_obj.pk,
+            sale_status__in=ship_states,
+        ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
+        planned_total = _d(order_obj.production_quantity)
+        any_shipped = _d(sold_total) > 0
+        all_full = planned_total > 0 and _d(sold_total) >= planned_total
 
     new_status = order_obj.status
     if all_full:

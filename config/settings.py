@@ -195,6 +195,7 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-correlation-id',
     'x-audit-shift-id',
     'x-shift-id',
+    'cache-control',
 ]
 
 # WebSocket handshake: браузер шлёт заголовок Origin страницы фронта (как при CORS), а не только Host API.

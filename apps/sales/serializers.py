@@ -1268,22 +1268,53 @@ class SaleSerializer(serializers.ModelSerializer):
                 field='sale_lines',
             )
 
-        candidates = list(
-            linked_order.lines.filter(product=product).order_by('id')
-        )
+        def _norm(v: str) -> str:
+            return ''.join(ch for ch in (v or '').strip().casefold() if ch.isalnum())
+
+        lines = list(linked_order.lines.all().order_by('id'))
+        normalized_product = _norm(product)
+        candidates = [
+            ln for ln in lines
+            if _norm(ln.product or '') == normalized_product
+        ]
+        # Мягкий матч для случаев вроде "60 мм белый" vs "60мм белый профиль"
+        if not candidates and normalized_product:
+            candidates = [
+                ln for ln in lines
+                if normalized_product in _norm(ln.product or '') or _norm(ln.product or '') in normalized_product
+            ]
+        candidates.sort(key=lambda ln: ln.id)
+
+        # UI может передать строку товара, отличающуюся от текста в заявке.
+        # В этом случае привязываем к первой "живой" строке заявки.
         if not candidates:
-            self._raise_sale_error(
-                'ORDER_LINE_NOT_FOUND',
-                f'В заявке нет строки для продукта "{product}".',
-                field='sale_lines',
-            )
-        if len(candidates) > 1:
-            self._raise_sale_error(
-                'ORDER_LINE_AMBIGUOUS',
-                f'Для продукта "{product}" найдено несколько строк заявки. Передайте order_line явно.',
-                field='sale_lines',
-            )
+            open_lines = [
+                ln for ln in lines
+                if Decimal(str(ln.remaining_quantity or 0)) > Decimal('0')
+            ]
+            open_lines.sort(key=lambda ln: ln.id)
+            if open_lines:
+                candidates = [open_lines[0]]
+            elif lines:
+                # Последний fallback: если строки в заявке есть, привязываем к первой,
+                # а дальше проверка остатка даст точную бизнес-ошибку.
+                candidates = [lines[0]]
+            else:
+                self._raise_sale_error(
+                    'ORDER_HAS_NO_LINES',
+                    'В заявке нет строк для продажи.',
+                    field='sale_lines',
+                )
+
         line_payload['order_line'] = candidates[0]
+        qty = Decimal(str(line_payload.get('quantity') or 0))
+        remaining = Decimal(str(line_payload['order_line'].remaining_quantity or 0))
+        if qty > remaining + Decimal('0.0001'):
+            self._raise_sale_error(
+                'ORDER_LINE_QUANTITY_EXCEEDED',
+                f'Нельзя продать больше остатка строки заявки ({remaining}).',
+                field='sale_lines',
+            )
         return line_payload
 
     def validate(self, attrs):
@@ -1474,23 +1505,6 @@ class SaleSerializer(serializers.ModelSerializer):
                 {'warehouse_batch': 'Обычная продажа не может выбирать партию с качеством «брак».'},
             )
 
-        if self.instance is None:
-            merged = {
-                'sale_mode': attrs.get('sale_mode') or Sale.MODE_PIECES,
-                'sold_pieces': attrs.get('sold_pieces'),
-                'sold_packages': attrs.get('sold_packages'),
-                'length_per_piece': attrs.get('length_per_piece'),
-                'price': attrs.get('price'),
-                'warehouse_batch': attrs.get('warehouse_batch'),
-                'quantity': attrs.get('quantity'),
-            }
-            self._apply_finance(merged)
-            total = Decimal(str(merged.get('revenue') or 0)).quantize(Decimal('0.01'))
-            self._payment_input = self._validate_embedded_payment(
-                total_amount=total,
-                initial=(self.initial_data or {}),
-            )
-
         return attrs
 
     def _fill_quantity_input(self, validated_data):
@@ -1659,7 +1673,7 @@ class SaleSerializer(serializers.ModelSerializer):
                     except WarehouseBatch.DoesNotExist:
                         pass
             sld = self._validate_sale_line_payload(row_in, shipping_target=True)
-            if linked_order is not None:
+            if linked_order is not None and linked_order.lines.exists():
                 sld = self._bind_order_line_for_linked_order(sld, linked_order)
             up = Decimal(str(sld.get('unit_price') or 0))
             qn_input = input_qty
@@ -1669,6 +1683,10 @@ class SaleSerializer(serializers.ModelSerializer):
 
         total_qty = sum((Decimal(str(x['quantity'])) for x in normalized_lines), Decimal('0')).quantize(Decimal('0.0001'))
         total_revenue = sum((Decimal(str(x['line_total'])) for x in normalized_lines), Decimal('0')).quantize(Decimal('0.01'))
+        self._payment_input = self._validate_embedded_payment(
+            total_amount=total_revenue,
+            initial=(self.initial_data or {}),
+        )
 
         validated_data['quantity'] = total_qty
         validated_data['sold_pieces'] = total_qty
