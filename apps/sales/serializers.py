@@ -10,7 +10,7 @@ from rest_framework.exceptions import ValidationError as DrfValidationError
 
 from config.api_numbers import api_decimal_str
 from config.fields import CleanDecimalField
-from apps.recipes.models import PlasticProfile
+from apps.recipes.models import PlasticProfile, Recipe
 from apps.warehouse.models import WarehouseBatch
 from apps.warehouse.stock_ops import (
     PIECE_FROM_SEALED,
@@ -178,6 +178,12 @@ class OrderLineSerializer(serializers.ModelSerializer):
 
 
 class OrderSerializer(serializers.ModelSerializer):
+    PAYMENT_FULL = 'full'
+    PAYMENT_PARTIAL = 'partial'
+    PAYMENT_DEBT = 'debt'
+    PAYMENT_KIND_CHOICES = (PAYMENT_FULL, PAYMENT_PARTIAL, PAYMENT_DEBT)
+    PAYMENT_METHOD_CHOICES = ('cash', 'card', 'transfer')
+
     lines = OrderLineSerializer(many=True, required=False)
     client_name = serializers.CharField(source='client.name', read_only=True, allow_null=True, default='')
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
@@ -204,11 +210,24 @@ class OrderSerializer(serializers.ModelSerializer):
         max_digits=14, decimal_places=4, source='production_length', required=False, allow_null=True, coerce_to_string=True,
     )
     quantity = serializers.IntegerField(
-        min_value=1, source='production_quantity', required=False, allow_null=True,
+        source='production_quantity', required=False, allow_null=True,
     )
-    recipe = serializers.SerializerMethodField()
+    recipe = serializers.PrimaryKeyRelatedField(
+        queryset=Recipe.objects.filter(is_active=True),
+        source='resolved_recipe',
+        required=False,
+        allow_null=True,
+    )
+    recipe_id = serializers.IntegerField(source='resolved_recipe_id', read_only=True)
+    recipe_name = serializers.SerializerMethodField()
+    payment_type = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    payment_method = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
     total_meters = serializers.SerializerMethodField()
     resource_check = serializers.SerializerMethodField()
+    payment_type_label = serializers.SerializerMethodField()
+    payment_method_label = serializers.SerializerMethodField()
+    prepayment_amount = serializers.SerializerMethodField()
+    advance_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -221,15 +240,19 @@ class OrderSerializer(serializers.ModelSerializer):
             'lines',
             'total_amount', 'shipped_amount', 'remaining_amount',
             'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
+            'payment_type', 'payment_type_label', 'payment_method', 'payment_method_label',
+            'prepayment_amount', 'advance_amount',
             'has_company_debt_by_goods',
-            'request_status', 'profile', 'length', 'quantity', 'recipe', 'total_meters', 'resource_check',
+            'request_status', 'profile', 'length', 'quantity', 'recipe', 'recipe_id', 'recipe_name', 'total_meters', 'resource_check',
         )
         read_only_fields = (
             'order_number', 'created_at', 'updated_at',
             'total_amount', 'shipped_amount', 'remaining_amount',
             'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
+            'payment_type_label', 'payment_method_label',
+            'prepayment_amount', 'advance_amount',
             'has_company_debt_by_goods',
-            'request_status', 'recipe', 'total_meters', 'resource_check',
+            'request_status', 'recipe_id', 'recipe_name', 'total_meters', 'resource_check',
         )
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
@@ -265,15 +288,57 @@ class OrderSerializer(serializers.ModelSerializer):
         from .payment_status import order_payment_metrics
         return api_decimal_str(order_payment_metrics(obj)['refund_amount'])
 
-    def get_recipe(self, obj):
+    def _order_payment_payload(self, obj) -> tuple[str, str | None]:
+        from .payment_status import order_payment_metrics
+
+        metrics = order_payment_metrics(obj)
+        paid = Decimal(str(metrics['paid_amount'] or 0)).quantize(Decimal('0.01'))
+        debt = Decimal(str(metrics['debt_amount'] or 0)).quantize(Decimal('0.01'))
+        if debt == 0:
+            ptype = self.PAYMENT_FULL
+        elif paid > 0:
+            ptype = self.PAYMENT_PARTIAL
+        else:
+            ptype = self.PAYMENT_DEBT
+        latest = (
+            obj.payments.filter(
+                status=Payment.STATUS_ACTIVE,
+                payment_type__in=(Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE),
+            )
+            .order_by('-id')
+            .first()
+        )
+        if latest is None:
+            return ptype, None
+        pmethod = (
+            'cash' if latest.payment_method == Payment.METHOD_CASH
+            else ('card' if latest.payment_method == Payment.METHOD_CARD
+            else ('transfer' if latest.payment_method == Payment.METHOD_TRANSFER else None))
+        )
+        return ptype, pmethod
+
+    def get_payment_type_label(self, obj):
+        ptype, _ = self._order_payment_payload(obj)
+        return {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[ptype]
+
+    def get_payment_method_label(self, obj):
+        _, pmethod = self._order_payment_payload(obj)
+        return {'cash': 'Наличные', 'card': 'Карта', 'transfer': 'Перевод'}.get(pmethod, '')
+
+    def get_recipe_name(self, obj):
         r = obj.resolved_recipe
         if r is None:
             return None
-        return {
-            'id': r.id,
-            'name': (r.recipe or '').strip() or (r.product or '')[:255],
-            'profile_id': r.profile_id,
-        }
+        return (r.recipe or '').strip() or (r.product or '')[:255]
+
+    def get_recipe(self, obj):
+        return obj.resolved_recipe_id
+
+    def get_prepayment_amount(self, obj):
+        return self.get_paid_amount(obj)
+
+    def get_advance_amount(self, obj):
+        return self.get_paid_amount(obj)
 
     def get_total_meters(self, obj):
         if obj.request_total_meters is not None:
@@ -292,12 +357,23 @@ class OrderSerializer(serializers.ModelSerializer):
             return None
         return snap
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ptype, pmethod = self._order_payment_payload(instance)
+        ret['payment_type'] = ptype
+        ret['payment_method'] = pmethod
+        ret['prepayment_amount'] = ret.get('paid_amount')
+        ret['advance_amount'] = ret.get('paid_amount')
+        return ret
+
     @staticmethod
     def _raise_order_error(code: str, message: str, field: str = 'non_field_errors'):
         raise serializers.ValidationError(
             {
                 'code': code,
+                'message': message,
                 'detail': message,
+                'fields': [{'field': field, 'message': message}],
                 'errors': [{'field': field, 'message': message}],
             },
         )
@@ -375,6 +451,95 @@ class OrderSerializer(serializers.ModelSerializer):
             return False
         return True
 
+    @staticmethod
+    def _parse_paid_amount_input(initial: dict) -> Decimal | None:
+        if not hasattr(initial, 'get'):
+            return None
+        raw = initial.get('paid_amount')
+        if raw in (None, ''):
+            return None
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            raise serializers.ValidationError(
+                {
+                    'code': 'INVALID_PAID_AMOUNT',
+                    'message': 'paid_amount должен быть числом.',
+                    'detail': 'paid_amount должен быть числом.',
+                    'fields': [{'field': 'paid_amount', 'message': 'paid_amount должен быть числом.'}],
+                    'errors': [{'field': 'paid_amount', 'message': 'paid_amount должен быть числом.'}],
+                },
+            )
+
+    def _validate_order_payment_input(self, *, total_amount: Decimal, initial: dict) -> tuple[str, str | None, Decimal]:
+        ptype = (initial.get('payment_type') or '').strip().lower() if hasattr(initial, 'get') else ''
+        pmethod = (initial.get('payment_method') or '').strip().lower() if hasattr(initial, 'get') else ''
+        paid_input = self._parse_paid_amount_input(initial)
+
+        if not ptype:
+            self._raise_order_error('MISSING_PAYMENT_TYPE', 'Поле payment_type обязательно.', field='payment_type')
+        if ptype not in self.PAYMENT_KIND_CHOICES:
+            self._raise_order_error('INVALID_PAYMENT_TYPE', 'payment_type: full | partial | debt', field='payment_type')
+        if paid_input is not None and paid_input < 0:
+            self._raise_order_error('INVALID_PAID_AMOUNT', 'paid_amount не может быть отрицательной.', field='paid_amount')
+        if ptype != self.PAYMENT_DEBT and not pmethod:
+            self._raise_order_error('MISSING_PAYMENT_METHOD', 'Поле payment_method обязательно.', field='payment_method')
+        if pmethod and pmethod not in self.PAYMENT_METHOD_CHOICES:
+            self._raise_order_error('INVALID_PAYMENT_METHOD', 'payment_method: cash | card | transfer', field='payment_method')
+
+        total = Decimal(str(total_amount or 0)).quantize(Decimal('0.01'))
+        if ptype == self.PAYMENT_FULL:
+            paid = total if paid_input is None else Decimal(str(paid_input)).quantize(Decimal('0.01'))
+            if total > 0 and paid != total:
+                self._raise_order_error(
+                    'FULL_PAYMENT_MUST_EQUAL_TOTAL',
+                    'Для payment_type=full paid_amount должен быть равен total_amount.',
+                    field='paid_amount',
+                )
+            return ptype, pmethod, paid
+        if ptype == self.PAYMENT_DEBT:
+            if paid_input not in (None, Decimal('0')):
+                self._raise_order_error('PAYMENT_TYPE_CONFLICT', 'Для payment_type=debt paid_amount должен быть 0.', field='paid_amount')
+            return ptype, pmethod, Decimal('0')
+
+        if paid_input is None:
+            self._raise_order_error('PAID_AMOUNT_REQUIRED', 'Для payment_type=partial поле paid_amount обязательно.', field='paid_amount')
+        paid = Decimal(str(paid_input)).quantize(Decimal('0.01'))
+        if paid <= 0:
+            self._raise_order_error('INVALID_PAID_AMOUNT', 'Для payment_type=partial paid_amount должен быть > 0.', field='paid_amount')
+        if total > 0 and paid > total:
+            self._raise_order_error('PAID_AMOUNT_EXCEEDS_TOTAL', 'paid_amount не должен превышать total_amount заявки.', field='paid_amount')
+        return ptype, pmethod, paid
+
+    @staticmethod
+    def _sync_embedded_order_payment(*, order: Order, payment_method: str | None, paid_amount: Decimal, user) -> None:
+        marker = '[embedded_order_payment]'
+        existing = order.payments.filter(
+            status=Payment.STATUS_ACTIVE,
+            payment_type=Payment.TYPE_PREPAYMENT,
+            comment__startswith=marker,
+            linked_sale__isnull=True,
+        )
+        if existing.exists():
+            existing.update(status=Payment.STATUS_CANCELED)
+        paid = Decimal(str(paid_amount or 0)).quantize(Decimal('0.01'))
+        if paid <= 0:
+            return
+        Payment.objects.create(
+            date=order.date,
+            client=order.client,
+            linked_order=order,
+            payment_type=Payment.TYPE_PREPAYMENT,
+            amount=paid,
+            payment_method=(
+                Payment.METHOD_CASH if payment_method == 'cash'
+                else (Payment.METHOD_CARD if payment_method == 'card' else Payment.METHOD_TRANSFER)
+            ),
+            status=Payment.STATUS_ACTIVE,
+            comment=f'{marker} order={order.pk}',
+            created_by=user if getattr(user, 'is_authenticated', False) else None,
+        )
+
     def validate(self, attrs):
         idata = self.initial_data or {}
         for forbidden in (
@@ -382,8 +547,6 @@ class OrderSerializer(serializers.ModelSerializer):
         ):
             if forbidden in idata:
                 self._raise_order_error('FORBIDDEN_FIELD', f'Поле {forbidden} задаётся только на сервере.', field=forbidden)
-        if 'recipe' in idata and idata.get('recipe') is not None:
-            self._raise_order_error('RECIPE_READ_ONLY', 'Рецепт нельзя задать вручную.', field='recipe')
         if self.instance is None:
             client = attrs.get('client')
             if client is None:
@@ -398,33 +561,67 @@ class OrderSerializer(serializers.ModelSerializer):
                     'Клиент неактивен. Создание заявки запрещено.',
                     field='client',
                 )
-            if self._is_production_payload(idata):
-                self._is_production_order_create = True
-                ln = idata.get('length')
-                qt = idata.get('quantity')
-                try:
-                    ln_d = Decimal(str(ln))
-                except Exception:
-                    self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
-                try:
-                    q_i = int(qt)
-                except Exception:
-                    self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
-                if ln_d <= 0:
-                    self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
-                if q_i <= 0:
-                    self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
-                return attrs
-            lines = (self.initial_data or {}).get('lines')
-            if not isinstance(lines, list) or len(lines) < 1:
+            profile = attrs.get('production_profile')
+            recipe = attrs.get('resolved_recipe')
+            if profile is None:
+                self._raise_order_error('MISSING_PROFILE', 'Поле profile обязательно.', field='profile')
+            if recipe is None:
+                self._raise_order_error('MISSING_RECIPE', 'Поле recipe обязательно.', field='recipe')
+            if recipe and profile and recipe.profile_id != profile.id:
                 self._raise_order_error(
-                    'MISSING_LINES',
-                    'Нужна минимум одна строка заявки, либо укажите profile, length и quantity.',
-                    field='lines',
+                    'RECIPE_PROFILE_MISMATCH',
+                    'recipe не относится к выбранному profile.',
+                    field='recipe',
                 )
-            for line in lines:
-                self._validate_order_line_payload(line)
+            ln = attrs.get('production_length')
+            qt = attrs.get('production_quantity')
+            if ln in (None, ''):
+                self._raise_order_error('INVALID_LENGTH', 'Поле length обязательно.', field='length')
+            if qt in (None, ''):
+                self._raise_order_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='quantity')
+            try:
+                ln_d = Decimal(str(ln))
+            except Exception:
+                self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
+            try:
+                q_i = int(qt)
+            except Exception:
+                self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
+            if ln_d <= 0:
+                self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
+            if q_i <= 0:
+                self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
+            self._is_production_order_create = True
+            total_amount = Decimal('0')
+            lines = (self.initial_data or {}).get('lines')
+            if isinstance(lines, list) and len(lines) > 0:
+                for line in lines:
+                    normalized = self._validate_order_line_payload(line)
+                    total_amount += (
+                        Decimal(str(normalized.get('ordered_quantity') or 0))
+                        * Decimal(str(normalized.get('unit_price') or 0))
+                    )
+            self._order_payment_input = self._validate_order_payment_input(
+                total_amount=total_amount.quantize(Decimal('0.01')),
+                initial=idata,
+            )
             return attrs
+
+        if any(k in idata for k in ('profile', 'recipe')):
+            profile = attrs.get('production_profile', self.instance.production_profile)
+            recipe = attrs.get('resolved_recipe', self.instance.resolved_recipe)
+            if recipe is not None and profile is not None and recipe.profile_id != profile.id:
+                self._raise_order_error(
+                    'RECIPE_PROFILE_MISMATCH',
+                    'recipe не относится к выбранному profile.',
+                    field='recipe',
+                )
+        if any(k in idata for k in ('payment_type', 'payment_method', 'paid_amount')):
+            total_amount = Decimal(str(self.instance.total_amount or 0)).quantize(Decimal('0.01'))
+            self._order_payment_input = self._validate_order_payment_input(
+                total_amount=total_amount,
+                initial=idata,
+            )
 
         if 'status' in (self.initial_data or {}) or 'status' in attrs:
             self._raise_order_error(
@@ -488,6 +685,9 @@ class OrderSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         is_prod = getattr(self, '_is_production_order_create', False)
+        payment_input = getattr(self, '_order_payment_input', (None, None, Decimal('0')))
+        validated_data.pop('payment_type', None)
+        validated_data.pop('payment_method', None)
         lines_data = validated_data.pop('lines', [])
         if is_prod:
             ln_d = validated_data.get('production_length')
@@ -496,7 +696,6 @@ class OrderSerializer(serializers.ModelSerializer):
             validated_data['request_total_meters'] = (
                 Decimal(str(ln_d)) * Decimal(int(q_i))
             ).quantize(Decimal('0.0001'))
-            validated_data['resolved_recipe'] = None
             validated_data.setdefault('resource_check_snapshot', {})
         if not validated_data.get('date'):
             validated_data['date'] = timezone.now().date()
@@ -512,18 +711,29 @@ class OrderSerializer(serializers.ModelSerializer):
 
         with transaction.atomic():
             order = super().create(validated_data)
-            if is_prod:
-                return order
-            for line_data in lines_data:
-                normalized = self._validate_order_line_payload(line_data)
-                OrderLine.objects.create(order=order, **normalized)
+            if not is_prod:
+                for line_data in lines_data:
+                    normalized = self._validate_order_line_payload(line_data)
+                    OrderLine.objects.create(order=order, **normalized)
+            pay_type, pay_method, pay_amount = payment_input
+            if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL):
+                req = self.context.get('request')
+                user = getattr(req, 'user', None)
+                self._sync_embedded_order_payment(
+                    order=order,
+                    payment_method=pay_method,
+                    paid_amount=pay_amount,
+                    user=user,
+                )
         return order
 
     def update(self, instance, validated_data):
         idata = self.initial_data or {}
+        validated_data.pop('payment_type', None)
+        validated_data.pop('payment_method', None)
         lines_data = validated_data.pop('lines', None)
         if any(
-            k in idata for k in ('profile', 'length', 'quantity')
+            k in idata for k in ('profile', 'length', 'quantity', 'recipe')
         ) and instance.request_status in (
             None, Order.REQUEST_STATUS_DRAFT, Order.REQUEST_STATUS_NOT_READY,
         ):
@@ -536,7 +746,6 @@ class OrderSerializer(serializers.ModelSerializer):
                     ).quantize(Decimal('0.0001'))
                 except (ArithmeticError, TypeError, ValueError):
                     pass
-            validated_data['resolved_recipe'] = None
             validated_data['resource_check_snapshot'] = {}
             if instance.request_status in (None, Order.REQUEST_STATUS_NOT_READY):
                 validated_data['request_status'] = Order.REQUEST_STATUS_DRAFT
@@ -561,6 +770,25 @@ class OrderSerializer(serializers.ModelSerializer):
                     else:
                         normalized = self._validate_order_line_payload(line_data)
                         OrderLine.objects.create(order=instance, **normalized)
+            payment_input = getattr(self, '_order_payment_input', None)
+            if payment_input is not None:
+                pay_type, pay_method, pay_amount = payment_input
+                req = self.context.get('request')
+                user = getattr(req, 'user', None)
+                if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL):
+                    self._sync_embedded_order_payment(
+                        order=instance,
+                        payment_method=pay_method,
+                        paid_amount=pay_amount,
+                        user=user,
+                    )
+                else:
+                    self._sync_embedded_order_payment(
+                        order=instance,
+                        payment_method='cash',
+                        paid_amount=Decimal('0'),
+                        user=user,
+                    )
         return instance
 
 
@@ -884,12 +1112,14 @@ class PaymentSerializer(serializers.ModelSerializer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SaleLineSerializer(serializers.ModelSerializer):
+    unit_type = serializers.CharField(required=False, allow_blank=False, write_only=True)
+
     class Meta:
         model = SaleLine
         fields = (
             'id', 'product', 'warehouse_batch', 'order_line',
             'stock_form', 'piece_pick', 'quantity', 'unit_price', 'line_total',
-            'cost', 'profit', 'defect_flag', 'comment',
+            'cost', 'profit', 'defect_flag', 'comment', 'unit_type',
         )
         read_only_fields = ('line_total', 'cost', 'profit')
         extra_kwargs = {
@@ -939,6 +1169,12 @@ class SaleSerializer(serializers.ModelSerializer):
         allow_null=True,
         write_only=True,
     )
+    order_paid_amount_applied = serializers.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
     unit_type = serializers.CharField(required=False, allow_blank=False, write_only=True)
     profile_name = serializers.SerializerMethodField()
     sale_lines = SaleLineSerializer(many=True, read_only=True)
@@ -965,6 +1201,7 @@ class SaleSerializer(serializers.ModelSerializer):
             'created_by', 'created_by_name', 'created_at',
             'sale_lines', 'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
             'payment_type', 'payment_method',
+            'order_paid_amount_applied',
         )
         read_only_fields = (
             'profit', 'revenue', 'cost', 'total_meters', 'inventory_form',
@@ -1040,7 +1277,9 @@ class SaleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {
                     'code': 'INVALID_PAID_AMOUNT',
+                    'message': 'paid_amount должен быть числом.',
                     'detail': 'paid_amount должен быть числом.',
+                    'fields': [{'field': 'paid_amount', 'message': 'paid_amount должен быть числом.'}],
                     'errors': [{'field': 'paid_amount', 'message': 'paid_amount должен быть числом.'}],
                 },
             )
@@ -1111,7 +1350,9 @@ class SaleSerializer(serializers.ModelSerializer):
         raise serializers.ValidationError(
             {
                 'code': code,
+                'message': message,
                 'detail': message,
+                'fields': [{'field': field, 'message': message}],
                 'errors': [{'field': field, 'message': message}],
             },
         )
@@ -1245,6 +1486,19 @@ class SaleSerializer(serializers.ModelSerializer):
                 )
 
         return payload
+
+    @staticmethod
+    def _raise_sale_line_error(code: str, message: str, line_idx: int, field_name: str):
+        field = f'sale_lines[{line_idx}].{field_name}'
+        raise serializers.ValidationError(
+            {
+                'code': code,
+                'message': message,
+                'detail': message,
+                'fields': [{'field': field, 'message': message}],
+                'errors': [{'field': field, 'message': message}],
+            },
+        )
 
     def _bind_order_line_for_linked_order(self, line_payload: dict, linked_order: Order) -> dict:
         """
@@ -1391,6 +1645,13 @@ class SaleSerializer(serializers.ModelSerializer):
                     'Создание продажи сразу в статусе closed запрещено.',
                     field='sale_status',
                 )
+            linked_order = attrs.get('linked_order')
+            if linked_order is not None and linked_order.status in (Order.STATUS_CLOSED, Order.STATUS_CANCELED):
+                self._raise_sale_error(
+                    'ORDER_CLOSED_FOR_SALE',
+                    'Заявка закрыта/отменена, создать продажу нельзя.',
+                    field='order',
+                )
             lines = initial.get('sale_lines')
             if not isinstance(lines, list) or len(lines) < 1:
                 self._raise_sale_error(
@@ -1531,6 +1792,7 @@ class SaleSerializer(serializers.ModelSerializer):
                 ret[key] = api_decimal_str(Decimal(str(ret[key])))
         from .payment_status import sale_payment_metrics
         ret['paid_amount'] = api_decimal_str(sale_payment_metrics(instance)['paid_amount'])
+        ret['order_paid_amount_applied'] = api_decimal_str(Decimal(str(instance.order_paid_amount_applied or 0)))
         if _sale_unit_is_package(instance.sale_unit):
             qi = instance.quantity_input
             if qi is None and instance.warehouse_batch_id:
@@ -1614,9 +1876,18 @@ class SaleSerializer(serializers.ModelSerializer):
         validated_data.pop('payment_type', None)
         validated_data.pop('payment_method', None)
         validated_data.pop('paid_amount', None)
+        requested_order_applied = validated_data.pop('order_paid_amount_applied', None)
 
         lines_payload = (self.initial_data or {}).get('sale_lines') or []
-        unit_type = validated_data.get('sale_mode') or Sale.MODE_PIECES
+        top_level_unit_type_raw = (
+            (self.initial_data or {}).get('unit_type')
+            or validated_data.get('sale_mode')
+            or Sale.MODE_PIECES
+        )
+        top_level_unit_type = str(top_level_unit_type_raw).strip().lower()
+        if top_level_unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+            top_level_unit_type = Sale.MODE_PIECES
+        unit_type = top_level_unit_type
         linked_order = validated_data.get('linked_order')
         sale_client = validated_data.get('client')
         if linked_order is not None and sale_client is not None and linked_order.client_id != sale_client.id:
@@ -1626,8 +1897,20 @@ class SaleSerializer(serializers.ModelSerializer):
                 field='order',
             )
         normalized_lines = []
-        for row in lines_payload:
+        for line_idx, row in enumerate(lines_payload):
             row_in = dict(row or {})
+            line_unit_type_raw = row_in.get('unit_type')
+            if line_unit_type_raw in (None, ''):
+                line_unit_type = top_level_unit_type
+            else:
+                line_unit_type = str(line_unit_type_raw).strip().lower()
+            if line_unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+                self._raise_sale_line_error(
+                    'INVALID_LINE_UNIT_TYPE',
+                    'sale_lines[].unit_type: pieces | packages',
+                    line_idx=line_idx,
+                    field_name='unit_type',
+                )
             try:
                 input_qty = Decimal(str(row_in.get('quantity') or 0))
             except (InvalidOperation, TypeError, ValueError):
@@ -1636,7 +1919,7 @@ class SaleSerializer(serializers.ModelSerializer):
                     'quantity в строке должен быть числом больше 0.',
                     field='sale_lines',
                 )
-            if unit_type == Sale.MODE_PACKAGES:
+            if line_unit_type == Sale.MODE_PACKAGES:
                 wb_id = row_in.get('warehouse_batch')
                 if wb_id in (None, ''):
                     self._raise_sale_error(
@@ -1651,6 +1934,13 @@ class SaleSerializer(serializers.ModelSerializer):
                         'MISSING_WAREHOUSE_BATCH',
                         'Указанная warehouse_batch не найдена.',
                         field='sale_lines',
+                    )
+                if wb_pkg.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+                    self._raise_sale_line_error(
+                        'BATCH_NOT_AVAILABLE_FOR_UNIT_TYPE',
+                        'Для unit_type=packages нужна партия с inventory_form=packed.',
+                        line_idx=line_idx,
+                        field_name='warehouse_batch',
                     )
                 try:
                     ppp = Decimal(str(wb_pkg.pieces_per_package or 0))
@@ -1679,6 +1969,7 @@ class SaleSerializer(serializers.ModelSerializer):
             qn_input = input_qty
             sld['line_total'] = (up * qn_input).quantize(Decimal('0.01'))
             sld['_input_quantity'] = qn_input
+            sld['_line_unit_type'] = line_unit_type
             normalized_lines.append(sld)
 
         total_qty = sum((Decimal(str(x['quantity'])) for x in normalized_lines), Decimal('0')).quantize(Decimal('0.0001'))
@@ -1687,20 +1978,60 @@ class SaleSerializer(serializers.ModelSerializer):
             total_amount=total_revenue,
             initial=(self.initial_data or {}),
         )
+        order_paid_available = Decimal('0')
+        if linked_order is not None:
+            from .payment_status import order_payment_metrics
+            order_paid_available = Decimal(str(order_payment_metrics(linked_order)['paid_amount'] or 0)).quantize(Decimal('0.01'))
+        if requested_order_applied in (None, ''):
+            order_paid_applied = min(order_paid_available, total_revenue)
+        else:
+            try:
+                order_paid_applied = Decimal(str(requested_order_applied)).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                self._raise_sale_error(
+                    'INVALID_ORDER_PAID_AMOUNT_APPLIED',
+                    'order_paid_amount_applied должен быть числом.',
+                    field='order_paid_amount_applied',
+                )
+            if order_paid_applied < 0:
+                self._raise_sale_error(
+                    'INVALID_ORDER_PAID_AMOUNT_APPLIED',
+                    'order_paid_amount_applied не может быть отрицательным.',
+                    field='order_paid_amount_applied',
+                )
+            if order_paid_applied > order_paid_available:
+                self._raise_sale_error(
+                    'ORDER_PREPAYMENT_EXCEEDED',
+                    'order_paid_amount_applied превышает доступную предоплату заявки.',
+                    field='order_paid_amount_applied',
+                )
+            if order_paid_applied > total_revenue:
+                self._raise_sale_error(
+                    'ORDER_PREPAYMENT_EXCEEDS_TOTAL',
+                    'order_paid_amount_applied не должен превышать total_amount продажи.',
+                    field='order_paid_amount_applied',
+                )
 
         validated_data['quantity'] = total_qty
         validated_data['sold_pieces'] = total_qty
-        if unit_type == Sale.MODE_PACKAGES:
+        has_packages = any((x.get('_line_unit_type') == Sale.MODE_PACKAGES) for x in normalized_lines)
+        if has_packages:
             validated_data['sold_packages'] = sum(
-                (Decimal(str(x.get('_input_quantity') or 0)) for x in normalized_lines),
+                (
+                    Decimal(str(x.get('_input_quantity') or 0))
+                    for x in normalized_lines
+                    if x.get('_line_unit_type') == Sale.MODE_PACKAGES
+                ),
                 Decimal('0'),
             ).quantize(Decimal('0.0001'))
         else:
             validated_data['sold_packages'] = Decimal('0')
+        validated_data['sale_mode'] = normalized_lines[0].get('_line_unit_type', unit_type) if normalized_lines else unit_type
         validated_data['price'] = (total_revenue / total_qty).quantize(Decimal('0.01')) if total_qty > 0 else Decimal('0')
         validated_data['revenue'] = total_revenue
         validated_data['cost'] = Decimal('0')
         validated_data['profit'] = total_revenue
+        validated_data['order_paid_amount_applied'] = order_paid_applied
         validated_data['warehouse_batch'] = None
         validated_data['sale_status'] = validated_data.get('sale_status') or Sale.STATUS_DRAFT
         shipping = True
@@ -1758,6 +2089,8 @@ class SaleSerializer(serializers.ModelSerializer):
                 )
             for sld in normalized_lines:
                 sld.pop('_input_quantity', None)
+                sld.pop('_line_unit_type', None)
+                sld.pop('unit_type', None)
                 sld['cost'] = Decimal('0')
                 sld['profit'] = Decimal(str(sld['line_total'] or 0))
                 sld['sale'] = instance
@@ -1788,14 +2121,15 @@ class SaleSerializer(serializers.ModelSerializer):
 
             payment_input = getattr(self, '_payment_input', (None, None, Decimal('0')))
             pay_type, pay_method, pay_amount = payment_input
-            if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL):
+            net_pay_amount = max(Decimal('0'), Decimal(str(pay_amount or 0)) - Decimal(str(order_paid_applied or 0))).quantize(Decimal('0.01'))
+            if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL) and net_pay_amount > 0:
                 Payment.objects.create(
                     date=instance.date,
                     client=instance.client,
                     linked_order=instance.linked_order,
                     linked_sale=instance,
                     payment_type=Payment.TYPE_PAYMENT,
-                    amount=Decimal(str(pay_amount)).quantize(Decimal('0.01')),
+                    amount=net_pay_amount,
                     payment_method=(
                         Payment.METHOD_CASH if pay_method == 'cash'
                         else (Payment.METHOD_CARD if pay_method == 'card' else Payment.METHOD_TRANSFER)

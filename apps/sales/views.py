@@ -60,10 +60,12 @@ def _err(code: str, message: str, errors: list = None, http_status: int = 400) -
     """Единый стиль: строковые code / error / detail (для UI), опционально errors."""
     payload = {
         'code': code,
+        'message': message,
         'error': message,
         'detail': message,
     }
     if errors:
+        payload['fields'] = errors
         payload['errors'] = errors
     return Response(payload, status=http_status)
 
@@ -415,6 +417,8 @@ def _render_waybill_html(payload: dict) -> str:
 
 
 def _order_display_payload(order: Order) -> dict:
+    from .payment_status import order_payment_metrics
+
     profile_name = None
     length = None
     qty = None
@@ -448,6 +452,34 @@ def _order_display_payload(order: Order) -> dict:
         display_parts.append(f'{qty} шт')
     if request_status and not prefer_order_status:
         display_parts.append(status_label.lower())
+    payment_metrics = order_payment_metrics(order)
+    paid_amount = Decimal(str(payment_metrics['paid_amount'] or 0)).quantize(Decimal('0.01'))
+    debt_amount = Decimal(str(payment_metrics['debt_amount'] or 0)).quantize(Decimal('0.01'))
+    total_amount = Decimal(str(order.total_amount or 0)).quantize(Decimal('0.01'))
+    if debt_amount == 0:
+        payment_type = 'full'
+    elif paid_amount > 0:
+        payment_type = 'partial'
+    else:
+        payment_type = 'debt'
+    latest = (
+        order.payments.filter(
+            status=Payment.STATUS_ACTIVE,
+            payment_type__in=(Payment.TYPE_PREPAYMENT, Payment.TYPE_PAYMENT, Payment.TYPE_SURCHARGE),
+        )
+        .order_by('-id')
+        .first()
+    )
+    payment_method = None
+    if latest is not None:
+        payment_method = (
+            'cash' if latest.payment_method == Payment.METHOD_CASH
+            else ('card' if latest.payment_method == Payment.METHOD_CARD
+            else ('transfer' if latest.payment_method == Payment.METHOD_TRANSFER else None))
+        )
+    recipe_name = None
+    if order.resolved_recipe_id:
+        recipe_name = (order.resolved_recipe.recipe or '').strip() or (order.resolved_recipe.product or '')[:255]
     return {
         'id': order.id,
         'display': ' — '.join(display_parts),
@@ -461,6 +493,15 @@ def _order_display_payload(order: Order) -> dict:
         'total_meters': total_meters,
         'request_status': request_status,
         'status_label': status_label,
+        'recipe_id': order.resolved_recipe_id,
+        'recipe_name': recipe_name,
+        'paid_amount': api_decimal_str(paid_amount),
+        'debt_amount': api_decimal_str(debt_amount),
+        'total_amount': api_decimal_str(total_amount),
+        'payment_type': payment_type,
+        'payment_method': payment_method,
+        'prepayment_amount': api_decimal_str(paid_amount),
+        'advance_amount': api_decimal_str(paid_amount),
     }
 
 
@@ -714,7 +755,7 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
 class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Order.objects.select_related(
-        'client', 'created_by', 'responsible_user',
+        'client', 'created_by', 'responsible_user', 'resolved_recipe', 'production_profile',
     ).prefetch_related('lines', 'lines__profile', 'payments', 'sales').all()
     serializer_class = OrderSerializer
     permission_classes = [IsAdminOrHasAccess]
@@ -777,8 +818,14 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return Response(data)
 
     @action(detail=False, methods=['get'], url_path='select-sources')
+    @extend_schema(
+        description=(
+            'Справочники для формы заявок: clients/profiles/recipes. '
+            'recipes содержит profile_id для клиентской фильтрации без доп. запроса.'
+        ),
+    )
     def select_sources(self, request):
-        from apps.recipes.models import PlasticProfile
+        from apps.recipes.models import PlasticProfile, Recipe
 
         clients = list(
             Client.objects.filter(is_active=True)
@@ -789,9 +836,25 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             PlasticProfile.objects.order_by('name')
             .values('id', 'name')[:300]
         )
+        recipes = list(
+            Recipe.objects.select_related('profile')
+            .order_by('recipe', 'id')
+            .values('id', 'profile_id', 'recipe', 'product', 'is_active')[:1200]
+        )
         return Response({
             'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
             'profiles': [{'id': p['id'], 'label': p['name']} for p in profiles],
+            'recipes': [
+                {
+                    'id': r['id'],
+                    'profile_id': r['profile_id'],
+                    'recipe': r['recipe'],
+                    'name': (r['recipe'] or '').strip() or (r['product'] or ''),
+                    'recipe_name': (r['recipe'] or '').strip() or (r['product'] or ''),
+                    'is_active': bool(r['is_active']),
+                }
+                for r in recipes
+            ],
         })
 
     @action(detail=True, methods=['post'], url_path='approve')
@@ -1313,6 +1376,19 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return Response(data)
 
     @action(detail=False, methods=['get'], url_path='select-sources')
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(name='client', required=False, type=int),
+            OpenApiParameter(name='client_id', required=False, type=int),
+            OpenApiParameter(name='order', required=False, type=int),
+            OpenApiParameter(name='order_id', required=False, type=int),
+            OpenApiParameter(name='unit_type', required=False, type=str),
+        ],
+        description=(
+            'Справочники для формы продаж. В каждом order в полях orders/available_orders '
+            'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.'
+        ),
+    )
     def select_sources(self, request):
         from apps.warehouse.models import WarehouseBatch
         from .reservations import get_available_quantity
@@ -1329,7 +1405,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
-        orders = list(orders_qs.select_related('client', 'production_profile')[:200])
+        orders = list(orders_qs.select_related('client', 'production_profile', 'resolved_recipe')[:200])
         order_id = request.query_params.get('order_id') or request.query_params.get('order')
         order_lines = []
         if order_id:
@@ -1409,6 +1485,12 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     ),
                     'product': b.product,
                     'available_quantity': api_decimal_str(available_qty),
+                    'available_pieces': api_decimal_str(available_qty),
+                    'available_packages': avail_packages,
+                    'supports_pieces': True,
+                    'supports_packages': bool(
+                        b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
+                    ),
                     'quality': b.quality,
                     'status': b.status,
                     'inventory_form': b.inventory_form,
@@ -1426,6 +1508,10 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     ),
                     'available_pieces': api_decimal_str(available_qty),
                     'available_packages': avail_packages,
+                    'supports_pieces': True,
+                    'supports_packages': bool(
+                        b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
+                    ),
                     'total_meters': total_meters,
                     'quality': b.quality,
                     'status': b.status,
@@ -1433,18 +1519,27 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 },
             )
         available_orders = [_order_display_payload(o) for o in orders]
-        return Response({
-            'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
-            'orders': [
+        orders_payload = []
+        for o, op in zip(orders, available_orders):
+            orders_payload.append(
                 {
                     'id': o.id,
                     'label': (
                         f"{o.order_number} — {(o.client.name if o.client_id else '—')} — "
                         f"осталось {api_decimal_str(o.remaining_amount)}"
                     ),
-                }
-                for o in orders
-            ],
+                    'paid_amount': op['paid_amount'],
+                    'debt_amount': op['debt_amount'],
+                    'total_amount': op['total_amount'],
+                    'payment_type': op['payment_type'],
+                    'payment_method': op['payment_method'],
+                    'prepayment_amount': op['prepayment_amount'],
+                    'advance_amount': op['advance_amount'],
+                },
+            )
+        return Response({
+            'clients': [{'id': c['id'], 'label': c['name']} for c in clients],
+            'orders': orders_payload,
             'order_lines': order_lines,
             'warehouse_batches': warehouse_batches,
             'available_orders': available_orders,
@@ -1475,6 +1570,16 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         normalized_lines = []
         errors = []
         for idx, row in enumerate(sale_lines, start=1):
+            line_unit_type = (row.get('unit_type') or unit_type or Sale.MODE_PIECES)
+            line_unit_type = str(line_unit_type).strip().lower()
+            if line_unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+                errors.append(
+                    {
+                        'field': f'sale_lines[{idx}].unit_type',
+                        'message': 'sale_lines[].unit_type: pieces | packages',
+                    },
+                )
+                continue
             wb_id = row.get('warehouse_batch')
             qty_raw = row.get('quantity')
             up_raw = row.get('unit_price')
@@ -1509,11 +1614,19 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price не может быть < 0'})
                 continue
             available_pieces = Decimal(str(get_available_quantity(wb.pk)))
-            if unit_type == Sale.MODE_PACKAGES:
+            if line_unit_type == Sale.MODE_PACKAGES:
                 try:
                     ppp = Decimal(str(wb.pieces_per_package or 0))
                 except (InvalidOperation, TypeError, ValueError):
                     ppp = Decimal('0')
+                if wb.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+                    errors.append(
+                        {
+                            'field': f'sale_lines[{idx}].warehouse_batch',
+                            'message': 'Для unit_type=packages нужна партия с inventory_form=packed',
+                        },
+                    )
+                    continue
                 if ppp <= 0:
                     errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'Для продажи в упаковках у партии нет pieces_per_package'})
                     continue
@@ -1531,6 +1644,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             normalized_lines.append({
                 'warehouse_batch': wb.pk,
                 'warehouse_batch_display': f"{(wb.profile.name if wb.profile_id else wb.product)}",
+                'unit_type': line_unit_type,
                 'input_quantity': api_decimal_str(qty_in),
                 'quantity_pieces': api_decimal_str(qty_pieces),
                 'unit_price': api_decimal_str(unit_price),

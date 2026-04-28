@@ -397,6 +397,12 @@ class Sale(models.Model):
     credit_limit_bypassed = models.BooleanField(
         'Согласован обход кредитного лимита', default=False, db_index=True,
     )
+    order_paid_amount_applied = models.DecimalField(
+        'Примененная предоплата из заявки',
+        max_digits=16,
+        decimal_places=2,
+        default=0,
+    )
     warehouse_mutation = models.JSONField(
         'Снимок списания склада для отката', null=True, blank=True, default=None, editable=False,
     )
