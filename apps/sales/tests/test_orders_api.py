@@ -128,6 +128,41 @@ class OrdersApiContractTests(APITestCase):
         self.assertEqual(resp.data['client'], self.active_client.pk)
         self.assertEqual(resp.data.get('recipe_id'), self.recipe.pk)
 
+    def test_create_success_with_order_lines_cart(self):
+        p2 = PlasticProfile.objects.create(name='Профиль 80', code='P-80', is_active=True)
+        r2 = Recipe.objects.create(recipe='Рецепт 80', profile=p2, is_active=True)
+        payload = {
+            'client': self.active_client.pk,
+            'date': '2026-04-30',
+            'order_lines': [
+                {'profile': self.profile.pk, 'recipe': self.recipe.pk, 'length': '6', 'quantity': 12},
+                {'profile': p2.pk, 'recipe': r2.pk, 'length': '3', 'quantity': 7},
+            ],
+            'payment_type': 'partial',
+            'payment_method': 'cash',
+            'paid_amount': '1000',
+        }
+        resp = self.client.post('/api/orders/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(resp.data.get('order_lines') or []), 2)
+        self.assertIn('total_quantity', resp.data)
+        self.assertIn('total_meters', resp.data)
+
+    def test_retrieve_returns_stable_order_lines_shape(self):
+        payload = self._order_payload()
+        create_resp = self.client.post('/api/orders/', data=payload, format='json')
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
+        order_id = create_resp.data['id']
+        resp = self.client.get(f'/api/orders/{order_id}/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        lines = resp.data.get('order_lines')
+        self.assertTrue(isinstance(lines, list) and len(lines) >= 1)
+        first = lines[0]
+        for key in ('id', 'profile', 'profile_id', 'profile_name', 'recipe', 'recipe_id', 'recipe_name', 'length', 'quantity', 'unit_type'):
+            self.assertIn(key, first)
+        self.assertIn('status_label', resp.data)
+        self.assertIn('request_status_label', resp.data)
+
     def test_update_status_forbidden_on_regular_patch(self):
         order = self._create_order()
         resp = self.client.patch(

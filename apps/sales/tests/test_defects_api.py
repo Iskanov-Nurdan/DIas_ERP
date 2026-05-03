@@ -20,6 +20,14 @@ class DefectsApiTests(APITestCase):
         self.client.force_authenticate(self.user)
         self.active_client = Client.objects.create(name='Active', is_active=True)
         self.inactive_client = Client.objects.create(name='Inactive', is_active=False)
+        self.wb_good = WarehouseBatch.objects.create(
+            product='60 мм годный',
+            quantity=Decimal('10'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
         self.wb = WarehouseBatch.objects.create(
             product='60 мм белый',
             quantity=Decimal('10'),
@@ -30,7 +38,22 @@ class DefectsApiTests(APITestCase):
         )
         self.defect = DefectRecord.objects.get(warehouse_batch=self.wb)
 
-    def test_create_manual_defect_success(self):
+    def test_create_from_good_warehouse_batch_splits_stock(self):
+        resp = self.client.post(
+            '/api/defects/',
+            data={
+                'source_type': DefectRecord.SOURCE_WAREHOUSE,
+                'warehouse_batch': self.wb_good.pk,
+                'quantity_pcs': '3',
+                'defect_reason': 'Повреждение',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.wb_good.refresh_from_db()
+        self.assertEqual(self.wb_good.quantity, Decimal('7'))
+
+    def test_create_manual_defect_rejected(self):
         resp = self.client.post(
             '/api/defects/',
             data={
@@ -41,7 +64,8 @@ class DefectsApiTests(APITestCase):
             },
             format='json',
         )
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data.get('code'), 'INVALID_SOURCE_TYPE')
 
     def test_create_manual_defect_without_quantity_error(self):
         resp = self.client.post(
@@ -68,18 +92,18 @@ class DefectsApiTests(APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_create_warehouse_duplicate_blocked(self):
+    def test_create_warehouse_defect_batch_rejected(self):
         resp = self.client.post(
             '/api/defects/',
             data={
                 'source_type': DefectRecord.SOURCE_WAREHOUSE,
                 'warehouse_batch': self.wb.pk,
+                'quantity_pcs': '1',
                 'defect_reason': 'duplicate',
             },
             format='json',
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'DEFECT_ALREADY_EXISTS')
 
     def test_select_sources_excludes_already_linked_batch_and_has_available_quantity(self):
         wb2 = WarehouseBatch.objects.create(

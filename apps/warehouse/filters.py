@@ -19,11 +19,18 @@ class WarehouseBatchFilter(django_filters.FilterSet):
     """
     stock_form / packaging_status — алиасы inventory_form.
     not_packed → unpacked (как в контракте фронта).
+    search — подстрочный поиск по product (как на фронте).
     """
 
     inventory_form = django_filters.CharFilter(method='filter_inventory_form')
     stock_form = django_filters.CharFilter(method='filter_stock_form')
     packaging_status = django_filters.CharFilter(method='filter_packaging_status')
+    search = django_filters.CharFilter(method='filter_search')
+
+    def filter_search(self, queryset, name, value):
+        if not value or not str(value).strip():
+            return queryset
+        return queryset.filter(product__icontains=str(value).strip())
 
     def filter_inventory_form(self, queryset, name, value):
         if not value:

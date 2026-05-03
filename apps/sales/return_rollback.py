@@ -36,10 +36,14 @@ def _rollback_line(line: ReturnLine, ret_doc: Return) -> None:
             source_id=line.id,
         ).delete()
     elif line.return_target == ReturnLine.TARGET_REWORK:
-        drs = DefectRecord.objects.filter(
-            source_type=DefectRecord.SOURCE_RETURN,
-            source_id=line.id,
-        )
-        for d in drs:
-            ReworkRequest.objects.filter(defect_record=d).delete()
-        drs.delete()
+        bid = line.rework_receipt_batch_id
+        if bid:
+            WarehouseBatch.objects.filter(pk=bid).delete()
+        else:
+            drs = DefectRecord.objects.filter(
+                source_type=DefectRecord.SOURCE_RETURN,
+                source_id=line.id,
+            )
+            for d in drs:
+                ReworkRequest.objects.filter(defect_record=d).delete()
+            drs.delete()

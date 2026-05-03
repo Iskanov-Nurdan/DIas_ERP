@@ -23,31 +23,71 @@ class ReworkApiTests(APITestCase):
             product='60 мм белый',
             original_quantity_pcs=Decimal('5'),
             quantity_pcs=Decimal('5'),
+            kg_coefficient=Decimal('1'),
             defect_reason='тест',
             status=DefectRecord.STATUS_ON_STOCK,
         )
 
     def _create_rework(self):
-        resp = self.client.post('/api/rework-requests/', data={'defect_record': self.defect.pk, 'comment': 'x'}, format='json')
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
-        return ReworkRequest.objects.get(pk=resp.data['id'])
-
-    def test_create_requires_defect_record(self):
-        resp = self.client.post('/api/rework-requests/', data={'comment': 'x'}, format='json')
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_create_quantity_from_defect_and_manual_qty_ignored(self):
         resp = self.client.post(
             '/api/rework-requests/',
-            data={'defect_record': self.defect.pk, 'quantity_pcs': '999'},
+            data={
+                'defect_record': self.defect.pk,
+                'result_name': 'Переделанный материал X',
+                'quantity_pcs': '5',
+                'quantity_kg': '5',
+            },
             format='json',
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        return ReworkRequest.objects.get(pk=resp.data['id'])
+
+    def _create_pending_rework(self, defect=None, quantity_pcs=Decimal('5'), quantity_kg=Decimal('5')):
+        defect = defect or self.defect
+        return ReworkRequest.objects.create(
+            defect_record=defect,
+            product=defect.product,
+            quantity_pcs=quantity_pcs,
+            quantity_kg=quantity_kg,
+            rework_number=f'RWK-2026-{ReworkRequest.objects.count() + 1:04d}',
+            status=ReworkRequest.STATUS_PENDING,
+        )
+
+    def test_create_requires_defect_record(self):
+        resp = self.client.post('/api/rework-requests/', data={'quantity_kg': '1'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_quantity_kg_partial_reserves_defect(self):
+        resp = self.client.post(
+            '/api/rework-requests/',
+            data={
+                'defect_record': self.defect.pk,
+                'result_name': 'Переделанный материал X',
+                'quantity_pcs': '3',
+                'quantity_kg': '12,5',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.data['result_name'], 'Переделанный материал X')
+        self.assertEqual(resp.data['result_warehouse_batch']['product_name'], 'Переделанный материал X')
+        self.assertEqual(resp.data['result_warehouse_batch']['quantity'], '12.5')
+        self.assertEqual(resp.data['result_warehouse_batch']['available_quantity'], '12.5')
         rw = ReworkRequest.objects.get(pk=resp.data['id'])
-        self.assertEqual(rw.quantity_pcs, Decimal('5'))
+        self.assertEqual(rw.product, 'Переделанный материал X')
+        self.assertEqual(rw.quantity_kg, Decimal('12.5'))
+        self.assertEqual(rw.status, ReworkRequest.STATUS_COMPLETED)
+        self.assertEqual(rw.output_quantity_kg, Decimal('12.5000'))
+        self.assertEqual(rw.loss_kg, Decimal('0.0000'))
+        self.assertIsNotNone(rw.result_warehouse_batch_id)
+        self.assertEqual(rw.result_warehouse_batch.product, 'Переделанный материал X')
+        self.assertEqual(rw.result_warehouse_batch.quantity, Decimal('12.5000'))
+        self.assertEqual(rw.result_warehouse_batch.stock_bucket, WarehouseBatch.STOCK_BUCKET_REWORKED)
+        self.defect.refresh_from_db()
+        self.assertEqual(self.defect.quantity_pcs, Decimal('2'))
 
     def test_start_pending_to_in_progress(self):
-        rw = self._create_rework()
+        rw = self._create_pending_rework()
         resp = self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         rw.refresh_from_db()
@@ -61,8 +101,7 @@ class ReworkApiTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     def test_complete_requires_fields_and_non_negative_values(self):
-        rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
+        rw = self._create_pending_rework()
         missing = self.client.post(f'/api/rework-requests/{rw.pk}/complete/', data={'quality': 'good'}, format='json')
         self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(missing.data.get('code'), 'MISSING_FIELDS')
@@ -75,8 +114,7 @@ class ReworkApiTests(APITestCase):
         self.assertEqual(neg.data.get('code'), 'NEGATIVE_QUANTITY')
 
     def test_complete_rejects_bounds_and_quality(self):
-        rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
+        rw = self._create_pending_rework()
         bounds = self.client.post(
             f'/api/rework-requests/{rw.pk}/complete/',
             data={'output_quantity': '4', 'loss_quantity': '2', 'quality': 'good'},
@@ -93,8 +131,7 @@ class ReworkApiTests(APITestCase):
         self.assertEqual(bad_quality.data.get('code'), 'INVALID_QUALITY')
 
     def test_complete_good_creates_good_batch(self):
-        rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
+        rw = self._create_pending_rework()
         resp = self.client.post(
             f'/api/rework-requests/{rw.pk}/complete/',
             data={'output_quantity': '2', 'loss_quantity': '1', 'quality': 'good'},
@@ -105,10 +142,10 @@ class ReworkApiTests(APITestCase):
         self.assertEqual(rw.status, ReworkRequest.STATUS_COMPLETED)
         self.assertIsNotNone(rw.result_warehouse_batch_id)
         self.assertEqual(rw.result_warehouse_batch.quality, WarehouseBatch.QUALITY_GOOD)
+        self.assertEqual(rw.result_warehouse_batch.stock_bucket, WarehouseBatch.STOCK_BUCKET_REWORKED)
 
     def test_complete_defect_creates_defect_batch_and_defect_record(self):
-        rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
+        rw = self._create_pending_rework()
         before = DefectRecord.objects.count()
         resp = self.client.post(
             f'/api/rework-requests/{rw.pk}/complete/',
@@ -121,8 +158,7 @@ class ReworkApiTests(APITestCase):
         self.assertGreater(DefectRecord.objects.count(), before)
 
     def test_repeated_complete_forbidden(self):
-        rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
+        rw = self._create_pending_rework()
         self.client.post(
             f'/api/rework-requests/{rw.pk}/complete/',
             data={'output_quantity': '2', 'loss_quantity': '1', 'quality': 'good'},
@@ -137,27 +173,22 @@ class ReworkApiTests(APITestCase):
         self.assertEqual(repeat.data.get('code'), 'REWORK_ALREADY_COMPLETED')
 
     def test_cancel_pending_and_in_progress_success(self):
-        rw1 = self._create_rework()
+        rw1 = self._create_pending_rework()
         c1 = self.client.post(f'/api/rework-requests/{rw1.pk}/cancel/', data={}, format='json')
         self.assertEqual(c1.status_code, status.HTTP_200_OK)
-        rw2 = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw2.pk}/start/', data={}, format='json')
+        rw2 = self._create_pending_rework()
+        rw2.status = ReworkRequest.STATUS_IN_PROGRESS
+        rw2.save(update_fields=['status'])
         c2 = self.client.post(f'/api/rework-requests/{rw2.pk}/cancel/', data={}, format='json')
         self.assertEqual(c2.status_code, status.HTTP_200_OK)
 
     def test_cancel_completed_and_repeated_cancel_forbidden(self):
         rw = self._create_rework()
-        self.client.post(f'/api/rework-requests/{rw.pk}/start/', data={}, format='json')
-        self.client.post(
-            f'/api/rework-requests/{rw.pk}/complete/',
-            data={'output_quantity': '2', 'loss_quantity': '1', 'quality': 'good'},
-            format='json',
-        )
         bad = self.client.post(f'/api/rework-requests/{rw.pk}/cancel/', data={}, format='json')
         self.assertEqual(bad.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
         self.assertEqual(bad.data.get('code'), 'REWORK_ALREADY_COMPLETED')
 
-        rw2 = self._create_rework()
+        rw2 = self._create_pending_rework()
         self.client.post(f'/api/rework-requests/{rw2.pk}/cancel/', data={}, format='json')
         repeat = self.client.post(f'/api/rework-requests/{rw2.pk}/cancel/', data={}, format='json')
         self.assertEqual(repeat.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
@@ -200,6 +231,8 @@ class ReworkApiTests(APITestCase):
         )
         resp = self.client.get('/api/rework-requests/select-sources/')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('items', resp.data)
+        self.assertEqual(resp.data['items']['defect_records'], resp.data['defect_records'])
         rows = resp.data['defect_records']
         ids = {x['id'] for x in rows}
         self.assertIn(self.defect.pk, ids)

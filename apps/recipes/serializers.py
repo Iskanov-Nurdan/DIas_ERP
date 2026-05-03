@@ -95,27 +95,78 @@ class RecipeComponentSerializer(serializers.ModelSerializer):
     type = serializers.SerializerMethodField()
     material_id = serializers.IntegerField(source='raw_material_id', read_only=True, allow_null=True)
     chemistry_id = serializers.IntegerField(read_only=True, allow_null=True)
+    rework_warehouse_batch_id = serializers.IntegerField(read_only=True, allow_null=True)
+    warehouse_batch_id = serializers.SerializerMethodField()
     quantity_per_meter = CleanDecimalField(
         max_digits=14, decimal_places=6, read_only=True, coerce_to_string=True,
     )
     name = serializers.SerializerMethodField()
+    rework_batch_display = serializers.SerializerMethodField()
+    batch_display = serializers.SerializerMethodField()
+    warehouse_batch_display = serializers.SerializerMethodField()
 
     def get_type(self, obj):
         if obj.type == RecipeComponent.TYPE_RAW:
             return 'raw_material'
-        return 'chemistry'
+        if obj.type == RecipeComponent.TYPE_CHEM:
+            return 'chemistry'
+        if obj.type == RecipeComponent.TYPE_REWORK_STOCK:
+            return 'rework_stock'
+        return obj.type
+
+    def get_warehouse_batch_id(self, obj):
+        return obj.rework_warehouse_batch_id
 
     def get_name(self, obj):
         if obj.raw_material_id:
             return obj.raw_material.name
         if obj.chemistry_id:
             return obj.chemistry.name
+        if obj.rework_warehouse_batch_id:
+            b = obj.rework_warehouse_batch
+            return (b.product or '').strip() or None
         return None
+
+    def _rework_display_parts(self, obj):
+        if not obj.rework_warehouse_batch_id:
+            return None, None
+        b = obj.rework_warehouse_batch
+        prof = ''
+        if b.profile_id:
+            prof = (b.profile.name or '').strip()
+        prod = (b.product or '').strip()
+        line = ' · '.join(x for x in (prof, prod) if x)
+        short = line or f'партия #{b.pk}'
+        long_label = f'{short} · партия #{b.pk}' if line else f'партия #{b.pk}'
+        return short, long_label
+
+    def get_rework_batch_display(self, obj):
+        _s, long_label = self._rework_display_parts(obj)
+        return long_label
+
+    def get_batch_display(self, obj):
+        short, _ = self._rework_display_parts(obj)
+        return short
+
+    def get_warehouse_batch_display(self, obj):
+        short, _ = self._rework_display_parts(obj)
+        return short
 
     class Meta:
         model = RecipeComponent
         fields = (
-            'id', 'type', 'material_id', 'chemistry_id', 'name', 'quantity_per_meter', 'unit',
+            'id',
+            'type',
+            'material_id',
+            'chemistry_id',
+            'rework_warehouse_batch_id',
+            'warehouse_batch_id',
+            'name',
+            'rework_batch_display',
+            'batch_display',
+            'warehouse_batch_display',
+            'quantity_per_meter',
+            'unit',
         )
 
 

@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.sales.models import Client, DefectRecord, Order, Payment, Return, ReturnLine, ReworkRequest, Sale, SaleLine
+from apps.sales.models import Client, DefectRecord, Order, Payment, Return, ReturnLine, Sale, SaleLine
 from apps.warehouse.models import WarehouseBatch
 
 
@@ -124,14 +124,12 @@ class ReturnsApiContractTests(APITestCase):
             'linked_order': self.order.pk,
             'return_reason': 'Возврат',
             'invoice_number': 'RET-INV-001',
-            'comment': 'test',
             'lines': [
                 {
                     'sale_line': self.line_shipped.pk,
                     'quantity': '2',
                     'return_target': 'warehouse',
                     'condition_type': 'good',
-                    'comment': '',
                 },
             ],
         }
@@ -195,7 +193,7 @@ class ReturnsApiContractTests(APITestCase):
 
         draft_ok = self.client.patch(
             f'/api/returns/{rid}/',
-            data={'comment': 'upd', 'lines': [{'sale_line': self.line_shipped.pk, 'quantity': '1.5', 'return_target': 'defect', 'condition_type': 'defect'}]},
+            data={'invoice_number': 'upd', 'lines': [{'sale_line': self.line_shipped.pk, 'quantity': '1.5', 'return_target': 'warehouse', 'condition_type': 'good'}]},
             format='json',
         )
         self.assertEqual(draft_ok.status_code, status.HTTP_200_OK)
@@ -208,13 +206,13 @@ class ReturnsApiContractTests(APITestCase):
         self.assertEqual(completed_bad.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(completed_bad.data.get('code'), 'RETURN_UPDATE_FORBIDDEN')
 
-        completed_ok = self.client.patch(f'/api/returns/{rid}/', data={'comment': 'ok'}, format='json')
+        completed_ok = self.client.patch(f'/api/returns/{rid}/', data={'return_reason': 'ok'}, format='json')
         self.assertEqual(completed_ok.status_code, status.HTTP_200_OK)
 
         canceled = self.client.post(f'/api/returns/{rid}/cancel/', data={}, format='json')
         self.assertEqual(canceled.status_code, status.HTTP_200_OK)
 
-        canceled_edit = self.client.patch(f'/api/returns/{rid}/', data={'comment': 'x'}, format='json')
+        canceled_edit = self.client.patch(f'/api/returns/{rid}/', data={'return_reason': 'x'}, format='json')
         self.assertEqual(canceled_edit.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(canceled_edit.data.get('code'), 'RETURN_UPDATE_FORBIDDEN')
 
@@ -238,17 +236,32 @@ class ReturnsApiContractTests(APITestCase):
         self.assertEqual(cant.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
         self.assertEqual(cant.data.get('code'), 'RETURN_ALREADY_CANCELED')
 
-        rd = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'defect', 'condition_type': 'defect'}])
-        self.client.post(f'/api/returns/{rd.data["id"]}/complete/', data={}, format='json')
-        self.assertTrue(DefectRecord.objects.filter(source_type=DefectRecord.SOURCE_RETURN).exists())
+        bad_defect_target = self._create_return(
+            lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'defect', 'condition_type': 'damaged'}],
+        )
+        self.assertEqual(bad_defect_target.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(bad_defect_target.data.get('code'), 'INVALID_RETURN_TARGET')
 
         rr = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'rework', 'condition_type': 'damaged'}])
         self.client.post(f'/api/returns/{rr.data["id"]}/complete/', data={}, format='json')
-        self.assertTrue(ReworkRequest.objects.exists())
+        rl_rw = ReturnLine.objects.filter(return_doc_id=rr.data['id']).first()
+        self.assertIsNotNone(rl_rw.rework_receipt_batch_id)
+        self.assertEqual(rl_rw.rework_receipt_batch.stock_bucket, WarehouseBatch.STOCK_BUCKET_REWORKED)
 
         retrieve = self.client.get(f'/api/returns/{rr.data["id"]}/')
         self.assertEqual(retrieve.status_code, status.HTTP_200_OK)
         self.assertIn('downstream_links', retrieve.data)
+        dw = retrieve.data['downstream_links']
+        self.assertTrue(
+            any(
+                x.get('type') == 'warehouse_batch'
+                and x.get('stock_bucket') == 'reworked'
+                and x.get('warehouse_batch_id') == rl_rw.rework_receipt_batch_id
+                and x.get('label') == 'Переделанные (склад)'
+                for x in dw
+            ),
+            msg=f'Expected rework warehouse downstream link, got: {dw}',
+        )
 
     def test_cancel_rules_and_locks(self):
         # draft cancel
@@ -286,11 +299,19 @@ class ReturnsApiContractTests(APITestCase):
         self.assertEqual(locked.status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(locked.data.get('code'), 'REFUND_PAYMENT_EXISTS')
 
-        # used defect lock
-        r4 = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'defect', 'condition_type': 'defect'}])
+        # used defect lock (ручная запись брака по строке возврата)
+        r4 = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'warehouse', 'condition_type': 'good'}])
         rid4 = r4.data['id']
         self.client.post(f'/api/returns/{rid4}/complete/', data={}, format='json')
-        defect = DefectRecord.objects.filter(source_type=DefectRecord.SOURCE_RETURN).order_by('-id').first()
+        rl4 = ReturnLine.objects.get(return_doc_id=rid4)
+        defect = DefectRecord.objects.create(
+            source_type=DefectRecord.SOURCE_RETURN,
+            source_id=rl4.pk,
+            product=rl4.product or 'x',
+            original_quantity_pcs=Decimal('1'),
+            quantity_pcs=Decimal('1'),
+            status=DefectRecord.STATUS_ON_STOCK,
+        )
         defect.status = DefectRecord.STATUS_SOLD
         defect.save(update_fields=['status'])
         used = self.client.post(f'/api/returns/{rid4}/cancel/', data={}, format='json')
@@ -301,9 +322,10 @@ class ReturnsApiContractTests(APITestCase):
         r5 = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'rework', 'condition_type': 'damaged'}])
         rid5 = r5.data['id']
         self.client.post(f'/api/returns/{rid5}/complete/', data={}, format='json')
-        rw = ReworkRequest.objects.order_by('-id').first()
-        rw.status = ReworkRequest.STATUS_COMPLETED
-        rw.save(update_fields=['status'])
+        rl5 = ReturnLine.objects.filter(return_doc_id=rid5).first()
+        wb_rw = rl5.rework_receipt_batch
+        wb_rw.status = WarehouseBatch.STATUS_SHIPPED
+        wb_rw.save(update_fields=['status'])
         used_rw = self.client.post(f'/api/returns/{rid5}/cancel/', data={}, format='json')
         self.assertEqual(used_rw.status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(used_rw.data.get('code'), 'DOWNSTREAM_USED')

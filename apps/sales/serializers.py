@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -12,6 +13,7 @@ from config.api_numbers import api_decimal_str
 from config.fields import CleanDecimalField
 from apps.recipes.models import PlasticProfile, Recipe
 from apps.warehouse.models import WarehouseBatch
+from apps.warehouse.packaging import q4
 from apps.warehouse.stock_ops import (
     PIECE_FROM_SEALED,
     PIECE_FROM_OPEN,
@@ -19,6 +21,7 @@ from apps.warehouse.stock_ops import (
     normalize_inventory_form,
     normalize_piece_pick,
 )
+from .defect_service import create_defect_split_from_good_batch
 from .models import (
     Client,
     ClientPrice,
@@ -89,21 +92,27 @@ class ClientSerializer(serializers.ModelSerializer):
     has_sales = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
     phone_extra = serializers.CharField(
-        source='phone_alt', required=False, allow_blank=True, max_length=50,
-    )
-    comment = serializers.CharField(
-        source='notes', required=False, allow_blank=True, default='',
+        source='phone_alt', required=False, allow_blank=True, max_length=255,
     )
 
     class Meta:
         model = Client
         fields = (
             'id', 'name', 'contact', 'phone', 'phone_alt', 'phone_extra',
-            'inn', 'address', 'email', 'messenger',
-            'client_type', 'notes', 'comment', 'is_active', 'status',
+            'settlement_account', 'inn', 'address', 'email', 'messenger',
+            'client_type', 'is_active', 'status',
             'sales_count', 'sales_total', 'has_sales',
             'credit_limit', 'credit_limit_mode',
         )
+        extra_kwargs = {
+            'name': {'required': True, 'allow_blank': False},
+            'client_type': {'required': False},
+            'phone': {'required': False, 'allow_blank': True},
+            'phone_alt': {'required': False, 'allow_blank': True},
+            'settlement_account': {'required': False, 'allow_blank': True},
+            'inn': {'required': False, 'allow_blank': True},
+            'address': {'required': False, 'allow_blank': True},
+        }
 
     def get_status(self, obj):
         return 'active' if obj.is_active else 'inactive'
@@ -118,12 +127,33 @@ class ClientSerializer(serializers.ModelSerializer):
             d = data.copy() if isinstance(data, dict) else dict(data)
             st = d.pop('status', None)
             if st is not None and str(st).strip() != '':
+                st = str(st).strip()
                 if st == 'active':
                     d['is_active'] = True
                 elif st == 'inactive':
                     d['is_active'] = False
+                else:
+                    raise serializers.ValidationError({'status': 'status должен быть active или inactive'})
             return super().to_internal_value(d)
         return super().to_internal_value(data)
+
+    def validate_client_type(self, value):
+        if value in (None, ''):
+            return Client.TYPE_INDIVIDUAL
+        if value not in (Client.TYPE_INDIVIDUAL, Client.TYPE_COMPANY):
+            raise serializers.ValidationError('client_type должен быть individual или company')
+        return value
+
+    def validate(self, attrs):
+        client_type = attrs.get(
+            'client_type',
+            self.instance.client_type if self.instance is not None else Client.TYPE_INDIVIDUAL,
+        )
+        if client_type == Client.TYPE_INDIVIDUAL:
+            attrs['settlement_account'] = ''
+            attrs['inn'] = ''
+            attrs['address'] = ''
+        return attrs
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -185,6 +215,11 @@ class OrderSerializer(serializers.ModelSerializer):
     PAYMENT_METHOD_CHOICES = ('cash', 'card', 'transfer')
 
     lines = OrderLineSerializer(many=True, required=False)
+    order_lines = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        write_only=True,
+    )
     client_name = serializers.CharField(source='client.name', read_only=True, allow_null=True, default='')
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
     responsible_user_name = serializers.CharField(source='responsible_user.name', read_only=True, allow_null=True, default='')
@@ -237,7 +272,7 @@ class OrderSerializer(serializers.ModelSerializer):
             'created_by', 'created_by_name',
             'responsible_user', 'responsible_user_name',
             'created_at', 'updated_at',
-            'lines',
+            'lines', 'order_lines',
             'total_amount', 'shipped_amount', 'remaining_amount',
             'paid_amount', 'payment_status', 'debt_amount', 'refund_amount',
             'payment_type', 'payment_type_label', 'payment_method', 'payment_method_label',
@@ -364,7 +399,165 @@ class OrderSerializer(serializers.ModelSerializer):
         ret['payment_method'] = pmethod
         ret['prepayment_amount'] = ret.get('paid_amount')
         ret['advance_amount'] = ret.get('paid_amount')
+        order_lines_payload = []
+        total_qty = Decimal('0')
+        total_m = Decimal('0')
+        for line in instance.lines.select_related('profile').all():
+            meta = self._extract_order_line_meta(line.comment)
+            length = meta.get('length')
+            qty = Decimal(str(line.ordered_quantity or 0))
+            total_qty += qty
+            if length not in (None, ''):
+                try:
+                    total_m += (qty * Decimal(str(length)))
+                except (InvalidOperation, TypeError, ValueError):
+                    pass
+            order_lines_payload.append(
+                {
+                    'id': line.id,
+                    'profile': line.profile_id,
+                    'profile_id': line.profile_id,
+                    'profile_name': line.profile.name if line.profile_id else (line.product or ''),
+                    'recipe': meta.get('recipe_id'),
+                    'recipe_id': meta.get('recipe_id'),
+                    'recipe_name': meta.get('recipe_name'),
+                    'length': api_decimal_str(Decimal(str(length))) if length not in (None, '') else None,
+                    'quantity': api_decimal_str(qty),
+                    'unit_type': meta.get('unit_type') or Sale.MODE_PIECES,
+                    'ordered_quantity': api_decimal_str(qty),
+                    'shipped_quantity': api_decimal_str(Decimal(str(line.shipped_quantity or 0))),
+                    'remaining_quantity': api_decimal_str(line.remaining_quantity),
+                },
+            )
+        ret['order_lines'] = order_lines_payload
+        ret['total_quantity'] = api_decimal_str(total_qty)
+        ret['total_meters'] = api_decimal_str(total_m) if total_m > 0 else ret.get('total_meters')
+        ret['status_label'] = instance.get_status_display()
+        ret['request_status_label'] = (
+            instance.get_request_status_display() if instance.request_status else None
+        )
         return ret
+
+    @staticmethod
+    def _extract_order_line_meta(comment: str) -> dict:
+        marker = '[line_meta]'
+        raw = comment or ''
+        pos = raw.find(marker)
+        if pos < 0:
+            return {}
+        payload = raw[pos + len(marker):].strip()
+        try:
+            val = json.loads(payload)
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _inject_order_line_meta(comment: str, *, recipe_id, recipe_name, length, unit_type) -> str:
+        marker = '[line_meta]'
+        base = (comment or '').strip()
+        if marker in base:
+            base = base.split(marker, 1)[0].strip()
+        meta = {
+            'recipe_id': recipe_id,
+            'recipe_name': recipe_name,
+            'length': str(length) if length is not None else None,
+            'unit_type': unit_type or Sale.MODE_PIECES,
+        }
+        suffix = f'{marker}{json.dumps(meta, ensure_ascii=False)}'
+        return f'{base}\n{suffix}'.strip()
+
+    def _normalize_cart_order_lines(self, initial_data: dict) -> list[dict]:
+        raw = initial_data.get('order_lines')
+        if raw in (None, ''):
+            raw = initial_data.get('lines')
+        if (raw in (None, '')) and all(k in initial_data for k in ('profile', 'recipe', 'length', 'quantity')):
+            raw = [
+                {
+                    'profile': initial_data.get('profile'),
+                    'recipe': initial_data.get('recipe'),
+                    'length': initial_data.get('length'),
+                    'quantity': initial_data.get('quantity'),
+                },
+            ]
+        if not isinstance(raw, list) or len(raw) < 1:
+            self._raise_order_error('MISSING_ORDER_LINES', 'Поле order_lines обязательно и должно содержать строки.', field='order_lines')
+
+        errors = []
+        normalized = []
+        for idx, row in enumerate(raw):
+            row = row or {}
+            profile_id = row.get('profile') or row.get('profile_id')
+            recipe_id = row.get('recipe') or row.get('recipe_id')
+            length_raw = row.get('length')
+            qty_raw = row.get('quantity') or row.get('ordered_quantity')
+            unit_type = (row.get('unit_type') or Sale.MODE_PIECES).strip().lower() if isinstance(row.get('unit_type', Sale.MODE_PIECES), str) else Sale.MODE_PIECES
+            if unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
+                unit_type = Sale.MODE_PIECES
+            line_errors = []
+            if not profile_id:
+                line_errors.append({'field': f'order_lines[{idx}].profile', 'message': 'Поле profile обязательно.'})
+            if not recipe_id:
+                line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'Поле recipe обязательно.'})
+            if length_raw in (None, ''):
+                line_errors.append({'field': f'order_lines[{idx}].length', 'message': 'Поле length обязательно.'})
+            if qty_raw in (None, ''):
+                line_errors.append({'field': f'order_lines[{idx}].quantity', 'message': 'Поле quantity обязательно.'})
+            profile_obj = None
+            recipe_obj = None
+            length_d = None
+            qty_d = None
+            if not line_errors:
+                try:
+                    profile_obj = PlasticProfile.objects.get(pk=profile_id)
+                except PlasticProfile.DoesNotExist:
+                    line_errors.append({'field': f'order_lines[{idx}].profile', 'message': 'Профиль не найден.'})
+                try:
+                    recipe_obj = Recipe.objects.get(pk=recipe_id, is_active=True)
+                except Recipe.DoesNotExist:
+                    line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'Рецепт не найден или неактивен.'})
+                try:
+                    length_d = Decimal(str(length_raw))
+                    if length_d <= 0:
+                        raise InvalidOperation()
+                except Exception:
+                    line_errors.append({'field': f'order_lines[{idx}].length', 'message': 'length должно быть > 0.'})
+                try:
+                    qty_d = Decimal(str(qty_raw))
+                    if qty_d <= 0:
+                        raise InvalidOperation()
+                except Exception:
+                    line_errors.append({'field': f'order_lines[{idx}].quantity', 'message': 'quantity должно быть > 0.'})
+                if profile_obj is not None and recipe_obj is not None and recipe_obj.profile_id != profile_obj.id:
+                    line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'recipe не относится к profile.'})
+            if line_errors:
+                errors.extend(line_errors)
+                continue
+            recipe_name = (recipe_obj.recipe or '').strip() or (recipe_obj.product or '')
+            normalized.append(
+                {
+                    'product': (profile_obj.name or '').strip() or recipe_name,
+                    'profile': profile_obj,
+                    'ordered_quantity': qty_d,
+                    'unit_price': Decimal('0'),
+                    'comment': self._inject_order_line_meta(
+                        row.get('comment', ''),
+                        recipe_id=recipe_obj.id,
+                        recipe_name=recipe_name,
+                        length=length_d,
+                        unit_type=unit_type,
+                    ),
+                },
+            )
+        if errors:
+            raise serializers.ValidationError(
+                {
+                    'code': 'ORDER_LINES_VALIDATION_ERROR',
+                    'detail': 'Ошибка в строках корзины заявки.',
+                    'errors': errors,
+                },
+            )
+        return normalized
 
     @staticmethod
     def _raise_order_error(code: str, message: str, field: str = 'non_field_errors'):
@@ -561,46 +754,49 @@ class OrderSerializer(serializers.ModelSerializer):
                     'Клиент неактивен. Создание заявки запрещено.',
                     field='client',
                 )
-            profile = attrs.get('production_profile')
-            recipe = attrs.get('resolved_recipe')
-            if profile is None:
-                self._raise_order_error('MISSING_PROFILE', 'Поле profile обязательно.', field='profile')
-            if recipe is None:
-                self._raise_order_error('MISSING_RECIPE', 'Поле recipe обязательно.', field='recipe')
-            if recipe and profile and recipe.profile_id != profile.id:
-                self._raise_order_error(
-                    'RECIPE_PROFILE_MISMATCH',
-                    'recipe не относится к выбранному profile.',
-                    field='recipe',
-                )
-            ln = attrs.get('production_length')
-            qt = attrs.get('production_quantity')
-            if ln in (None, ''):
-                self._raise_order_error('INVALID_LENGTH', 'Поле length обязательно.', field='length')
-            if qt in (None, ''):
-                self._raise_order_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='quantity')
-            try:
-                ln_d = Decimal(str(ln))
-            except Exception:
-                self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
-            try:
-                q_i = int(qt)
-            except Exception:
-                self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
-            if ln_d <= 0:
-                self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
-            if q_i <= 0:
-                self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
-            self._is_production_order_create = True
-            total_amount = Decimal('0')
-            lines = (self.initial_data or {}).get('lines')
-            if isinstance(lines, list) and len(lines) > 0:
-                for line in lines:
-                    normalized = self._validate_order_line_payload(line)
-                    total_amount += (
-                        Decimal(str(normalized.get('ordered_quantity') or 0))
-                        * Decimal(str(normalized.get('unit_price') or 0))
+            raw_order_lines = idata.get('order_lines')
+            raw_lines = idata.get('lines')
+            has_explicit_lines = isinstance(raw_order_lines, list) or isinstance(raw_lines, list)
+            legacy_keys = {'profile', 'recipe', 'length', 'quantity'}
+            has_legacy_any = any(k in idata for k in legacy_keys)
+            if not has_explicit_lines and has_legacy_any:
+                profile = attrs.get('production_profile')
+                recipe = attrs.get('resolved_recipe')
+                if profile is None:
+                    self._raise_order_error('MISSING_PROFILE', 'Поле profile обязательно.', field='profile')
+                if recipe is None:
+                    self._raise_order_error('MISSING_RECIPE', 'Поле recipe обязательно.', field='recipe')
+                if recipe and profile and recipe.profile_id != profile.id:
+                    self._raise_order_error(
+                        'RECIPE_PROFILE_MISMATCH',
+                        'recipe не относится к выбранному profile.',
+                        field='recipe',
                     )
+                ln = attrs.get('production_length')
+                qt = attrs.get('production_quantity')
+                if ln in (None, ''):
+                    self._raise_order_error('INVALID_LENGTH', 'Поле length обязательно.', field='length')
+                if qt in (None, ''):
+                    self._raise_order_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='quantity')
+                try:
+                    ln_d = Decimal(str(ln))
+                except Exception:
+                    self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
+                try:
+                    q_d = Decimal(str(qt))
+                except Exception:
+                    self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
+                if ln_d <= 0:
+                    self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
+                if q_d <= 0:
+                    self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
+            self._normalized_order_lines = self._normalize_cart_order_lines(idata)
+            total_amount = Decimal('0')
+            for normalized in self._normalized_order_lines:
+                total_amount += (
+                    Decimal(str(normalized.get('ordered_quantity') or 0))
+                    * Decimal(str(normalized.get('unit_price') or 0))
+                )
             self._order_payment_input = self._validate_order_payment_input(
                 total_amount=total_amount.quantize(Decimal('0.01')),
                 initial=idata,
@@ -684,11 +880,21 @@ class OrderSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        is_prod = getattr(self, '_is_production_order_create', False)
+        is_prod = False
         payment_input = getattr(self, '_order_payment_input', (None, None, Decimal('0')))
         validated_data.pop('payment_type', None)
         validated_data.pop('payment_method', None)
+        validated_data.pop('order_lines', None)
         lines_data = validated_data.pop('lines', [])
+        normalized_order_lines = getattr(self, '_normalized_order_lines', None)
+        if normalized_order_lines is not None:
+            lines_data = normalized_order_lines
+        if (
+            validated_data.get('production_profile') is not None
+            and validated_data.get('production_length') is not None
+            and validated_data.get('production_quantity') not in (None, 0)
+        ):
+            is_prod = True
         if is_prod:
             ln_d = validated_data.get('production_length')
             q_i = int(validated_data.get('production_quantity') or 0)
@@ -711,8 +917,10 @@ class OrderSerializer(serializers.ModelSerializer):
 
         with transaction.atomic():
             order = super().create(validated_data)
-            if not is_prod:
-                for line_data in lines_data:
+            for line_data in lines_data:
+                if normalized_order_lines is not None:
+                    OrderLine.objects.create(order=order, **line_data)
+                else:
                     normalized = self._validate_order_line_payload(line_data)
                     OrderLine.objects.create(order=order, **normalized)
             pay_type, pay_method, pay_amount = payment_input
@@ -2198,7 +2406,8 @@ class ReturnLineSerializer(serializers.ModelSerializer):
         model = ReturnLine
         fields = (
             'id', 'sale_line', 'product', 'quantity',
-            'return_target', 'condition_type', 'comment',
+            'return_target', 'condition_type',
+            'rework_receipt_batch',
             'sale_line_label', 'sale_line_sale_id',
         )
         extra_kwargs = {
@@ -2225,16 +2434,30 @@ class ReturnLineSerializer(serializers.ModelSerializer):
                 if 'return_target' in detail:
                     self._raise_return_line_error(
                         'INVALID_RETURN_TARGET',
-                        'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                        'Некорректный return_target. Допустимо: warehouse, rework.',
                         field='return_target',
                     )
                 if 'condition_type' in detail:
                     self._raise_return_line_error(
                         'INVALID_CONDITION_TYPE',
-                        'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                        'Некорректный condition_type. Допустимо: good, damaged.',
                         field='condition_type',
                     )
             raise
+
+    def validate_return_target(self, value):
+        if value == ReturnLine.TARGET_DEFECT:
+            raise serializers.ValidationError('invalid')
+        if value not in (ReturnLine.TARGET_WAREHOUSE, ReturnLine.TARGET_REWORK):
+            raise serializers.ValidationError('invalid')
+        return value
+
+    def validate_condition_type(self, value):
+        if value == ReturnLine.CONDITION_DEFECT:
+            return ReturnLine.CONDITION_DAMAGED
+        if value not in (ReturnLine.CONDITION_GOOD, ReturnLine.CONDITION_DAMAGED):
+            raise serializers.ValidationError('invalid')
+        return value
 
     def validate(self, attrs):
         if self.instance and self.instance.return_doc.status == Return.STATUS_COMPLETED:
@@ -2275,6 +2498,14 @@ class ReturnLineSerializer(serializers.ModelSerializer):
             return ''
         return f'{sl.product} × {api_decimal_str(sl.quantity)}'
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get('return_target') == ReturnLine.TARGET_DEFECT:
+            ret['return_target'] = ReturnLine.TARGET_REWORK
+        if ret.get('condition_type') == ReturnLine.CONDITION_DEFECT:
+            ret['condition_type'] = ReturnLine.CONDITION_DAMAGED
+        return ret
+
 
 class ReturnSerializer(serializers.ModelSerializer):
     lines = ReturnLineSerializer(many=True, required=False)
@@ -2287,7 +2518,7 @@ class ReturnSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'return_number', 'date', 'status', 'sale', 'sale_order_number',
             'linked_order', 'invoice_number',
-            'return_reason', 'comment',
+            'return_reason',
             'created_by', 'created_by_name', 'created_at',
             'lines', 'client_name',
         )
@@ -2321,13 +2552,13 @@ class ReturnSerializer(serializers.ModelSerializer):
                     if 'return_target' in text:
                         self._raise_return_error(
                             'INVALID_RETURN_TARGET',
-                            'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                            'Некорректный return_target. Допустимо: warehouse, rework.',
                             field='lines',
                         )
                     if 'condition_type' in text:
                         self._raise_return_error(
                             'INVALID_CONDITION_TYPE',
-                            'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                            'Некорректный condition_type. Допустимо: good, damaged.',
                             field='lines',
                         )
                     self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
@@ -2383,24 +2614,32 @@ class ReturnSerializer(serializers.ModelSerializer):
 
         rt = payload.get('return_target', ReturnLine.TARGET_WAREHOUSE)
         ct = payload.get('condition_type', ReturnLine.CONDITION_GOOD)
-        allowed_targets = {x[0] for x in ReturnLine.TARGET_CHOICES}
-        allowed_conditions = {x[0] for x in ReturnLine.CONDITION_CHOICES}
-        if rt not in allowed_targets:
+        if rt == ReturnLine.TARGET_DEFECT:
             self._raise_return_error(
                 'INVALID_RETURN_TARGET',
-                'Некорректный return_target. Допустимо: warehouse/defect/rework.',
+                'Некорректный return_target. Допустимо: warehouse, rework.',
                 field='lines',
             )
-        if ct not in allowed_conditions:
+        if rt not in (ReturnLine.TARGET_WAREHOUSE, ReturnLine.TARGET_REWORK):
+            self._raise_return_error(
+                'INVALID_RETURN_TARGET',
+                'Некорректный return_target. Допустимо: warehouse, rework.',
+                field='lines',
+            )
+        if ct == ReturnLine.CONDITION_DEFECT:
+            ct = ReturnLine.CONDITION_DAMAGED
+        if ct not in (ReturnLine.CONDITION_GOOD, ReturnLine.CONDITION_DAMAGED):
             self._raise_return_error(
                 'INVALID_CONDITION_TYPE',
-                'Некорректный condition_type. Допустимо: good/damaged/defect.',
+                'Некорректный condition_type. Допустимо: good, damaged.',
                 field='lines',
             )
 
         payload['sale_line'] = sale_line
         payload['quantity'] = qty_d
         payload['product'] = sale_line.product
+        payload['return_target'] = rt
+        payload['condition_type'] = ct
         return payload
 
     def get_client_name(self, obj):
@@ -2449,12 +2688,12 @@ class ReturnSerializer(serializers.ModelSerializer):
             if self.instance.status == Return.STATUS_CANCELED:
                 self._raise_return_error('RETURN_UPDATE_FORBIDDEN', 'Отмененный возврат нельзя редактировать.', field='status')
             if self.instance.status == Return.STATUS_COMPLETED:
-                allowed = {'comment', 'return_reason', 'invoice_number'}
+                allowed = {'return_reason', 'invoice_number'}
                 for key in initial:
                     if key not in allowed:
                         self._raise_return_error(
                             'RETURN_UPDATE_FORBIDDEN',
-                            'У проведенного возврата можно менять только comment, return_reason, invoice_number.',
+                            'У проведенного возврата можно менять только return_reason и invoice_number.',
                             field=key,
                         )
             if self.instance.status == Return.STATUS_DRAFT:
@@ -2493,7 +2732,6 @@ class ReturnSerializer(serializers.ModelSerializer):
                     quantity=normalized['quantity'],
                     return_target=normalized.get('return_target', ReturnLine.TARGET_WAREHOUSE),
                     condition_type=normalized.get('condition_type', ReturnLine.CONDITION_GOOD),
-                    comment=normalized.get('comment', '') or '',
                 )
         return ret_doc
 
@@ -2502,7 +2740,7 @@ class ReturnSerializer(serializers.ModelSerializer):
         if instance.status == Return.STATUS_COMPLETED:
             validated_data = {
                 k: v for k, v in validated_data.items()
-                if k in {'comment', 'return_reason', 'invoice_number'}
+                if k in {'return_reason', 'invoice_number'}
             }
             return super().update(instance, validated_data)
         if instance.status == Return.STATUS_CANCELED:
@@ -2522,7 +2760,6 @@ class ReturnSerializer(serializers.ModelSerializer):
                         quantity=normalized['quantity'],
                         return_target=normalized.get('return_target', ReturnLine.TARGET_WAREHOUSE),
                         condition_type=normalized.get('condition_type', ReturnLine.CONDITION_GOOD),
-                        comment=normalized.get('comment', '') or '',
                     )
                 return obj
         return super().update(instance, validated_data)
@@ -2565,30 +2802,43 @@ class ReturnSerializer(serializers.ModelSerializer):
             )
 
         elif line.return_target == ReturnLine.TARGET_REWORK:
-            # Создаём заявку на переделку (вся строка возврата сразу уходит в переделку)
-            product = line.sale_line.product
-            qp = Decimal(str(line.quantity))
-            defect = DefectRecord.objects.create(
-                source_type=DefectRecord.SOURCE_RETURN,
-                source_id=line.id,
-                product=product,
-                original_quantity_pcs=qp,
-                quantity_pcs=Decimal('0'),
-                sent_to_rework_quantity_pcs=qp,
-                defect_reason=ret_doc.return_reason or '',
-                status=DefectRecord.STATUS_SENT_TO_REWORK,
-                comment=line.comment or '',
+            sl = line.sale_line
+            src_wb = None
+            if sl is not None and sl.warehouse_batch_id:
+                src_wb = sl.warehouse_batch
+            elif ret_doc.sale_id and ret_doc.sale.warehouse_batch_id:
+                src_wb = ret_doc.sale.warehouse_batch
+            qp = q4(Decimal(str(line.quantity)))
+            product_name = (
+                (line.product or '').strip()
+                or (sl.product if sl else '')
+                or (ret_doc.sale.product if ret_doc.sale_id else '')
+                or '—'
             )
-            ReworkRequest.objects.create(
-                return_doc=ret_doc,
-                defect_record=defect,
-                original_sale=ret_doc.sale,
-                product=product,
-                quantity_pcs=qp,
-                quantity_kg=Decimal('0'),
-                status=ReworkRequest.STATUS_PENDING,
-                comment=line.comment or '',
+            quality = (
+                WarehouseBatch.QUALITY_DEFECT
+                if line.condition_type in (ReturnLine.CONDITION_DAMAGED, ReturnLine.CONDITION_DEFECT)
+                else WarehouseBatch.QUALITY_GOOD
             )
+            inv = src_wb.inventory_form if src_wb else WarehouseBatch.INVENTORY_UNPACKED
+            wb = WarehouseBatch.objects.create(
+                product=product_name[:255],
+                quantity=qp,
+                date=ret_doc.date,
+                status=WarehouseBatch.STATUS_AVAILABLE,
+                quality=quality,
+                inventory_form=inv,
+                stock_bucket=WarehouseBatch.STOCK_BUCKET_REWORKED,
+                profile_id=src_wb.profile_id if src_wb else None,
+                length_per_piece=src_wb.length_per_piece if src_wb else None,
+                unit_meters=src_wb.unit_meters if src_wb else None,
+                package_total_meters=src_wb.package_total_meters if src_wb else None,
+                pieces_per_package=src_wb.pieces_per_package if src_wb else None,
+                packages_count=src_wb.packages_count if src_wb else None,
+                source_batch=None,
+            )
+            line.rework_receipt_batch = wb
+            line.save(update_fields=['rework_receipt_batch'])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2612,7 +2862,7 @@ class DefectRecordSerializer(serializers.ModelSerializer):
             'quantity_kg', 'kg_coefficient',
             'defect_reason', 'status', 'writeoff_reason',
             'source_label', 'display_quantity_label',
-            'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
         read_only_fields = (
             'created_at', 'updated_at',
@@ -2656,59 +2906,59 @@ class DefectRecordSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {'writeoff_reason': 'Причина списания обязательна при статусе «списан»'}
                 )
+        if self.instance is not None:
+            incoming = set((self.initial_data or {}).keys())
+            allowed_patch = {'defect_reason', 'kg_coefficient'}
+            forbidden = incoming - allowed_patch
+            if forbidden:
+                raise serializers.ValidationError(
+                    {
+                        'code': 'DEFECT_PATCH_FORBIDDEN',
+                        'detail': 'Разрешено менять только defect_reason.',
+                        'errors': [{'field': k, 'message': 'Поле недоступно для изменения'} for k in sorted(forbidden)],
+                    },
+                )
+
         if self.instance is None:
-            source_type = attrs.get('source_type', DefectRecord.SOURCE_OTK)
-            source_id = attrs.get('source_id')
-            if source_type == DefectRecord.SOURCE_MANUAL:
-                if not (attrs.get('defect_reason') or '').strip():
-                    raise serializers.ValidationError({'defect_reason': 'Для ручного брака укажите причину'})
-                if not (attrs.get('product') or '').strip():
-                    raise serializers.ValidationError({'product': 'Для ручного брака укажите продукт'})
-                if not attrs.get('quantity_pcs') or attrs.get('quantity_pcs') <= 0:
-                    raise serializers.ValidationError({'quantity_pcs': 'Для ручного брака укажите количество > 0'})
-            elif source_type in (DefectRecord.SOURCE_WAREHOUSE, DefectRecord.SOURCE_QC):
-                if not attrs.get('warehouse_batch') and source_id is None:
-                    raise serializers.ValidationError(
-                        {'warehouse_batch': 'Укажите warehouse_batch или source_id (ID партии/ОТК)'}
-                    )
-                batch_id = attrs.get('warehouse_batch').pk if attrs.get('warehouse_batch') else source_id
-                if batch_id and DefectRecord.objects.filter(warehouse_batch_id=batch_id).exists():
-                    raise serializers.ValidationError(
-                        {
-                            'code': 'DEFECT_ALREADY_EXISTS',
-                            'detail': f'Для warehouse_batch #{batch_id} уже есть запись брака.',
-                            'errors': [{'field': 'warehouse_batch', 'message': 'Для партии уже существует DefectRecord.'}],
-                        },
-                    )
-            elif source_type == DefectRecord.SOURCE_RETURN:
-                if source_id is None or not ReturnLine.objects.filter(pk=source_id).exists():
-                    raise serializers.ValidationError({'source_id': 'ReturnLine с указанным source_id не найден'})
-                if DefectRecord.objects.filter(source_type=DefectRecord.SOURCE_RETURN, source_id=source_id).exists():
-                    raise serializers.ValidationError(
-                        {
-                            'code': 'DEFECT_ALREADY_EXISTS',
-                            'detail': f'Для ReturnLine #{source_id} уже есть запись брака.',
-                            'errors': [{'field': 'source_id', 'message': 'Для return line уже существует DefectRecord.'}],
-                        },
-                    )
-            else:
-                if source_id is None:
-                    raise serializers.ValidationError({'source_id': 'Поле source_id обязательно при создании (ОТК)'})
+            source_type = attrs.get('source_type')
+            if source_type != DefectRecord.SOURCE_WAREHOUSE:
+                raise serializers.ValidationError(
+                    {
+                        'code': 'INVALID_SOURCE_TYPE',
+                        'detail': 'Создание через API только со склада ГП: source_type=warehouse.',
+                        'errors': [{'field': 'source_type', 'message': 'Ожидается warehouse'}],
+                    },
+                )
+            wb = attrs.get('warehouse_batch')
+            if wb is None:
+                raise serializers.ValidationError({'warehouse_batch': 'Поле warehouse_batch обязательно'})
+            qp = attrs.get('quantity_pcs')
+            try:
+                qp_d = Decimal(str(qp))
+            except Exception:
+                qp_d = Decimal('-1')
+            if qp is None or qp_d <= 0 or qp_d % Decimal('1') != 0:
+                raise serializers.ValidationError(
+                    {'quantity_pcs': 'Укажите целое количество штук > 0'},
+                )
+            if not (attrs.get('defect_reason') or '').strip():
+                raise serializers.ValidationError({'defect_reason': 'Укажите причину брака'})
         return attrs
 
     def create(self, validated_data):
-        source_type = validated_data.get('source_type', DefectRecord.SOURCE_OTK)
-        source_id = validated_data.get('source_id')
-        if source_type == DefectRecord.SOURCE_RETURN and source_id is not None:
-            rl = ReturnLine.objects.select_related('sale_line').filter(pk=source_id).first()
-            if rl is not None:
-                validated_data['product'] = rl.sale_line.product
-                validated_data['quantity_pcs'] = rl.quantity
-        qp = validated_data.get('quantity_pcs')
-        if qp is not None and Decimal(str(qp or 0)) > 0:
-            if not validated_data.get('original_quantity_pcs'):
-                validated_data['original_quantity_pcs'] = qp
-        return super().create(validated_data)
+        validated_data.pop('source_id', None)
+        validated_data.pop('source_type', None)
+        wb = validated_data.pop('warehouse_batch')
+        qp = q4(Decimal(str(validated_data.pop('quantity_pcs'))))
+        reason = (validated_data.pop('defect_reason') or '').strip()
+        try:
+            return create_defect_split_from_good_batch(
+                source_batch=wb,
+                quantity_pcs=qp,
+                defect_reason=reason,
+            )
+        except ValueError as e:
+            raise serializers.ValidationError({'non_field_errors': [str(e)]})
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -2762,6 +3012,146 @@ def defect_record_source_label(dr: DefectRecord) -> str:
     return ''
 
 
+def _reserve_defect_for_rework_explicit(
+    d: DefectRecord,
+    send_pcs: Decimal,
+    rework_kg: Decimal,
+    *,
+    eps: Decimal = Decimal('0.0001'),
+) -> tuple[Decimal, Decimal]:
+    """
+    Списать с DefectRecord ровно send_pcs шт и зафиксировать rework_kg на заявке (d под select_for_update).
+    Не вызывает save().
+    """
+    from .state_machine import validate_defect_transition
+
+    if ReworkRequest.objects.filter(
+        defect_record_id=d.pk,
+        status__in=(ReworkRequest.STATUS_PENDING, ReworkRequest.STATUS_IN_PROGRESS),
+    ).exists():
+        raise ValueError('По этому браку уже есть активная переделка')
+
+    if rework_kg <= 0:
+        raise ValueError('quantity_kg должно быть > 0')
+
+    sp = q4(Decimal(str(send_pcs)))
+    if sp <= 0 or sp % Decimal('1') != 0:
+        raise ValueError('quantity_pcs должно быть целым числом > 0')
+
+    rem_pcs = Decimal(str(d.quantity_pcs or 0))
+    if sp > rem_pcs + eps:
+        raise ValueError('quantity_pcs превышает доступный остаток по браку')
+
+    kg_raw = d.quantity_kg
+    kg_before_d = Decimal(str(kg_raw)) if kg_raw is not None else Decimal('0')
+    rem_before = rem_pcs
+
+    d.sent_to_rework_quantity_pcs = Decimal(str(d.sent_to_rework_quantity_pcs or 0)) + sp
+    d.recompute_remaining_pcs()
+    if kg_before_d > 0 and rem_before > 0:
+        kg_delta = (sp / rem_before * kg_before_d).quantize(Decimal('0.0001'))
+        d.quantity_kg = max(Decimal('0'), (kg_before_d - kg_delta).quantize(Decimal('0.0001')))
+    if sp >= rem_before - eps:
+        try:
+            validate_defect_transition(d.status, DefectRecord.STATUS_SENT_TO_REWORK)
+        except ValueError:
+            pass
+
+    d.apply_terminal_status_from_counters()
+    return sp, rework_kg
+
+
+def _create_reworked_warehouse_batch_from_defect(
+    defect: DefectRecord,
+    quantity_kg: Decimal,
+    result_name: str,
+) -> WarehouseBatch:
+    tpl = getattr(defect, 'warehouse_batch', None)
+    return WarehouseBatch.objects.create(
+        profile_id=defect.profile_id,
+        product=(result_name or '').strip() or 'Переделанный материал',
+        length_per_piece=None,
+        quantity=q4(quantity_kg),
+        cost_per_piece=tpl.cost_per_piece if tpl else Decimal('0'),
+        cost_per_meter=tpl.cost_per_meter if tpl else Decimal('0'),
+        date=timezone.now().date(),
+        source_batch_id=tpl.source_batch_id if tpl else None,
+        inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        stock_bucket=WarehouseBatch.STOCK_BUCKET_REWORKED,
+        quality=WarehouseBatch.QUALITY_GOOD,
+    )
+
+
+def _reserve_defect_from_kg_only(
+    d: DefectRecord,
+    quantity_kg: Decimal,
+    *,
+    eps: Decimal = Decimal('0.0001'),
+) -> tuple[Decimal | None, Decimal]:
+    """Legacy: только quantity_kg в теле (пропорционально шт). Для POST …/defects/…/send-to-rework/."""
+    from .state_machine import validate_defect_transition
+
+    if ReworkRequest.objects.filter(
+        defect_record_id=d.pk,
+        status__in=(ReworkRequest.STATUS_PENDING, ReworkRequest.STATUS_IN_PROGRESS),
+    ).exists():
+        raise ValueError('По этому браку уже есть активная переделка')
+
+    if quantity_kg <= 0:
+        raise ValueError('quantity_kg должно быть > 0')
+
+    rem_pcs = Decimal(str(d.quantity_pcs or 0))
+    kg_raw = d.quantity_kg
+    kg_before_d = Decimal(str(kg_raw)) if kg_raw is not None else Decimal('0')
+    coeff_raw = d.kg_coefficient
+    coeff = Decimal(str(coeff_raw)) if coeff_raw is not None else Decimal('0')
+
+    send_pcs: Decimal | None = None
+
+    if kg_before_d > 0 and rem_pcs > 0:
+        if quantity_kg > kg_before_d + eps:
+            raise ValueError('quantity_kg превышает остаток кг по браку')
+        send_pcs = (quantity_kg / kg_before_d * rem_pcs).quantize(Decimal('0.0001'))
+    elif kg_before_d > 0 and rem_pcs <= 0:
+        if quantity_kg > kg_before_d + eps:
+            raise ValueError('quantity_kg превышает остаток кг по браку')
+        send_pcs = None
+    elif rem_pcs > 0:
+        if coeff <= 0:
+            raise ValueError(
+                'Для записи брака без quantity_kg задайте kg_coefficient (> 0), чтобы передавать quantity_kg в кг',
+            )
+        max_kg = (rem_pcs * coeff).quantize(Decimal('0.0001'))
+        if quantity_kg > max_kg + eps:
+            raise ValueError('quantity_kg превышает остаток по браку (кг)')
+        send_pcs = (quantity_kg / coeff).quantize(Decimal('0.0001'))
+    else:
+        raise ValueError('Нет остатка для переделки по этой записи брака')
+
+    if send_pcs is not None:
+        if send_pcs <= 0:
+            raise ValueError('Расчётное количество для переделки должно быть > 0')
+        if send_pcs > rem_pcs + eps:
+            send_pcs = rem_pcs
+
+        rem_before = rem_pcs
+        d.sent_to_rework_quantity_pcs = Decimal(str(d.sent_to_rework_quantity_pcs or 0)) + send_pcs
+        d.recompute_remaining_pcs()
+        if kg_before_d > 0 and rem_before > 0:
+            kg_delta = (send_pcs / rem_before * kg_before_d).quantize(Decimal('0.0001'))
+            d.quantity_kg = max(Decimal('0'), (kg_before_d - kg_delta).quantize(Decimal('0.0001')))
+        if send_pcs >= rem_before - eps:
+            try:
+                validate_defect_transition(d.status, DefectRecord.STATUS_SENT_TO_REWORK)
+            except ValueError:
+                pass
+    else:
+        d.quantity_kg = max(Decimal('0'), (kg_before_d - quantity_kg).quantize(Decimal('0.0001')))
+
+    d.apply_terminal_status_from_counters()
+    return send_pcs, quantity_kg
+
+
 def rework_quantities_from_defect_record(
     defect: DefectRecord,
     pcs_to_send: Decimal | None = None,
@@ -2802,7 +3192,10 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
     return_doc_number = serializers.CharField(source='return_doc.return_number', read_only=True, default='')
     defect_status = serializers.CharField(source='defect_record.status', read_only=True, default='')
     original_sale_number = serializers.CharField(source='original_sale.order_number', read_only=True, default='')
+    result_name = serializers.SerializerMethodField()
+    result_warehouse_batch = serializers.SerializerMethodField()
     result_warehouse_batch_label = serializers.SerializerMethodField()
+    result_warehouse_batch_id = serializers.IntegerField(read_only=True, allow_null=True)
     defect_record_id = serializers.IntegerField(read_only=True, allow_null=True)
     defect_product_name = serializers.SerializerMethodField()
     defect_quantity_pcs = serializers.SerializerMethodField()
@@ -2821,23 +3214,23 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
             'defect_product_name', 'defect_quantity_pcs', 'defect_quantity_kg',
             'defect_reason', 'defect_source_type', 'defect_source_label',
             'display_quantity', 'display_quantity_label',
-            'product', 'quantity_pcs', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
-            'status', 'result_warehouse_batch',
+            'product', 'result_name', 'quantity_pcs', 'quantity_kg', 'output_quantity_kg', 'loss_kg', 'conversion_rate',
+            'status', 'result_warehouse_batch', 'result_warehouse_batch_id',
             'result_warehouse_batch_label',
             'rework_loss_kg', 'recovered_output',
-            'comment', 'created_by', 'created_by_name', 'created_at', 'updated_at',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
         )
         read_only_fields = (
             'rework_number', 'created_at', 'updated_at', 'rework_loss_kg', 'recovered_output',
             'defect_record_id', 'defect_product_name', 'defect_quantity_pcs', 'defect_quantity_kg',
             'defect_reason', 'defect_source_type', 'defect_source_label',
-            'display_quantity', 'display_quantity_label',
+            'display_quantity', 'display_quantity_label', 'result_name', 'result_warehouse_batch',
+            'result_warehouse_batch_id',
         )
         extra_kwargs = {
             'return_doc': {'required': False, 'allow_null': True},
             'defect_record': {'required': False, 'allow_null': True},
             'original_sale': {'required': False, 'allow_null': True},
-            'result_warehouse_batch': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
             'quantity_pcs': {'required': False, 'allow_null': True},
             'output_quantity_kg': {'required': False, 'allow_null': True},
@@ -2845,10 +3238,45 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
             'conversion_rate': {'required': False, 'allow_null': True},
         }
 
+    def to_internal_value(self, data):
+        """Запятая как десятичный разделитель (напр. 12,5 кг) до парсинга DecimalField."""
+        if hasattr(data, 'copy'):
+            data = data.copy()
+        elif isinstance(data, dict):
+            data = dict(data)
+        else:
+            return super().to_internal_value(data)
+        for k in ('quantity_pcs', 'quantity_kg'):
+            if k not in data:
+                continue
+            v = data.get(k)
+            if isinstance(v, str):
+                data[k] = v.strip().replace(',', '.')
+        return super().to_internal_value(data)
+
     def get_defect_product_name(self, obj):
         if obj.defect_record_id:
             return (obj.defect_record.product or '').strip()
         return ''
+
+    def get_result_name(self, obj):
+        return (obj.product or '').strip()
+
+    def get_result_warehouse_batch(self, obj):
+        wb = getattr(obj, 'result_warehouse_batch', None)
+        if wb is None:
+            return None
+        qty = Decimal(str(wb.quantity or 0))
+        return {
+            'id': wb.pk,
+            'product': wb.product,
+            'product_name': wb.product,
+            'quantity': api_decimal_str(qty),
+            'available_quantity': api_decimal_str(qty),
+            'stock_bucket': wb.stock_bucket,
+            'status': wb.status,
+            'date': wb.date.isoformat() if wb.date else None,
+        }
 
     def _defect_qty_pcs_str(self, obj):
         if not obj.defect_record_id:
@@ -2918,15 +3346,34 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         if validated_data.get('defect_record') is None:
             raise serializers.ValidationError({'defect_record': 'Поле defect_record обязательно'})
-        defect = validated_data['defect_record']
-        if not (validated_data.get('product') or '').strip():
-            validated_data['product'] = defect.product
+        defect_ref = validated_data['defect_record']
+        defect_pk = defect_ref.pk
+        raw = getattr(self, 'initial_data', {}) or {}
+
+        def _parse_dec(val, field: str) -> Decimal:
+            if val in (None, ''):
+                raise serializers.ValidationError({field: f'Обязательное поле {field}'})
+            try:
+                return Decimal(str(val).strip().replace(',', '.'))
+            except Exception:
+                raise serializers.ValidationError({field: 'Некорректное число'})
+
         try:
-            qmap = rework_quantities_from_defect_record(defect)
-        except ValueError as e:
-            raise serializers.ValidationError({'defect_record': str(e)})
-        validated_data['quantity_pcs'] = qmap['quantity_pcs']
-        validated_data['quantity_kg'] = qmap['quantity_kg']
+            send_pcs = _parse_dec(raw.get('quantity_pcs'), 'quantity_pcs')
+            rework_kg = _parse_dec(raw.get('quantity_kg'), 'quantity_kg')
+        except serializers.ValidationError:
+            raise
+        if send_pcs <= 0 or send_pcs % Decimal('1') != 0:
+            raise serializers.ValidationError({'quantity_pcs': 'quantity_pcs должно быть целым > 0'})
+
+        result_name = (
+            str(raw.get('result_name') or '').strip()
+            or (validated_data.get('product') or '').strip()
+            or (defect_ref.product or '').strip()
+        )
+        if not result_name:
+            raise serializers.ValidationError({'result_name': 'Поле result_name обязательно'})
+        validated_data['product'] = result_name
         year = timezone.now().date().year
         last = ReworkRequest.objects.filter(rework_number__startswith=f'RWK-{year}-').order_by('-rework_number').first()
         try:
@@ -2934,7 +3381,36 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
         except (ValueError, IndexError):
             last_n = 0
         validated_data['rework_number'] = f'RWK-{year}-{last_n + 1:04d}'
-        return super().create(validated_data)
+        err_field = 'non_field_errors'
+        try:
+            with transaction.atomic():
+                d = DefectRecord.objects.select_for_update().get(pk=defect_pk)
+                qpcs, qkg = _reserve_defect_for_rework_explicit(d, send_pcs, rework_kg)
+                if d.quantity_pcs <= Decimal('0.0001'):
+                    d.status = DefectRecord.STATUS_REWORKED
+                d.save(
+                    update_fields=[
+                        'sent_to_rework_quantity_pcs', 'quantity_pcs', 'quantity_kg',
+                        'status', 'updated_at',
+                    ],
+                )
+                wb = _create_reworked_warehouse_batch_from_defect(d, qkg, result_name)
+                validated_data['defect_record'] = d
+                validated_data['quantity_pcs'] = qpcs
+                validated_data['quantity_kg'] = qkg
+                validated_data['output_quantity_kg'] = qkg
+                validated_data['loss_kg'] = Decimal('0')
+                validated_data['conversion_rate'] = Decimal('1')
+                validated_data['status'] = ReworkRequest.STATUS_COMPLETED
+                validated_data['result_warehouse_batch'] = wb
+                return super().create(validated_data)
+        except ValueError as e:
+            msg = str(e)
+            if 'остаток' in msg or 'шт' in msg:
+                err_field = 'quantity_pcs'
+            elif 'кг' in msg or 'kg' in msg.lower():
+                err_field = 'quantity_kg'
+            raise serializers.ValidationError({err_field: [msg]})
 
     def validate(self, attrs):
         if self.instance is None:
@@ -2961,7 +3437,7 @@ class ReworkRequestSerializer(serializers.ModelSerializer):
                 },
             )
 
-        allowed = {'comment'}
+        allowed = set()
         unknown_updates = [k for k in self.initial_data.keys() if k not in allowed]
         if unknown_updates:
             message = 'Переделка меняется только через start/complete/cancel.'

@@ -19,6 +19,10 @@ def _packaging_int_field(value):
 
 class WarehouseBatchSerializer(serializers.ModelSerializer):
     """Склад ГП: один канон `inventory_form`, без дублей габаритов и алиасов упаковки."""
+    stock_bucket = serializers.CharField(read_only=True)
+    product_name = serializers.SerializerMethodField()
+    result_rework_request = serializers.SerializerMethodField()
+    linked_entities = serializers.SerializerMethodField()
     line_name = serializers.SerializerMethodField()
     height = serializers.SerializerMethodField()
     width = serializers.SerializerMethodField()
@@ -35,9 +39,13 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'product',
+            'product_name',
             'quantity',
             'reserved_quantity',
             'available_quantity',
+            'stock_bucket',
+            'result_rework_request',
+            'linked_entities',
             'status',
             'date',
             'source_batch',
@@ -68,6 +76,35 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             'cost_per_meter',
             'total_meters',
         )
+
+    def get_product_name(self, obj):
+        return obj.product
+
+    def get_result_rework_request(self, obj):
+        if obj.stock_bucket != WarehouseBatch.STOCK_BUCKET_REWORKED:
+            return None
+        rw = obj.rework_requests.order_by('-created_at', '-id').first()
+        return rw.pk if rw else None
+
+    def get_linked_entities(self, obj):
+        return {
+            'profile': (
+                {
+                    'id': obj.profile_id,
+                    'label': obj.profile.name,
+                }
+                if obj.profile_id
+                else None
+            ),
+            'source_batch': (
+                {
+                    'id': obj.source_batch_id,
+                    'label': f'#{obj.source_batch_id} {obj.source_batch.product}',
+                }
+                if obj.source_batch_id
+                else None
+            ),
+        }
 
     def get_line_name(self, obj):
         pb = obj.source_batch

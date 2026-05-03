@@ -5,10 +5,20 @@ from .models import Client, DefectRecord, Order, Payment, Return, Sale
 
 class ClientFilter(django_filters.FilterSet):
     is_active = django_filters.BooleanFilter()
+    client_type = django_filters.CharFilter(field_name='client_type')
+    status = django_filters.CharFilter(method='filter_status')
+
+    def filter_status(self, queryset, name, value):
+        v = (value or '').strip()
+        if v == 'active':
+            return queryset.filter(is_active=True)
+        if v == 'inactive':
+            return queryset.filter(is_active=False)
+        return queryset
 
     class Meta:
         model = Client
-        fields = ['is_active']
+        fields = ['is_active', 'client_type', 'status']
 
 
 class SaleFilter(django_filters.FilterSet):

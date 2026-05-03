@@ -43,14 +43,79 @@ class ClientsApiContractTests(APITestCase):
         resp = self.client.post('/api/clients/', data={'name': 'ОсОО Бета'}, format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(resp.data['name'], 'ОсОО Бета')
+        self.assertEqual(resp.data['client_type'], Client.TYPE_INDIVIDUAL)
         self.assertEqual(resp.data['status'], 'active')
+        self.assertNotIn('comment', resp.data)
+        self.assertNotIn('notes', resp.data)
+
+    def test_post_clients_creates_individual_contract(self):
+        resp = self.client.post(
+            '/api/clients/',
+            data={
+                'client_type': 'individual',
+                'name': 'Иванов Иван Иванович',
+                'phone': '+996700000000',
+                'phone_extra': '+996500000000',
+                'inn': '123',
+                'address': 'Адрес не нужен физлицу',
+                'status': 'active',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.data['client_type'], 'individual')
+        self.assertEqual(resp.data['name'], 'Иванов Иван Иванович')
+        self.assertEqual(resp.data['phone_extra'], '+996500000000')
+        self.assertEqual(resp.data['inn'], '')
+        self.assertEqual(resp.data['address'], '')
+        self.assertEqual(resp.data['status'], 'active')
+
+    def test_post_clients_creates_company_contract(self):
+        resp = self.client.post(
+            '/api/clients/',
+            data={
+                'client_type': 'company',
+                'name': 'ОсОО Ромашка',
+                'settlement_account': '1234567890123456',
+                'phone': '+996700000000',
+                'phone_extra': '+996500000000, +996550000000',
+                'inn': '12345678901234',
+                'address': 'г. Бишкек',
+                'status': 'active',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.data['client_type'], 'company')
+        self.assertEqual(resp.data['settlement_account'], '1234567890123456')
+        self.assertEqual(resp.data['phone_extra'], '+996500000000, +996550000000')
+        self.assertEqual(resp.data['inn'], '12345678901234')
+        self.assertEqual(resp.data['address'], 'г. Бишкек')
 
     def test_patch_clients_updates_client(self):
         c = self._create_client(name='Старое')
-        resp = self.client.patch(f'/api/clients/{c.pk}/', data={'name': 'Новое'}, format='json')
+        resp = self.client.patch(
+            f'/api/clients/{c.pk}/',
+            data={
+                'client_type': 'company',
+                'name': 'ОсОО Ромашка',
+                'settlement_account': '1234567890123456',
+                'phone': '+996700000000',
+                'phone_extra': '+996500000000',
+                'inn': '12345678901234',
+                'address': 'Адрес',
+                'status': 'active',
+            },
+            format='json',
+        )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         c.refresh_from_db()
-        self.assertEqual(c.name, 'Новое')
+        self.assertEqual(c.client_type, 'company')
+        self.assertEqual(c.name, 'ОсОО Ромашка')
+        self.assertEqual(c.settlement_account, '1234567890123456')
+        self.assertEqual(c.phone_alt, '+996500000000')
+        self.assertEqual(c.inn, '12345678901234')
+        self.assertEqual(c.address, 'Адрес')
 
     def test_patch_inactive_and_active_back(self):
         c = self._create_client()
@@ -220,7 +285,14 @@ class ClientsApiContractTests(APITestCase):
         self.assertEqual(row['sales_total'], '100')
 
     def test_profile_summary_and_debts_sync_after_partial_payment(self):
-        c = self._create_client()
+        c = self._create_client(
+            client_type=Client.TYPE_COMPANY,
+            settlement_account='1234567890123456',
+            phone='+996700000000',
+            phone_alt='+996500000000',
+            inn='12345678901234',
+            address='Адрес',
+        )
         sale = Sale.objects.create(
             order_number='ORD-DEBT-1',
             product='Профиль',
@@ -243,6 +315,12 @@ class ClientsApiContractTests(APITestCase):
 
         resp = self.client.get(f'/api/clients/{c.pk}/profile/')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['client']['client_type'], Client.TYPE_COMPANY)
+        self.assertEqual(resp.data['client']['settlement_account'], '1234567890123456')
+        self.assertEqual(resp.data['client']['phone_extra'], '+996500000000')
+        self.assertEqual(resp.data['client']['inn'], '12345678901234')
+        self.assertEqual(resp.data['client']['address'], 'Адрес')
+        self.assertNotIn('comment', resp.data['client'])
         self.assertEqual(resp.data['summary']['total_sales_amount'], '400')
         self.assertEqual(resp.data['summary']['total_paid_amount'], '200')
         self.assertEqual(resp.data['summary']['total_debt'], '200')

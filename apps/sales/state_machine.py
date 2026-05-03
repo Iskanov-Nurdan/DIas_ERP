@@ -257,7 +257,7 @@ def validate_defect_writeoff_qty(defect_record) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 REWORK_TRANSITIONS: dict[str, list[str]] = {
-    'pending':     ['in_progress', 'canceled'],
+    'pending':     ['in_progress', 'canceled', 'completed'],
     'in_progress': ['completed', 'canceled'],
     'completed':   [],
     'canceled':    [],
@@ -274,8 +274,8 @@ def validate_rework_transition(current: str, new: str) -> None:
 
 
 def validate_rework_complete(rework_request) -> None:
-    if rework_request.status != 'in_progress':
+    if rework_request.status not in ('pending', 'in_progress'):
         raise ValueError(
-            'Завершить переделку можно только из статуса «В работе». '
+            'Завершить переделку можно из статусов «Ожидает» или «В работе». '
             f'Текущий статус: «{rework_request.get_status_display()}»'
         )

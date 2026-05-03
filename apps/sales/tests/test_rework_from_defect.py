@@ -60,15 +60,31 @@ class ReworkRequestSerializerCreateTests(TestCase):
             product='60 мм белый',
             original_quantity_pcs=Decimal('2'),
             quantity_pcs=Decimal('2'),
+            kg_coefficient=Decimal('1'),
             defect_reason='трещина',
             status=DefectRecord.STATUS_ON_STOCK,
         )
-        ser = ReworkRequestSerializer(data={'defect_record': d.pk})
+        ser = ReworkRequestSerializer(
+            data={
+                'defect_record': d.pk,
+                'result_name': 'Переделанный материал X',
+                'quantity_pcs': '2',
+                'quantity_kg': '2',
+            },
+        )
         self.assertTrue(ser.is_valid(), ser.errors)
         rw = ser.save()
         rw.refresh_from_db()
+        self.assertEqual(rw.product, 'Переделанный материал X')
         self.assertEqual(rw.quantity_pcs, Decimal('2'))
-        self.assertEqual(rw.quantity_kg, Decimal('0'))
+        self.assertEqual(rw.quantity_kg, Decimal('2'))
+        self.assertEqual(rw.status, ReworkRequest.STATUS_COMPLETED)
+        self.assertIsNotNone(rw.result_warehouse_batch_id)
+        self.assertEqual(rw.result_warehouse_batch.product, 'Переделанный материал X')
+        self.assertEqual(rw.result_warehouse_batch.stock_bucket, 'reworked')
+        self.assertEqual(rw.result_warehouse_batch.quantity, Decimal('2.0000'))
+        d.refresh_from_db()
+        self.assertEqual(d.quantity_pcs, Decimal('0'))
 
     def test_representation_has_display_fields(self):
         d = DefectRecord.objects.create(

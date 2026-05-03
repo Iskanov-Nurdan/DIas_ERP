@@ -2,6 +2,13 @@ from django.db import models
 
 
 class WarehouseBatch(models.Model):
+    STOCK_BUCKET_STANDARD = 'standard'
+    STOCK_BUCKET_REWORKED = 'reworked'
+    STOCK_BUCKET_CHOICES = [
+        (STOCK_BUCKET_STANDARD, 'Основной склад ГП'),
+        (STOCK_BUCKET_REWORKED, 'Переделанные'),
+    ]
+
     STATUS_AVAILABLE = 'available'
     STATUS_RESERVED = 'reserved'
     STATUS_SHIPPED = 'shipped'
@@ -77,6 +84,13 @@ class WarehouseBatch(models.Model):
         max_length=10,
         choices=QUALITY_CHOICES,
         default=QUALITY_GOOD,
+        db_index=True,
+    )
+    stock_bucket = models.CharField(
+        'Сегмент склада',
+        max_length=20,
+        choices=STOCK_BUCKET_CHOICES,
+        default=STOCK_BUCKET_STANDARD,
         db_index=True,
     )
     defect_reason = models.TextField('Причина брака (строка партии)', blank=True, default='')

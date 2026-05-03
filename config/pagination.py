@@ -27,6 +27,12 @@ class StandardResultsSetPagination(PageNumberPagination):
         })
 
 
+class WarehouseResultsSetPagination(StandardResultsSetPagination):
+    """Склад ГП: до 500 строк на страницу (селекты переделки на фронте)."""
+
+    max_page_size = 500
+
+
 class RecipeResultsSetPagination(StandardResultsSetPagination):
     """Список рецептов: допускает page_size до 500 (фильтр по профилю на клиенте)."""
 

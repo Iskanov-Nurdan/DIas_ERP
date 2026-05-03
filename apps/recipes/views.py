@@ -12,6 +12,7 @@ from config.api_numbers import api_decimal_str
 from apps.activity.mixins import ActivityLoggingMixin
 from apps.chemistry.fifo import chemistry_stock_kg
 from apps.materials.fifo import material_stock_kg
+from apps.warehouse.models import WarehouseBatch
 from config.pagination import RecipeResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 from .models import PlasticProfile, Recipe, RecipeComponent
@@ -111,7 +112,12 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return qs.prefetch_related(
             Prefetch(
                 'components',
-                queryset=RecipeComponent.objects.select_related('raw_material', 'chemistry'),
+                queryset=RecipeComponent.objects.select_related(
+                    'raw_material',
+                    'chemistry',
+                    'rework_warehouse_batch',
+                    'rework_warehouse_batch__profile',
+                ),
             )
         ).order_by('recipe', 'id')
 
@@ -150,8 +156,45 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return data
 
     def _normalize_component(self, c):
-        raw_type = (c.get('type') or 'raw').lower()
-        if raw_type in ('raw_material', 'raw'):
+        raw_type = (c.get('type') or '').strip().lower()
+        rework_aliases = (
+            'rework_stock', 'reworked_batch', 'reworked_warehouse', 'rework_warehouse_batch',
+        )
+        if raw_type in rework_aliases:
+            bid = c.get('rework_warehouse_batch_id')
+            if bid is None:
+                bid = c.get('warehouse_batch_id')
+            if bid is None:
+                raise serializers.ValidationError(
+                    {'components': 'Для rework_stock укажите rework_warehouse_batch_id'},
+                )
+            try:
+                bid_int = int(bid)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({'components': 'Некорректный rework_warehouse_batch_id'})
+            wb = WarehouseBatch.objects.filter(pk=bid_int).first()
+            if wb is None:
+                raise serializers.ValidationError({'components': f'Партия склада #{bid_int} не найдена'})
+            if wb.stock_bucket != WarehouseBatch.STOCK_BUCKET_REWORKED:
+                raise serializers.ValidationError({
+                    'components': (
+                        'Компонент переделки: выберите партию из сегмента «переделанные» '
+                        '(stock_bucket=reworked).'
+                    ),
+                })
+            qpm = c.get('quantity_per_meter', c.get('quantity', 0))
+            qd = Decimal(str(qpm if qpm is not None else 0))
+            if qd < 0:
+                raise serializers.ValidationError({'components': 'quantity_per_meter должно быть ≥ 0'})
+            unit = (c.get('unit') or 'кг').strip() or 'кг'
+            return {
+                'kind': 'rework_stock',
+                'rework_warehouse_batch_id': bid_int,
+                'quantity_per_meter': qd,
+                'unit': unit,
+            }
+
+        if raw_type in ('raw_material', 'raw') or not raw_type:
             comp_type = RecipeComponent.TYPE_RAW
         elif raw_type in ('chemistry', 'chem'):
             comp_type = RecipeComponent.TYPE_CHEM
@@ -168,11 +211,12 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if qd < 0:
             raise serializers.ValidationError({'components': 'quantity_per_meter должно быть ≥ 0'})
         return {
+            'kind': 'basic',
             'type': comp_type,
             'raw_material_id': material_id if comp_type == RecipeComponent.TYPE_RAW else None,
             'chemistry_id': chemistry_id if comp_type == RecipeComponent.TYPE_CHEM else None,
             'quantity_per_meter': qd,
-            'unit': 'kg',
+            'unit': (c.get('unit') or 'kg').strip() or 'kg',
         }
 
     @transaction.atomic
@@ -185,6 +229,17 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             raise serializers.ValidationError({'components': 'Ожидается массив'})
         for c in comps:
             nc = self._normalize_component(c)
+            if nc['kind'] == 'rework_stock':
+                RecipeComponent.objects.create(
+                    recipe=recipe,
+                    type=RecipeComponent.TYPE_REWORK_STOCK,
+                    rework_warehouse_batch_id=nc['rework_warehouse_batch_id'],
+                    quantity_per_meter=nc['quantity_per_meter'],
+                    unit=nc['unit'],
+                    raw_material_id=None,
+                    chemistry_id=None,
+                )
+                continue
             if nc['raw_material_id'] and nc['chemistry_id']:
                 raise serializers.ValidationError(
                     {'components': 'Только material_id или chemistry_id, не оба'}
@@ -213,6 +268,17 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         recipe.components.all().delete()
         for c in comps:
             nc = self._normalize_component(c)
+            if nc['kind'] == 'rework_stock':
+                RecipeComponent.objects.create(
+                    recipe=recipe,
+                    type=RecipeComponent.TYPE_REWORK_STOCK,
+                    rework_warehouse_batch_id=nc['rework_warehouse_batch_id'],
+                    quantity_per_meter=nc['quantity_per_meter'],
+                    unit=nc['unit'],
+                    raw_material_id=None,
+                    chemistry_id=None,
+                )
+                continue
             if nc['raw_material_id'] and nc['chemistry_id']:
                 raise serializers.ValidationError(
                     {'components': 'Только material_id или chemistry_id, не оба'}
@@ -279,7 +345,13 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         q_step = Decimal('0.0001')
         components_out = []
         all_ok = True
-        for comp in recipe.components.select_related('raw_material', 'chemistry').order_by('id'):
+        comp_qs = recipe.components.select_related(
+            'raw_material',
+            'chemistry',
+            'rework_warehouse_batch',
+            'rework_warehouse_batch__profile',
+        ).order_by('id')
+        for comp in comp_qs:
             qpm = Decimal(str(comp.quantity_per_meter or 0))
             need = (qpm * total_meters).quantize(q_step)
             if comp.type == RecipeComponent.TYPE_RAW and comp.raw_material_id:
@@ -300,6 +372,43 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 ctype = 'chemistry'
                 mid = None
                 chid = comp.chemistry_id
+            elif comp.type == RecipeComponent.TYPE_REWORK_STOCK and comp.rework_warehouse_batch_id:
+                batch = comp.rework_warehouse_batch
+                prof = (batch.profile.name if batch.profile_id else '') or ''
+                prod = (batch.product or '').strip()
+                name = ' · '.join(x for x in (prof.strip(), prod) if x).strip() or f'Партия #{batch.pk}'
+                qty = Decimal(str(batch.quantity or 0))
+                length = batch.length_per_piece
+                if length is not None and Decimal(str(length)) > 0:
+                    ln = Decimal(str(length))
+                    avail = (qty * ln).quantize(q_step)
+                    unit_line = 'м'
+                else:
+                    avail = qty.quantize(q_step)
+                    unit_line = 'шт'
+                shortage = (need - avail).quantize(q_step) if need > avail else Decimal('0')
+                ok = avail >= need
+                all_ok = all_ok and ok
+                components_out.append({
+                    'id': comp.id,
+                    'type': 'rework_stock',
+                    'type_label': 'Переделанные',
+                    'component_type': 'rework_stock',
+                    'rework_warehouse_batch_id': batch.id,
+                    'material_id': None,
+                    'chemistry_id': None,
+                    'component_name': name,
+                    'name': name,
+                    'quantity_per_meter': api_decimal_str(qpm),
+                    'available': api_decimal_str(avail),
+                    'unit': f'{unit_line}/м',
+                    'norm_per_meter_kg': api_decimal_str(qpm),
+                    'required_total_kg': api_decimal_str(need),
+                    'available_kg': api_decimal_str(avail),
+                    'shortage_kg': api_decimal_str(shortage),
+                    'sufficient': ok,
+                })
+                continue
             else:
                 continue
             shortage = (need - avail).quantize(q_step) if need > avail else Decimal('0')

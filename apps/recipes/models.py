@@ -98,10 +98,15 @@ class Recipe(models.Model):
 class RecipeComponent(models.Model):
     TYPE_RAW = 'raw'
     TYPE_CHEM = 'chem'
-    TYPE_CHOICES = [(TYPE_RAW, 'Сырьё'), (TYPE_CHEM, 'Хим. элемент')]
+    TYPE_REWORK_STOCK = 'rework_stock'
+    TYPE_CHOICES = [
+        (TYPE_RAW, 'Сырьё'),
+        (TYPE_CHEM, 'Хим. элемент'),
+        (TYPE_REWORK_STOCK, 'Переделанные (склад)'),
+    ]
 
     recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name='components')
-    type = models.CharField('Тип', max_length=10, choices=TYPE_CHOICES)
+    type = models.CharField('Тип', max_length=30, choices=TYPE_CHOICES)
     raw_material = models.ForeignKey(
         'materials.RawMaterial',
         on_delete=models.CASCADE,
@@ -116,6 +121,14 @@ class RecipeComponent(models.Model):
         blank=True,
         related_name='recipe_components',
     )
+    rework_warehouse_batch = models.ForeignKey(
+        'warehouse.WarehouseBatch',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='recipe_components_as_rework_input',
+        verbose_name='Партия переделанных',
+    )
     quantity_per_meter = models.DecimalField('На 1 м профиля', max_digits=14, decimal_places=6)
     unit = models.CharField('Единица', max_length=50, default='кг')
 
@@ -129,4 +142,6 @@ class RecipeComponent(models.Model):
             return f'{self.recipe.product} — {self.raw_material.name}'
         if self.type == self.TYPE_CHEM and self.chemistry_id:
             return f'{self.recipe.product} — {self.chemistry.name}'
+        if self.type == self.TYPE_REWORK_STOCK and self.rework_warehouse_batch_id:
+            return f'{self.recipe.product} — партия переделки #{self.rework_warehouse_batch_id}'
         return f'Component #{self.id}'

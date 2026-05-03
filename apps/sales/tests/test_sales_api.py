@@ -301,6 +301,9 @@ class SalesApiContractTests(APITestCase):
         self.assertIn('order_lines', resp.data)
         self.assertTrue(all(row['id'] == self.order.pk for row in resp.data['orders']))
         self.assertTrue(all(b['quality'] == WarehouseBatch.QUALITY_GOOD for b in resp.data['warehouse_batches']))
+        self.assertTrue(all('profile_id' in b for b in resp.data.get('available_warehouse_batches', [])))
+        self.assertTrue(all('pieces_per_package' in b for b in resp.data.get('available_warehouse_batches', [])))
+        self.assertTrue(all('client_id' in o for o in resp.data.get('orders', [])))
         order_row = resp.data['orders'][0]
         self.assertIn('paid_amount', order_row)
         self.assertIn('debt_amount', order_row)
@@ -651,6 +654,8 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(line.get('warehouse_batch'), batch.pk)
         self.assertIn('Пакет fallback', line.get('warehouse_batch_display') or '')
         self.assertEqual(line.get('quantity_display'), '2 упак × 6 шт = 12 шт')
+        self.assertIn('order_line', line)
+        self.assertIn('order_line_display', line)
 
     def test_credit_check_hard_block_and_override_access(self):
         self.client_active.credit_limit_mode = 'hard'

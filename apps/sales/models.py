@@ -3,6 +3,13 @@ from django.db import models
 
 
 class Client(models.Model):
+    TYPE_INDIVIDUAL = 'individual'
+    TYPE_COMPANY = 'company'
+    TYPE_CHOICES = [
+        (TYPE_INDIVIDUAL, 'Физ лицо'),
+        (TYPE_COMPANY, 'Компания'),
+    ]
+
     CREDIT_MODE_SOFT = 'soft'
     CREDIT_MODE_HARD = 'hard'
     CREDIT_MODE_CHOICES = [
@@ -13,10 +20,13 @@ class Client(models.Model):
     name = models.CharField('Название', max_length=255)
     contact = models.CharField('Контакт', max_length=255, blank=True)
     phone = models.CharField('Телефон', max_length=50, blank=True)
-    phone_alt = models.CharField('Доп. телефон', max_length=50, blank=True, default='')
+    phone_alt = models.CharField('Доп. телефон', max_length=255, blank=True, default='')
     inn = models.CharField('ИНН', max_length=20, blank=True)
+    settlement_account = models.CharField('Расчётный счёт', max_length=64, blank=True, default='')
     address = models.TextField('Адрес', blank=True)
-    client_type = models.CharField('Тип клиента', max_length=100, blank=True, default='')
+    client_type = models.CharField(
+        'Тип клиента', max_length=20, choices=TYPE_CHOICES, default=TYPE_INDIVIDUAL,
+    )
     notes = models.TextField('Комментарий', blank=True, default='')
     email = models.EmailField('Email', blank=True, default='')
     messenger = models.CharField(
@@ -681,6 +691,14 @@ class ReturnLine(models.Model):
         'Состояние', max_length=20, choices=CONDITION_CHOICES, default=CONDITION_GOOD,
     )
     comment = models.TextField('Комментарий', blank=True, default='')
+    rework_receipt_batch = models.OneToOneField(
+        'warehouse.WarehouseBatch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='source_return_line',
+        verbose_name='Партия оприходования (переделанные)',
+    )
 
     class Meta:
         db_table = 'return_lines'

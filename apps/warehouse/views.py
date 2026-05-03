@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from config.openapi_common import DiasErrorSerializer
+from config.pagination import WarehouseResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
 from .filters import WarehouseBatchFilter
@@ -32,13 +33,24 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'warehouse'
     filterset_class = WarehouseBatchFilter
+    pagination_class = WarehouseResultsSetPagination
     ordering_fields = ['id', 'date']
 
     def get_queryset(self):
-        qs = WarehouseBatch.objects.select_related('source_batch', 'source_batch__order', 'source_batch__order__line').all()
+        qs = WarehouseBatch.objects.select_related(
+            'profile',
+            'source_batch',
+            'source_batch__order',
+            'source_batch__order__line',
+        ).prefetch_related('rework_requests').all()
         debug = str(self.request.query_params.get('debug', '')).lower() in ('1', 'true', 'yes')
         if not debug:
             qs = qs.exclude(Q(product__iexact='test') | Q(product__iexact='тест'))
+        bucket = (self.request.query_params.get('stock_bucket') or '').strip().lower()
+        if bucket == WarehouseBatch.STOCK_BUCKET_REWORKED:
+            qs = qs.filter(stock_bucket=WarehouseBatch.STOCK_BUCKET_REWORKED)
+        else:
+            qs = qs.filter(stock_bucket=WarehouseBatch.STOCK_BUCKET_STANDARD)
         return qs
 
     def retrieve(self, request, *args, **kwargs):
@@ -58,20 +70,6 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
             and batch.inventory_form == WarehouseBatch.INVENTORY_UNPACKED
             and batch.quality == WarehouseBatch.QUALITY_GOOD
         )
-        data['linked_entities'] = {
-            'profile': (
-                {
-                    'id': batch.profile_id,
-                    'label': batch.profile.name,
-                } if batch.profile_id else None
-            ),
-            'source_batch': (
-                {
-                    'id': batch.source_batch_id,
-                    'label': f"#{batch.source_batch_id} {batch.source_batch.product}",
-                } if batch.source_batch_id else None
-            ),
-        }
         data['available_actions'] = {
             'reserve': can_reserve,
             'package': can_package,
