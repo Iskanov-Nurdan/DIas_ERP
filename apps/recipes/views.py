@@ -342,7 +342,7 @@ class RecipeViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if total_meters <= 0:
             raise ValidationError({'total_meters': 'Должно быть > 0'})
 
-        q_step = Decimal('0.0001')
+        q_step = Decimal('0.000001')
         components_out = []
         all_ok = True
         comp_qs = recipe.components.select_related(

@@ -2,9 +2,11 @@ from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from apps.materials.models import MaterialBatch, RawMaterial
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
 from apps.warehouse.models import WarehouseBatch
 
@@ -80,3 +82,51 @@ class RecipeReworkStockComponentTests(APITestCase):
         self.assertIn('quantity_per_meter', rows[0])
         self.assertIn('available', rows[0])
         self.assertIn('sufficient', rows[0])
+
+    def test_fractional_quantity_per_meter_is_preserved_and_calculated(self):
+        material = RawMaterial.objects.create(name='ПВХ', unit='kg', is_active=True)
+        MaterialBatch.objects.create(
+            material=material,
+            quantity_initial=Decimal('3.9000'),
+            quantity_remaining=Decimal('3.9000'),
+            unit='kg',
+            unit_price=Decimal('10'),
+            received_at=timezone.now(),
+        )
+
+        created = self.client.post(
+            '/api/recipes/',
+            {
+                'recipe': 'Дробная норма',
+                'profile_id': self.profile.pk,
+                'base_unit': 'per_meter',
+                'components': [
+                    {
+                        'type': 'raw_material',
+                        'material_id': material.pk,
+                        'quantity_per_meter': 0.04,
+                        'unit': 'кг',
+                    },
+                ],
+            },
+            format='json',
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        rid = created.data['id']
+
+        component = RecipeComponent.objects.get(recipe_id=rid)
+        self.assertEqual(component.quantity_per_meter, Decimal('0.040000'))
+
+        detail = self.client.get(f'/api/recipes/{rid}/')
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data['components'][0]['quantity_per_meter'], '0.04')
+
+        availability = self.client.get(f'/api/recipes/{rid}/availability/?total_meters=100')
+        self.assertEqual(availability.status_code, status.HTTP_200_OK)
+        row = availability.data['components'][0]
+        self.assertEqual(row['norm_per_meter_kg'], '0.04')
+        self.assertEqual(row['required_total_kg'], '4')
+        self.assertEqual(row['available_kg'], '3.9')
+        self.assertEqual(row['shortage_kg'], '0.1')
+        self.assertFalse(row['sufficient'])
+        self.assertFalse(availability.data['all_sufficient'])

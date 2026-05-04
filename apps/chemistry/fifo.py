@@ -12,6 +12,8 @@ from django.db.models import F, Sum
 
 from rest_framework.exceptions import ValidationError
 
+from config.api_numbers import api_decimal_str
+
 from .models import ChemistryBatch, ChemistryStockDeduction, ChemistryCatalog
 
 
@@ -53,8 +55,8 @@ def fifo_deduct_chemistry(
                 'error': 'Недостаточно остатков химии',
                 'detail': 'Недостаточно остатков химии',
                 'chemistry_id': chemistry_id,
-                'required': float(q_need),
-                'available': float(avail),
+                'required': api_decimal_str(q_need),
+                'available': api_decimal_str(avail),
             }
         )
 

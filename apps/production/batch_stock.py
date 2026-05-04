@@ -14,8 +14,10 @@ from apps.chemistry.fifo import fifo_deduct_chemistry, chemistry_stock_kg, rever
 from apps.chemistry.models import ChemistryCatalog, ChemistryStockDeduction
 from apps.recipes.models import Recipe, RecipeComponent
 from apps.production.models import ProductionBatch
+from config.api_numbers import api_decimal_str
 
 PRODUCTION_BATCH_REASON = 'production_batch'
+CONSUMPTION_QUANT = Decimal('0.000001')
 
 
 def _q(d) -> Decimal:
@@ -32,7 +34,7 @@ def aggregate_consumption_for_recipe(recipe: Recipe, total_meters: Decimal) -> T
         return {}, {}
     for comp in recipe.components.all():
         per = _q(comp.quantity_per_meter)
-        need = (per * tm).quantize(Decimal('0.0001'))
+        need = (per * tm).quantize(CONSUMPTION_QUANT)
         if need <= 0:
             continue
         if comp.type == RecipeComponent.TYPE_RAW and comp.raw_material_id:
@@ -84,8 +86,8 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             missing.append({
                 'kind': 'raw_material',
                 'component': name,
-                'required': float(req),
-                'available': float(avail),
+                'required': api_decimal_str(req),
+                'available': api_decimal_str(avail),
                 'unit': unit,
             })
 
@@ -97,8 +99,8 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             missing.append({
                 'kind': 'chemistry',
                 'component': f'Химия id={cid}',
-                'required': float(req),
-                'available': 0.0,
+                'required': api_decimal_str(req),
+                'available': '0',
                 'unit': '—',
             })
             continue
@@ -107,8 +109,8 @@ def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
             missing.append({
                 'kind': 'chemistry',
                 'component': cat.name,
-                'required': float(req),
-                'available': float(avail),
+                'required': api_decimal_str(req),
+                'available': api_decimal_str(avail),
                 'unit': cat.unit or 'kg',
             })
 

@@ -12,6 +12,8 @@ from django.db.models import F, Sum
 
 from rest_framework.exceptions import ValidationError
 
+from config.api_numbers import api_decimal_str
+
 from .models import MaterialBatch, MaterialStockDeduction, RawMaterial
 
 
@@ -64,8 +66,8 @@ def fifo_deduct(
                 'error': 'Недостаточно остатков сырья',
                 'detail': 'Недостаточно остатков сырья',
                 'material_id': material_id,
-                'required': float(remaining),
-                'available': float(avail),
+                'required': api_decimal_str(remaining),
+                'available': api_decimal_str(avail),
             }
         )
 
