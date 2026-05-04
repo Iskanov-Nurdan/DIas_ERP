@@ -9,6 +9,7 @@ from django.db import transaction
 from django.db.models import Count, DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import Http404, HttpResponse
+from django.utils import timezone
 
 from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
@@ -51,6 +52,9 @@ from .serializers import (
     SaleSerializer,
     defect_record_source_label,
     rework_quantities_from_defect_record,
+    return_document_amount,
+    sale_active_total_amount,
+    sale_return_source_is_valid,
     _reserve_defect_from_kg_only,
 )
 
@@ -2104,6 +2108,82 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     ordering_fields = ['id', 'date']
     filterset_class = ReturnFilter
 
+    def _recalculate_sale_after_return(self, sale: Sale) -> None:
+        sale_lines = list(SaleLine.objects.filter(sale=sale).values('id', 'quantity'))
+        if not sale_lines:
+            return
+        sold_total = sum((Decimal(str(sl['quantity'] or 0)) for sl in sale_lines), Decimal('0'))
+        returned_total = ReturnLine.objects.filter(
+            sale_line_id__in=[sl['id'] for sl in sale_lines],
+            return_doc__status=Return.STATUS_COMPLETED,
+        ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
+        if sold_total > 0 and Decimal(str(returned_total)) >= sold_total:
+            if sale.sale_status != Sale.STATUS_CANCELED:
+                sale.sale_status = Sale.STATUS_CANCELED
+                sale.save(update_fields=['sale_status', 'updated_at'])
+        elif sale.sale_status == Sale.STATUS_DRAFT and sale.warehouse_stock_applied:
+            sale.sale_status = Sale.STATUS_SHIPPED
+            sale.save(update_fields=['sale_status', 'updated_at'])
+        elif sale.sale_status == Sale.STATUS_CANCELED:
+            sale.sale_status = Sale.STATUS_SHIPPED
+            sale.save(update_fields=['sale_status', 'updated_at'])
+
+    def _next_payment_number(self, payment_date) -> str:
+        year = (payment_date or timezone.now().date()).year
+        last = Payment.objects.filter(payment_number__startswith=f'PAY-{year}-').order_by('-payment_number').first()
+        try:
+            last_n = int(last.payment_number.split('-')[-1]) if last else 0
+        except (ValueError, IndexError):
+            last_n = 0
+        return f'PAY-{year}-{last_n + 1:04d}'
+
+    def _create_auto_refund_payment(self, ret_doc: Return, user) -> Payment | None:
+        sale = ret_doc.sale
+        total_return_amount = return_document_amount(ret_doc)
+        if total_return_amount <= 0:
+            return None
+        active_payments = Payment.objects.filter(status=Payment.STATUS_ACTIVE).filter(
+            Q(linked_sale=sale) | Q(linked_return__sale=sale),
+        ).distinct()
+        incoming = sum(
+            (Decimal(str(p.amount or 0)) for p in active_payments if p.payment_type in (
+                Payment.TYPE_PREPAYMENT,
+                Payment.TYPE_PAYMENT,
+                Payment.TYPE_SURCHARGE,
+            )),
+            Decimal('0'),
+        )
+        existing_refunds = sum(
+            (Decimal(str(p.amount or 0)) for p in active_payments if p.payment_type == Payment.TYPE_REFUND),
+            Decimal('0'),
+        )
+        order_applied = Decimal(str(sale.order_paid_amount_applied or 0))
+        net_paid = incoming + order_applied - existing_refunds
+        active_due = sale_active_total_amount(sale)
+        refundable = min(total_return_amount, max(Decimal('0'), net_paid - active_due)).quantize(Decimal('0.01'))
+        if refundable <= 0:
+            return None
+        if Payment.objects.filter(
+            linked_return=ret_doc,
+            payment_type=Payment.TYPE_REFUND,
+            status=Payment.STATUS_ACTIVE,
+        ).exists():
+            return None
+        return Payment.objects.create(
+            payment_number=self._next_payment_number(ret_doc.date),
+            date=ret_doc.date,
+            client=sale.client,
+            linked_order=ret_doc.linked_order,
+            linked_sale=sale,
+            linked_return=ret_doc,
+            payment_type=Payment.TYPE_REFUND,
+            payment_method=Payment.METHOD_CASH,
+            amount=refundable,
+            status=Payment.STATUS_ACTIVE,
+            comment=f'Автоматический refund по возврату #{ret_doc.return_number or ret_doc.pk}',
+            created_by=user if getattr(user, 'is_authenticated', False) else None,
+        )
+
     def destroy(self, request, *args, **kwargs):
         return Response(
             {'code': 'DELETE_DISABLED', 'error': 'Удаление возвратов отключено. Используйте /api/returns/{id}/cancel/.'},
@@ -2119,18 +2199,6 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             return _err('RETURN_ALREADY_CANCELED', 'Возврат уже отменён', http_status=422)
         with transaction.atomic():
             if ret_doc.status == Return.STATUS_COMPLETED:
-                active_refund_exists = Payment.objects.filter(
-                    linked_return=ret_doc,
-                    payment_type=Payment.TYPE_REFUND,
-                    status=Payment.STATUS_ACTIVE,
-                ).exists()
-                if active_refund_exists:
-                    return _err(
-                        'REFUND_PAYMENT_EXISTS',
-                        'Нельзя отменить возврат: есть активный refund payment.',
-                        http_status=409,
-                    )
-
                 from apps.warehouse.models import WarehouseBatch as WarehouseBatchModel
 
                 for line in ret_doc.lines.select_related('rework_receipt_batch').all():
@@ -2221,8 +2289,14 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         f'Не удалось откатить возврат: {exc}',
                         http_status=409,
                     )
+                Payment.objects.filter(
+                    linked_return=ret_doc,
+                    payment_type=Payment.TYPE_REFUND,
+                    status=Payment.STATUS_ACTIVE,
+                ).update(status=Payment.STATUS_CANCELED)
             ret_doc.status = Return.STATUS_CANCELED
             ret_doc.save(update_fields=['status'])
+            self._recalculate_sale_after_return(ret_doc.sale)
         from .commercial_audit import log_commercial_audit
         log_commercial_audit(
             user=request.user,
@@ -2251,10 +2325,20 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         with transaction.atomic():
             try:
                 ser.apply_completion_effects(ret_doc)
+            except ValidationError as exc:
+                detail = getattr(exc, 'detail', {})
+                code = 'RETURN_COMPLETE_FAILED'
+                message = 'Ошибка проведения возврата.'
+                if isinstance(detail, dict):
+                    code = str(detail.get('code') or code)
+                    message = str(detail.get('detail') or detail.get('error') or message)
+                return _err(code, message, http_status=400)
             except Exception as exc:
                 return _err('RETURN_COMPLETE_FAILED', f'Ошибка проведения возврата: {exc}', http_status=409)
             ret_doc.status = Return.STATUS_COMPLETED
             ret_doc.save(update_fields=['status'])
+            self._recalculate_sale_after_return(ret_doc.sale)
+            self._create_auto_refund_payment(ret_doc, request.user)
         return Response(ReturnSerializer(ret_doc, context={'request': request}).data)
 
     def perform_create(self, serializer):
@@ -2351,8 +2435,9 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         for p in active_refunds:
             downstream.append(
                 {
-                    'type': 'refund_payment',
+                    'type': 'payment',
                     'id': p['id'],
+                    'label': f"Возврат денег №{p['payment_number'] or p['id']} — {api_decimal_str(Decimal(str(p['amount'] or 0)))} сом",
                     'payment_number': p['payment_number'],
                     'amount': api_decimal_str(Decimal(str(p['amount'] or 0))),
                     'status': p['status'],
@@ -2370,33 +2455,93 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='select-sources')
     def select_sources(self, request):
         sale_id = request.query_params.get('sale_id')
-        sales_qs = Sale.objects.select_related('client').filter(
-            sale_status__in=(Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED),
+        q = (request.query_params.get('q') or '').strip().lower()
+        try:
+            page = max(1, int(request.query_params.get('page') or 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.query_params.get('page_size') or 20)
+        except (TypeError, ValueError):
+            page_size = 20
+        page_size = min(max(page_size, 1), 100)
+
+        sales_qs = Sale.objects.select_related('client').exclude(
+            sale_status=Sale.STATUS_CANCELED,
         ).order_by('-date', '-id')
-        sales_payload = []
-        for sale in sales_qs[:200]:
-            sale_lines = SaleLine.objects.filter(sale=sale).values('id', 'product', 'quantity', 'unit_price')
+        all_sales_payload = []
+        for sale in sales_qs:
+            if not sale_return_source_is_valid(sale):
+                continue
+            sale_lines = (
+                SaleLine.objects.filter(sale=sale)
+                .select_related('warehouse_batch__profile')
+                .values(
+                    'id',
+                    'product',
+                    'quantity',
+                    'unit_price',
+                    'warehouse_batch__profile__name',
+                )
+            )
             total_returnable = Decimal('0')
+            product_names = []
             for sl in sale_lines:
+                product_name = (
+                    (sl.get('product') or '').strip()
+                    or (sl.get('warehouse_batch__profile__name') or '').strip()
+                )
+                if product_name and product_name not in product_names:
+                    product_names.append(product_name)
                 sold = Decimal(str(sl['quantity'] or 0))
-                returned = ReturnLine.objects.filter(sale_line_id=sl['id']).exclude(
-                    return_doc__status=Return.STATUS_CANCELED,
+                returned = ReturnLine.objects.filter(
+                    sale_line_id=sl['id'],
+                    return_doc__status=Return.STATUS_COMPLETED,
                 ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
                 returnable = sold - Decimal(str(returned))
                 if returnable > 0:
                     total_returnable += returnable
             if total_returnable <= 0:
                 continue
-            sales_payload.append(
-                {
-                    'id': sale.id,
-                    'label': f'{sale.sale_number or sale.order_number} — {sale.client.name if sale.client_id else "—"} — доступно к возврату {api_decimal_str(total_returnable)}',
-                    'client': sale.client_id,
-                    'client_name': sale.client.name if sale.client_id else '',
-                    'sale_status': sale.sale_status,
-                    'returnable_quantity': api_decimal_str(total_returnable),
-                },
-            )
+            sale_sum = api_decimal_str(Decimal(str(sale.revenue or 0)))
+            client_name = sale.client.name if sale.client_id else ''
+            sale_date = sale.date.isoformat() if sale.date else ''
+            products = ', '.join(product_names)
+            sale_number = sale.sale_number or str(sale.id)
+            haystack = ' '.join(
+                str(x)
+                for x in (
+                    sale.id,
+                    sale.sale_number,
+                    sale.order_number,
+                    client_name,
+                    sale_date,
+                    sale_sum,
+                    products,
+                )
+                if x not in (None, '')
+            ).lower()
+            if q and q not in haystack:
+                continue
+            all_sales_payload.append({
+                'id': sale.id,
+                'sale_number': sale_number,
+                'date': sale_date,
+                'client': sale.client_id,
+                'client_name': client_name,
+                'total_amount': sale_sum,
+                'products': products,
+                'label': f'Продажа №{sale_number} — {sale_date} — {client_name or "—"} — {sale_sum} сом — {products or "—"}',
+                'status': 'completed',
+                'sale_status': sale.sale_status,
+                'returnable_quantity': api_decimal_str(total_returnable),
+            })
+
+        total = len(all_sales_payload)
+        pages = (total + page_size - 1) // page_size
+        start = (page - 1) * page_size
+        end = start + page_size
+        sales_payload = all_sales_payload[start:end]
         lines = []
         if sale_id:
             sale_lines = (
@@ -2406,8 +2551,9 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             )
             for sl in sale_lines:
                 sold = Decimal(str(sl['quantity'] or 0))
-                returned = ReturnLine.objects.filter(sale_line_id=sl['id']).exclude(
-                    return_doc__status=Return.STATUS_CANCELED,
+                returned = ReturnLine.objects.filter(
+                    sale_line_id=sl['id'],
+                    return_doc__status=Return.STATUS_COMPLETED,
                 ).aggregate(s=Sum('quantity'))['s'] or Decimal('0')
                 returnable = sold - Decimal(str(returned))
                 if returnable <= 0:
@@ -2419,8 +2565,11 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 lines.append(
                     {
                         'id': sl['id'],
-                        'label': f"{sl['product']} — продано {sold_s} — возвращено {ret_s} — доступно {retable_s}",
+                        'label': f"{sl['product']} — продано {sold_s} — доступно {retable_s}",
                         'product': sl['product'],
+                        'product_name': sl['product'],
+                        'quantity': sold_s,
+                        'quantity_sold': sold_s,
                         'sold_quantity': sold_s,
                         'returned_quantity': ret_s,
                         'returnable_quantity': retable_s,
@@ -2430,6 +2579,12 @@ class ReturnViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         return Response({
             'sales': sales_payload,
             'sale_lines': lines,
+            'meta': {
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'pages': pages,
+            },
         })
 
     @action(detail=True, methods=['get'], url_path='waybill')

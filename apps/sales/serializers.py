@@ -1368,6 +1368,10 @@ class SaleSerializer(serializers.ModelSerializer):
         allow_null=True,
     )
     total_amount = serializers.SerializerMethodField()
+    original_total_amount = serializers.SerializerMethodField()
+    returned_amount = serializers.SerializerMethodField()
+    total_amount_after_returns = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
     payment_type = serializers.CharField(write_only=True, required=False, allow_blank=False)
     payment_method = serializers.CharField(write_only=True, required=False, allow_blank=False)
     paid_amount = serializers.DecimalField(
@@ -1400,7 +1404,9 @@ class SaleSerializer(serializers.ModelSerializer):
             'client', 'client_name',
             'product', 'sale_mode', 'unit_type', 'sold_pieces', 'sold_packages',
             'length_per_piece', 'total_meters',
-            'quantity_input', 'price', 'revenue', 'total_amount', 'cost', 'date',
+            'quantity_input', 'price', 'revenue',
+            'original_total_amount', 'returned_amount', 'total_amount',
+            'total_amount_after_returns', 'cost', 'date',
             'comment',
             'sale_unit', 'packaging', 'stock_form', 'inventory_form', 'piece_pick', 'profit',
             'profile_name', 'stock_quality',
@@ -1408,6 +1414,7 @@ class SaleSerializer(serializers.ModelSerializer):
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
             'created_by', 'created_by_name', 'created_at',
             'sale_lines', 'payment_status', 'paid_amount', 'debt_amount', 'refund_amount',
+            'status',
             'payment_type', 'payment_method',
             'order_paid_amount_applied',
         )
@@ -1417,7 +1424,8 @@ class SaleSerializer(serializers.ModelSerializer):
             'created_at', 'sale_lines',
             'warehouse_stock_applied', 'credit_limit_bypassed', 'updated_at',
             'payment_status', 'debt_amount', 'refund_amount',
-            'total_amount',
+            'original_total_amount', 'returned_amount', 'total_amount',
+            'total_amount_after_returns', 'status',
         )
         extra_kwargs = {
             'product': {'required': False, 'allow_blank': True},
@@ -1453,7 +1461,27 @@ class SaleSerializer(serializers.ModelSerializer):
         return sale_payment_metrics(obj)['payment_status']
 
     def get_total_amount(self, obj):
-        return api_decimal_str(Decimal(str(obj.revenue or 0)))
+        return api_decimal_str(sale_active_total_amount(obj))
+
+    def get_original_total_amount(self, obj):
+        return api_decimal_str(sale_original_total_amount(obj))
+
+    def get_returned_amount(self, obj):
+        return api_decimal_str(sale_returned_amount(obj))
+
+    def get_total_amount_after_returns(self, obj):
+        return api_decimal_str(sale_active_total_amount(obj))
+
+    def get_status(self, obj):
+        original = sale_original_total_amount(obj)
+        returned = sale_returned_amount(obj)
+        if original > 0 and returned >= original:
+            return 'returned' if obj.sale_status != Sale.STATUS_CANCELED else Sale.STATUS_CANCELED
+        if returned > 0:
+            return 'partial_return'
+        if obj.sale_status in (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED) or obj.warehouse_stock_applied:
+            return 'completed'
+        return obj.sale_status
 
     def get_debt_amount(self, obj):
         from .payment_status import sale_payment_metrics
@@ -2398,14 +2426,73 @@ class SaleSerializer(serializers.ModelSerializer):
 # RETURN (Возврат)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def sale_return_source_is_valid(sale: Sale) -> bool:
+    if sale.sale_status == Sale.STATUS_CANCELED:
+        return False
+    if sale.sale_status == Sale.STATUS_DRAFT and not sale.warehouse_stock_applied:
+        return False
+    return True
+
+
+def sale_line_returned_quantity(sale_line_id: int, *, exclude_return_id: int | None = None) -> Decimal:
+    qs = ReturnLine.objects.filter(
+        sale_line_id=sale_line_id,
+        return_doc__status=Return.STATUS_COMPLETED,
+    )
+    if exclude_return_id is not None:
+        qs = qs.exclude(return_doc_id=exclude_return_id)
+    return Decimal(str(qs.aggregate(s=Sum('quantity'))['s'] or 0))
+
+
+def return_document_amount(ret_doc: Return) -> Decimal:
+    total = Decimal('0')
+    for line in ret_doc.lines.select_related('sale_line').all():
+        unit_price = Decimal(str(line.sale_line.unit_price or 0)) if line.sale_line_id else Decimal('0')
+        qty = Decimal(str(line.quantity or 0))
+        total += unit_price * qty
+    return total.quantize(Decimal('0.01'))
+
+
+def sale_original_total_amount(sale: Sale) -> Decimal:
+    lines = list(sale.sale_lines.all())
+    if lines:
+        return sum((Decimal(str(line.line_total or 0)) for line in lines), Decimal('0')).quantize(Decimal('0.01'))
+    return Decimal(str(sale.revenue or 0)).quantize(Decimal('0.01'))
+
+
+def sale_returned_amount(sale: Sale) -> Decimal:
+    total = Decimal('0')
+    for line in sale.sale_lines.all():
+        unit_price = Decimal(str(line.unit_price or 0))
+        returned_qty = sale_line_returned_quantity(line.pk)
+        total += unit_price * returned_qty
+    return total.quantize(Decimal('0.01'))
+
+
+def sale_active_total_amount(sale: Sale) -> Decimal:
+    return max(Decimal('0'), sale_original_total_amount(sale) - sale_returned_amount(sale)).quantize(Decimal('0.01'))
+
+
+def sale_has_returnable_lines(sale: Sale) -> bool:
+    if not sale_return_source_is_valid(sale):
+        return False
+    for line in sale.sale_lines.all():
+        sold = Decimal(str(line.quantity or 0))
+        returned = sale_line_returned_quantity(line.pk)
+        if sold - returned > 0:
+            return True
+    return False
+
+
 class ReturnLineSerializer(serializers.ModelSerializer):
     sale_line_label = serializers.SerializerMethodField()
+    sale_line_id = serializers.IntegerField(source='sale_line.id', read_only=True)
     sale_line_sale_id = serializers.IntegerField(source='sale_line.sale_id', read_only=True)
 
     class Meta:
         model = ReturnLine
         fields = (
-            'id', 'sale_line', 'product', 'quantity',
+            'id', 'sale_line', 'sale_line_id', 'product', 'quantity',
             'return_target', 'condition_type',
             'rework_receipt_batch',
             'sale_line_label', 'sale_line_sale_id',
@@ -2477,8 +2564,9 @@ class ReturnLineSerializer(serializers.ModelSerializer):
         if not self.instance:
             total_returned = sum(
                 rl.quantity
-                for rl in ReturnLine.objects.filter(sale_line=sale_line).exclude(
-                    return_doc__status=Return.STATUS_CANCELED,
+                for rl in ReturnLine.objects.filter(
+                    sale_line=sale_line,
+                    return_doc__status=Return.STATUS_COMPLETED,
                 )
             )
             if total_returned + qty_d > sale_line.quantity:
@@ -2510,19 +2598,29 @@ class ReturnLineSerializer(serializers.ModelSerializer):
 class ReturnSerializer(serializers.ModelSerializer):
     lines = ReturnLineSerializer(many=True, required=False)
     sale_order_number = serializers.CharField(source='sale.order_number', read_only=True)
+    display = serializers.SerializerMethodField()
+    sale_id = serializers.IntegerField(source='sale.id', read_only=True)
+    sale_display = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(source='created_by.name', read_only=True, allow_null=True, default='')
+    total_refund_amount = serializers.SerializerMethodField()
+    downstream_links = serializers.SerializerMethodField()
 
     class Meta:
         model = Return
         fields = (
-            'id', 'return_number', 'date', 'status', 'sale', 'sale_order_number',
+            'id', 'display', 'return_number', 'date', 'status',
+            'sale', 'sale_id', 'sale_order_number', 'sale_display',
             'linked_order', 'invoice_number',
             'return_reason',
             'created_by', 'created_by_name', 'created_at',
-            'lines', 'client_name',
+            'lines', 'client_name', 'total_refund_amount', 'downstream_links',
         )
-        read_only_fields = ('return_number', 'created_at', 'sale_order_number', 'client_name')
+        read_only_fields = (
+            'return_number', 'created_at', 'sale_order_number',
+            'display', 'sale_id', 'sale_display', 'client_name',
+            'total_refund_amount', 'downstream_links',
+        )
         extra_kwargs = {
             'linked_order': {'required': False, 'allow_null': True},
             'created_by': {'required': False, 'allow_null': True},
@@ -2598,10 +2696,7 @@ class ReturnSerializer(serializers.ModelSerializer):
         if qty_d <= 0:
             self._raise_return_error('INVALID_QUANTITY', 'quantity должно быть больше 0.', field='lines')
 
-        total_returned_qs = ReturnLine.objects.filter(sale_line=sale_line).exclude(return_doc__status=Return.STATUS_CANCELED)
-        if exclude_return_id is not None:
-            total_returned_qs = total_returned_qs.exclude(return_doc_id=exclude_return_id)
-        total_returned = sum((Decimal(str(x.quantity or 0)) for x in total_returned_qs), Decimal('0'))
+        total_returned = sale_line_returned_quantity(sale_line.pk, exclude_return_id=exclude_return_id)
         if total_returned + qty_d > Decimal(str(sale_line.quantity or 0)):
             self._raise_return_error(
                 'RETURN_QUANTITY_EXCEEDED',
@@ -2634,6 +2729,11 @@ class ReturnSerializer(serializers.ModelSerializer):
                 'Некорректный condition_type. Допустимо: good, damaged.',
                 field='lines',
             )
+        ct = (
+            ReturnLine.CONDITION_GOOD
+            if rt == ReturnLine.TARGET_WAREHOUSE
+            else ReturnLine.CONDITION_DAMAGED
+        )
 
         payload['sale_line'] = sale_line
         payload['quantity'] = qty_d
@@ -2642,10 +2742,55 @@ class ReturnSerializer(serializers.ModelSerializer):
         payload['condition_type'] = ct
         return payload
 
+    def _validate_unique_payload_lines(self, lines: list[dict]) -> None:
+        seen: set[int] = set()
+        for line_data in lines:
+            sale_line = (line_data or {}).get('sale_line')
+            sale_line_id = sale_line.pk if isinstance(sale_line, SaleLine) else sale_line
+            if sale_line_id in (None, ''):
+                continue
+            try:
+                sale_line_id = int(sale_line_id)
+            except (TypeError, ValueError):
+                continue
+            if sale_line_id in seen:
+                self._raise_return_error(
+                    'RETURN_QUANTITY_EXCEEDED',
+                    'Одна строка продажи не может быть добавлена в возврат дважды.',
+                    field='lines',
+                )
+            seen.add(sale_line_id)
+
+    def get_display(self, obj):
+        return f'Возврат №{obj.return_number or obj.id}'
+
+    def get_sale_display(self, obj):
+        if not obj.sale_id:
+            return ''
+        return f'Продажа №{obj.sale.sale_number or obj.sale.order_number or obj.sale_id}'
+
     def get_client_name(self, obj):
         if obj.sale and obj.sale.client:
             return obj.sale.client.name
         return ''
+
+    def get_total_refund_amount(self, obj):
+        return api_decimal_str(return_document_amount(obj))
+
+    def get_downstream_links(self, obj):
+        payments = Payment.objects.filter(
+            linked_return=obj,
+            payment_type=Payment.TYPE_REFUND,
+            status=Payment.STATUS_ACTIVE,
+        ).order_by('id')
+        return [
+            {
+                'type': 'payment',
+                'id': p.id,
+                'label': f'Возврат денег №{p.payment_number or p.id} — {api_decimal_str(Decimal(str(p.amount or 0)))} сом',
+            }
+            for p in payments
+        ]
 
     def validate(self, attrs):
         initial = self.initial_data or {}
@@ -2671,10 +2816,10 @@ class ReturnSerializer(serializers.ModelSerializer):
         sale = attrs.get('sale', self.instance.sale if self.instance else None)
         if sale is None:
             self._raise_return_error('MISSING_SALE', 'Поле sale обязательно.', field='sale')
-        if is_create and sale.sale_status not in (Sale.STATUS_SHIPPED, Sale.STATUS_CLOSED):
+        if is_create and not sale_has_returnable_lines(sale):
             self._raise_return_error(
                 'INVALID_SALE_STATUS',
-                'Возврат разрешен только для sale в статусе shipped или closed.',
+                'Продажа недоступна для возврата.',
                 field='sale',
             )
 
@@ -2682,6 +2827,7 @@ class ReturnSerializer(serializers.ModelSerializer):
             lines = initial.get('lines')
             if not lines or not isinstance(lines, list) or len(lines) < 1:
                 self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
+            self._validate_unique_payload_lines(lines)
             for line_data in lines:
                 self._validate_line_payload(line_data, sale=sale)
         else:
@@ -2701,6 +2847,7 @@ class ReturnSerializer(serializers.ModelSerializer):
                 if lines is not None:
                     if not isinstance(lines, list) or len(lines) < 1:
                         self._raise_return_error('MISSING_LINES', 'Нужна минимум одна строка возврата (lines).', field='lines')
+                    self._validate_unique_payload_lines(lines)
                     base_sale = attrs.get('sale', self.instance.sale)
                     for line_data in lines:
                         self._validate_line_payload(line_data, sale=base_sale, exclude_return_id=self.instance.pk)
@@ -2766,7 +2913,41 @@ class ReturnSerializer(serializers.ModelSerializer):
 
     def apply_completion_effects(self, ret_doc: Return) -> None:
         """Склад / брак / переделка — только при проведении возврата (после complete)."""
-        for line in ret_doc.lines.all().select_related('sale_line', 'sale_line__warehouse_batch'):
+        lines = list(ret_doc.lines.all().select_related('sale_line', 'sale_line__warehouse_batch'))
+        requested_by_line: dict[int, Decimal] = {}
+        for line in lines:
+            if not line.sale_line_id:
+                self._raise_return_error('MISSING_SALE_LINE', 'Поле sale_line обязательно.', field='lines')
+            requested_by_line[line.sale_line_id] = (
+                requested_by_line.get(line.sale_line_id, Decimal('0'))
+                + Decimal(str(line.quantity or 0))
+            )
+        if len(requested_by_line) != len(lines):
+            self._raise_return_error(
+                'RETURN_QUANTITY_EXCEEDED',
+                'Одна строка продажи не может быть добавлена в возврат дважды.',
+                field='lines',
+            )
+        for sale_line_id, requested_qty in requested_by_line.items():
+            sale_line = SaleLine.objects.get(pk=sale_line_id)
+            returned = sale_line_returned_quantity(sale_line_id, exclude_return_id=ret_doc.pk)
+            if Decimal(str(returned)) + requested_qty > Decimal(str(sale_line.quantity or 0)):
+                self._raise_return_error(
+                    'RETURN_QUANTITY_EXCEEDED',
+                    'Нельзя вернуть больше доступного количества на момент проведения.',
+                    field='lines',
+                )
+        for line in lines:
+            self._validate_line_payload(
+                {
+                    'sale_line': line.sale_line_id,
+                    'quantity': line.quantity,
+                    'return_target': line.return_target,
+                    'condition_type': line.condition_type,
+                },
+                sale=ret_doc.sale,
+                exclude_return_id=ret_doc.pk,
+            )
             self._process_return_line(line, ret_doc)
 
     def _process_return_line(self, line: ReturnLine, ret_doc: Return):

@@ -222,6 +222,7 @@ class ReturnsApiContractTests(APITestCase):
         before_qty = WarehouseBatch.objects.get(pk=self.batch.pk).quantity
         done = self.client.post(f'/api/returns/{rid}/complete/', data={}, format='json')
         self.assertEqual(done.status_code, status.HTTP_200_OK)
+        self.assertEqual(done.data['total_refund_amount'], '200')
         self.batch.refresh_from_db()
         self.assertEqual(self.batch.status, WarehouseBatch.STATUS_AVAILABLE)
         self.assertGreater(self.batch.quantity, before_qty)
@@ -282,11 +283,38 @@ class ReturnsApiContractTests(APITestCase):
         self.assertEqual(repeat.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
         self.assertEqual(repeat.data.get('code'), 'RETURN_ALREADY_CANCELED')
 
-        # lock by active refund
+        paid_return = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'warehouse', 'condition_type': 'good'}])
+        paid_rid = paid_return.data['id']
+        Payment.objects.create(
+            date=date(2026, 4, 26),
+            client=self.client_active,
+            linked_sale=self.sale_shipped,
+            payment_type=Payment.TYPE_PAYMENT,
+            payment_method=Payment.METHOD_CASH,
+            amount=Decimal('1000'),
+            status=Payment.STATUS_ACTIVE,
+        )
+        paid_done = self.client.post(f'/api/returns/{paid_rid}/complete/', data={}, format='json')
+        self.assertEqual(paid_done.status_code, status.HTTP_200_OK)
+        auto_refund = Payment.objects.filter(
+            linked_return_id=paid_rid,
+            payment_type=Payment.TYPE_REFUND,
+            status=Payment.STATUS_ACTIVE,
+        ).first()
+        self.assertIsNotNone(auto_refund)
+        self.assertEqual(auto_refund.amount, Decimal('100.00'))
+        paid_detail = self.client.get(f'/api/returns/{paid_rid}/')
+        self.assertTrue(any(x.get('type') == 'payment' for x in paid_detail.data['downstream_links']))
+        paid_cancel = self.client.post(f'/api/returns/{paid_rid}/cancel/', data={}, format='json')
+        self.assertEqual(paid_cancel.status_code, status.HTTP_200_OK)
+        auto_refund.refresh_from_db()
+        self.assertEqual(auto_refund.status, Payment.STATUS_CANCELED)
+
+        # active refund is rolled back with completed return cancel
         r3 = self._create_return()
         rid3 = r3.data['id']
         self.client.post(f'/api/returns/{rid3}/complete/', data={}, format='json')
-        Payment.objects.create(
+        manual_refund = Payment.objects.create(
             date=date(2026, 4, 26),
             client=self.client_active,
             linked_return_id=rid3,
@@ -295,9 +323,10 @@ class ReturnsApiContractTests(APITestCase):
             amount=Decimal('10'),
             status=Payment.STATUS_ACTIVE,
         )
-        locked = self.client.post(f'/api/returns/{rid3}/cancel/', data={}, format='json')
-        self.assertEqual(locked.status_code, status.HTTP_409_CONFLICT)
-        self.assertEqual(locked.data.get('code'), 'REFUND_PAYMENT_EXISTS')
+        rolled_back = self.client.post(f'/api/returns/{rid3}/cancel/', data={}, format='json')
+        self.assertEqual(rolled_back.status_code, status.HTTP_200_OK)
+        manual_refund.refresh_from_db()
+        self.assertEqual(manual_refund.status, Payment.STATUS_CANCELED)
 
         # used defect lock (ручная запись брака по строке возврата)
         r4 = self._create_return(lines=[{'sale_line': self.line_shipped.pk, 'quantity': '1', 'return_target': 'warehouse', 'condition_type': 'good'}])
@@ -348,6 +377,8 @@ class ReturnsApiContractTests(APITestCase):
             lines=[{'sale_line': self.line_closed.pk, 'quantity': '8', 'return_target': 'warehouse', 'condition_type': 'good'}],
         )
         self.assertEqual(full_return.status_code, status.HTTP_201_CREATED)
+        completed = self.client.post(f'/api/returns/{full_return.data["id"]}/complete/', data={}, format='json')
+        self.assertEqual(completed.status_code, status.HTTP_200_OK)
 
         sources = self.client.get('/api/returns/select-sources/')
         self.assertEqual(sources.status_code, status.HTTP_200_OK)

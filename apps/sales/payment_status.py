@@ -63,9 +63,16 @@ def payment_status(
 
 
 def sale_payment_metrics(sale) -> dict[str, Any]:
-    from .models import Payment, Sale, SaleLine
+    from django.db.models import Q
+    from django.db.models import Sum
 
-    active = [p for p in sale.payments.all() if p.status == Payment.STATUS_ACTIVE]
+    from .models import Payment, Return, ReturnLine
+
+    active = list(
+        Payment.objects.filter(status=Payment.STATUS_ACTIVE)
+        .filter(Q(linked_sale=sale) | Q(linked_return__sale=sale))
+        .distinct()
+    )
     total_in = sum(
         (p.amount or Decimal('0'))
         for p in active
@@ -78,10 +85,20 @@ def sale_payment_metrics(sale) -> dict[str, Any]:
     net = total_in - ref + order_applied
     lines = list(sale.sale_lines.all())
     if lines:
-        due = sum(
-            (Decimal(str(sl.line_total or 0)) for sl in lines),
-            Decimal('0'),
-        )
+        due = Decimal('0')
+        for line in lines:
+            sold_qty = Decimal(str(line.quantity or 0))
+            line_total = Decimal(str(line.line_total or 0))
+            returned_qty = Decimal(str(
+                ReturnLine.objects.filter(
+                    sale_line=line,
+                    return_doc__status=Return.STATUS_COMPLETED,
+                ).aggregate(s=Sum('quantity'))['s'] or 0
+            ))
+            if sold_qty <= 0:
+                continue
+            active_qty = max(Decimal('0'), sold_qty - returned_qty)
+            due += (line_total * active_qty / sold_qty).quantize(Decimal('0.01'))
     else:
         due = sale.revenue or Decimal('0')
     st = payment_status(
