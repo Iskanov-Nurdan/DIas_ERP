@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>Расходная накладная</title>
+    <style>
+        @page { size: A4; margin: 16mm 14mm 16mm 14mm; }
+        body { font-family: "Times New Roman", serif; max-width: 900px; margin: 0 auto; color: #111; }
+        .title { text-align: center; font-weight: 700; font-size: 44px; margin: 8px 0 28px; }
+        .row { margin: 8px 0; font-size: 38px; }
+        table { border-collapse: collapse; width: 100%; margin-top: 14px; table-layout: fixed; }
+        th, td { border: 1px solid #222; padding: 14px 12px; font-size: 36px; }
+        th { font-weight: 700; text-align: center; vertical-align: middle; }
+        td { vertical-align: middle; }
+        td.num { text-align: center; }
+        td.money { text-align: right; white-space: nowrap; }
+        .total-row td { font-weight: 700; }
+        .footer { margin-top: 46px; font-size: 42px; }
+        .sign-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; column-gap: 24px; }
+        .sign-row { margin-top: 34px; }
+    </style>
+</head>
+<body>
+    <div class="title">{title}</div>
+    <div class="row">{supplier}</div>
+    <div class="row">{buyer}</div>
+
+    <table>
+        <colgroup>
+            <col style="width:8%;">
+            <col style="width:47.5%;">
+            <col style="width:12.5%;">
+            <col style="width:16%;">
+            <col style="width:16%;">
+        </colgroup>
+        <thead>
+            <tr>
+                <th>{h1}</th>
+                <th>{h2}</th>
+                <th>{h3}</th>
+                <th>{h4}</th>
+                <th>{h5}</th>
+            </tr>
+        </thead>
+        <tbody>
+            {lines_rows}
+            <tr class="total-row">
+                <td colspan="4" class="money">{total_label}</td>
+                <td class="money">{total}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="footer">
+        <div class="sign-grid">
+            <div>{sign1}</div>
+            <div>{sign2}</div>
+            <div>{sign3}</div>
+        </div>
+        <div class="sign-grid sign-row">
+            <div>{sign_line}</div>
+            <div>{sign_line}</div>
+            <div>{sign_line}</div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,51 @@
+import django_filters
+
+from .models import WarehouseBatch
+
+
+def _canonical_inventory_form(value: str) -> str:
+    v = str(value).strip().lower()
+    alias = {
+        'not_packed': WarehouseBatch.INVENTORY_UNPACKED,
+        'unpacked': WarehouseBatch.INVENTORY_UNPACKED,
+        'opened': WarehouseBatch.INVENTORY_OPEN_PACKAGE,
+        'open': WarehouseBatch.INVENTORY_OPEN_PACKAGE,
+        'packed': WarehouseBatch.INVENTORY_PACKED,
+    }
+    return alias.get(v, v)
+
+
+class WarehouseBatchFilter(django_filters.FilterSet):
+    """
+    stock_form / packaging_status — алиасы inventory_form.
+    not_packed → unpacked (как в контракте фронта).
+    search — подстрочный поиск по product (как на фронте).
+    """
+
+    inventory_form = django_filters.CharFilter(method='filter_inventory_form')
+    stock_form = django_filters.CharFilter(method='filter_stock_form')
+    packaging_status = django_filters.CharFilter(method='filter_packaging_status')
+    search = django_filters.CharFilter(method='filter_search')
+
+    def filter_search(self, queryset, name, value):
+        if not value or not str(value).strip():
+            return queryset
+        return queryset.filter(product__icontains=str(value).strip())
+
+    def filter_inventory_form(self, queryset, name, value):
+        if not value:
+            return queryset
+        canon = _canonical_inventory_form(value)
+        return queryset.filter(inventory_form=canon)
+
+    def filter_stock_form(self, queryset, name, value):
+        return self.filter_inventory_form(queryset, name, value)
+
+    def filter_packaging_status(self, queryset, name, value):
+        return self.filter_inventory_form(queryset, name, value)
+
+    quality = django_filters.CharFilter(field_name='quality', lookup_expr='exact')
+
+    class Meta:
+        model = WarehouseBatch
+        fields = ['status', 'product', 'quality']
