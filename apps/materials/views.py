@@ -25,6 +25,7 @@ from .usage_checks import raw_material_is_deletable, raw_material_unit_change_de
 REASON_TO_MOVEMENT = {
     'chemistry_batch_produce': 'writeoff_chemistry',
     'production_batch': 'writeoff_production',
+    'workshop_blank_barrel': 'writeoff_workshop',
 }
 
 

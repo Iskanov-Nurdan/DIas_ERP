@@ -5,7 +5,7 @@ from rest_framework import serializers
 
 from config.api_numbers import api_decimal_str
 
-from .models import WarehouseBatch
+from .models import GpPackOperation, GpPackRunAllocation, GpPackUnit, WarehouseBatch
 from .packaging import warehouse_packaging_breakdown
 
 
@@ -283,3 +283,121 @@ class WarehouseBatchSerializer(serializers.ModelSerializer):
             elif k in ('otk_accepted', 'otk_defect'):
                 ret[k] = api_decimal_str(v)
         return ret
+
+
+class GpPackageLineInputSerializer(serializers.Serializer):
+    package_count = serializers.IntegerField(min_value=1)
+    pieces_per_package = serializers.IntegerField(min_value=1)
+
+
+class GpPackageCreateSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+    blank_id = serializers.IntegerField(min_value=1)
+    kind = serializers.CharField(max_length=16)
+    label = serializers.CharField(max_length=255, allow_blank=True, default='')
+    split_mode = serializers.CharField(max_length=16)
+    lines = GpPackageLineInputSerializer(many=True)
+    total_pieces = serializers.IntegerField(min_value=1)
+    client_request_id = serializers.CharField(max_length=64, allow_blank=True, required=False, default='')
+
+
+class GpPackUnitOutSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GpPackUnit
+        fields = ('id', 'sequence', 'pieces')
+
+
+class GpPackageJournalSerializer(serializers.ModelSerializer):
+    """
+    Одна строка журнала = одна физическая упаковка (GpPackUnit).
+    total_kg — доля массы операции (сумма kg по FIFO-аллокациям), пропорционально total_pieces этой строки.
+    """
+
+    created_at = serializers.DateTimeField(source='operation.created_at', read_only=True)
+    product_id = serializers.IntegerField(source='operation.product_id', read_only=True)
+    blank_id = serializers.IntegerField(source='operation.blank_id', read_only=True)
+    product_name = serializers.SerializerMethodField()
+    blank_name = serializers.SerializerMethodField()
+    kind = serializers.CharField(source='operation.kind', read_only=True)
+    label = serializers.CharField(source='operation.label', read_only=True)
+    total_pieces = serializers.IntegerField(source='pieces', read_only=True)
+    total_kg = serializers.SerializerMethodField()
+    total_weight_kg = serializers.SerializerMethodField()
+    warehouse_batch_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = GpPackUnit
+        fields = (
+            'id',
+            'created_at',
+            'product_id',
+            'blank_id',
+            'product_name',
+            'blank_name',
+            'kind',
+            'label',
+            'total_pieces',
+            'total_kg',
+            'total_weight_kg',
+            'warehouse_batch_id',
+        )
+
+    def get_product_name(self, obj):
+        op = obj.operation
+        if op.product_id and op.product:
+            return op.product.name or ''
+        return ''
+
+    def get_blank_name(self, obj):
+        op = obj.operation
+        if op.blank_id and op.blank:
+            return op.blank.name or ''
+        return ''
+
+    def get_total_kg(self, obj):
+        from decimal import Decimal
+
+        op = obj.operation
+        cached = getattr(op, '_prefetched_objects_cache', {}).get('run_allocations')
+        allocs = list(cached) if cached is not None else list(op.run_allocations.all())
+        total_k = sum(Decimal(str(a.kg or 0)) for a in allocs)
+        tp = int(op.total_pieces or 0)
+        if tp <= 0 or not allocs:
+            return 0.0
+        share = Decimal(int(obj.pieces)) / Decimal(tp)
+        kg = (total_k * share).quantize(Decimal('0.000001'))
+        return float(kg)
+
+    def get_total_weight_kg(self, obj):
+        return self.get_total_kg(obj)
+
+
+class GpPackRunAllocationOutSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GpPackRunAllocation
+        fields = ('id', 'blank_production_run_id', 'pieces', 'kg')
+
+
+class GpPackOperationDetailSerializer(serializers.ModelSerializer):
+    product_id = serializers.IntegerField(read_only=True)
+    blank_id = serializers.IntegerField(read_only=True)
+    created_by_id = serializers.IntegerField(read_only=True, allow_null=True)
+    units = GpPackUnitOutSerializer(many=True, read_only=True)
+    run_allocations = GpPackRunAllocationOutSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = GpPackOperation
+        fields = (
+            'id',
+            'product_id',
+            'blank_id',
+            'kind',
+            'label',
+            'split_mode',
+            'total_pieces',
+            'created_at',
+            'created_by_id',
+            'client_request_id',
+            'units',
+            'run_allocations',
+        )

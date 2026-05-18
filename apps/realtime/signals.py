@@ -21,6 +21,7 @@ from apps.production.models import (
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
 from apps.sales.models import DefectRecord, Order, Payment, Return, ReworkRequest, Sale
 from apps.warehouse.models import WarehouseBatch
+from apps.workshop.models import WorkshopBlank
 
 from .broadcast import schedule_push
 
@@ -408,8 +409,9 @@ def sale_deleted(sender, instance, **kwargs):
 
 @receiver(post_save, sender=Order)
 def order_saved(sender, instance, created, **kwargs):
-    schedule_push(
-        resource='order',
+    from .broadcast import schedule_order_operational_push
+
+    schedule_order_operational_push(
         action=_act(created),
         entity_id=instance.pk,
         extra={'client_id': instance.client_id, 'status': instance.status},
@@ -418,7 +420,19 @@ def order_saved(sender, instance, created, **kwargs):
 
 @receiver(post_delete, sender=Order)
 def order_deleted(sender, instance, **kwargs):
-    schedule_push(resource='order', action='deleted', entity_id=instance.pk)
+    from .broadcast import schedule_order_operational_push
+
+    schedule_order_operational_push(action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=WorkshopBlank)
+def workshop_blank_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='workshop_blank', action=_act(created), entity_id=instance.pk)
+
+
+@receiver(post_delete, sender=WorkshopBlank)
+def workshop_blank_deleted(sender, instance, **kwargs):
+    schedule_push(resource='workshop_blank', action='deleted', entity_id=instance.pk)
 
 
 @receiver(post_save, sender=Payment)

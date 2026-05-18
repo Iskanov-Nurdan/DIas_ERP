@@ -62,3 +62,19 @@ def schedule_push(**kwargs) -> None:
     from django.db import transaction
 
     transaction.on_commit(lambda: push_operational_event(**kwargs))
+
+
+def schedule_order_operational_push(
+    *,
+    action: str,
+    entity_id: int | None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Заявка клиента: фронт (касса / производство) подписан и на order, и на orders."""
+    from django.db import transaction
+
+    def _fanout() -> None:
+        push_operational_event(resource='order', action=action, entity_id=entity_id, extra=extra)
+        push_operational_event(resource='orders', action=action, entity_id=entity_id, extra=extra)
+
+    transaction.on_commit(_fanout)

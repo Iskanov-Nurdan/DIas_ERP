@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'apps.analytics',
     'apps.activity',
     'apps.realtime',
+    'apps.workshop.apps.WorkshopConfig',
 ]
 
 MIDDLEWARE = [

@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -56,6 +57,14 @@ class WarehouseBatch(models.Model):
         null=True,
         blank=True,
         related_name='warehouse_batches',
+    )
+    blank_production_run = models.ForeignKey(
+        'workshop.BlankProductionRun',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='warehouse_gp_acceptance_batches',
+        verbose_name='Приёмка ГП (неупакованная строка по приёмке)',
     )
     inventory_form = models.CharField(
         'Форма учёта на складе ГП',
@@ -117,3 +126,131 @@ class WarehouseBatch(models.Model):
 
     def __str__(self):
         return f'{self.product} — {self.quantity} шт ({self.get_status_display()})'
+
+
+class GpPackOperation(models.Model):
+    """Одна операция упаковки неупакованного ГП (по группе product + blank), с дочерними единицами и FIFO по приёмкам."""
+
+    KIND_PALLET = 'pallet'
+    KIND_BOX = 'box'
+    KIND_OTHER = 'other'
+    KIND_CHOICES = [
+        (KIND_PALLET, 'Поддон'),
+        (KIND_BOX, 'Короб'),
+        (KIND_OTHER, 'Иное'),
+    ]
+
+    SPLIT_SINGLE = 'single'
+    SPLIT_UNIFORM = 'uniform'
+    SPLIT_CUSTOM = 'custom'
+    SPLIT_CHOICES = [
+        (SPLIT_SINGLE, 'Одна упаковка'),
+        (SPLIT_UNIFORM, 'Одинаковые упаковки'),
+        (SPLIT_CUSTOM, 'Разный состав'),
+    ]
+
+    product = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.PROTECT,
+        related_name='gp_pack_operations',
+        verbose_name='ГП (SKU)',
+    )
+    blank = models.ForeignKey(
+        'workshop.WorkshopBlank',
+        on_delete=models.PROTECT,
+        related_name='gp_pack_operations',
+        verbose_name='Заготовка',
+    )
+    kind = models.CharField('Тип', max_length=16, choices=KIND_CHOICES)
+    label = models.CharField('Метка', max_length=255, blank=True, default='')
+    split_mode = models.CharField('Режим разбиения', max_length=16, choices=SPLIT_CHOICES)
+    total_pieces = models.PositiveIntegerField('Всего штук в операции')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='gp_pack_operations',
+        verbose_name='Кто создал',
+    )
+    client_request_id = models.CharField(
+        'Идемпотентность (клиент)',
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        default=None,
+    )
+
+    class Meta:
+        db_table = 'warehouse_gp_pack_operations'
+        verbose_name = 'Операция упаковки ГП'
+        verbose_name_plural = 'Операции упаковки ГП'
+        ordering = ('-created_at', '-pk')
+
+    def __str__(self):
+        return f'#{self.pk} {self.get_kind_display()} {self.total_pieces} шт'
+
+
+class GpPackUnit(models.Model):
+    """Одна физическая упаковка (короб / поддон / …)."""
+
+    operation = models.ForeignKey(
+        GpPackOperation,
+        on_delete=models.CASCADE,
+        related_name='units',
+        verbose_name='Операция',
+    )
+    sequence = models.PositiveIntegerField('Порядок')
+    pieces = models.PositiveIntegerField('Штук в упаковке')
+    warehouse_batch = models.ForeignKey(
+        'WarehouseBatch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='gp_pack_units',
+        verbose_name='Партия склада ГП (1 упаковка = 1 строка)',
+    )
+
+    class Meta:
+        db_table = 'warehouse_gp_pack_units'
+        verbose_name = 'Единица упаковки ГП'
+        verbose_name_plural = 'Единицы упаковки ГП'
+        ordering = ('operation_id', 'sequence', 'pk')
+        constraints = [
+            models.UniqueConstraint(fields=('operation', 'sequence'), name='uniq_gp_pack_unit_op_seq'),
+        ]
+
+    def __str__(self):
+        return f'op={self.operation_id} seq={self.sequence} {self.pieces} шт'
+
+
+class GpPackRunAllocation(models.Model):
+    """Списание штук с конкретной строки приёмки (BlankProductionRun), FIFO."""
+
+    operation = models.ForeignKey(
+        GpPackOperation,
+        on_delete=models.CASCADE,
+        related_name='run_allocations',
+        verbose_name='Операция',
+    )
+    blank_production_run = models.ForeignKey(
+        'workshop.BlankProductionRun',
+        on_delete=models.PROTECT,
+        related_name='gp_pack_allocations',
+        verbose_name='Партия (приёмка ГП)',
+    )
+    pieces = models.PositiveIntegerField('Штук')
+    kg = models.DecimalField('Кг (снимок)', max_digits=14, decimal_places=6, null=True, blank=True)
+
+    class Meta:
+        db_table = 'warehouse_gp_pack_run_allocations'
+        verbose_name = 'Списание упаковки с приёмки'
+        verbose_name_plural = 'Списания упаковки с приёмок'
+        indexes = [
+            models.Index(fields=['blank_production_run']),
+        ]
+
+    def __str__(self):
+        return f'run={self.blank_production_run_id} {self.pieces} шт'

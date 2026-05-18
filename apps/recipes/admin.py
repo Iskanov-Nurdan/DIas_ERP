@@ -4,7 +4,7 @@ from .models import PlasticProfile, Recipe, RecipeComponent
 
 @admin.register(PlasticProfile)
 class PlasticProfileAdmin(admin.ModelAdmin):
-    list_display = ('id', 'name', 'code', 'is_active', 'comment')
+    list_display = ('id', 'name', 'code', 'weight_kg_per_piece', 'is_active', 'comment')
     search_fields = ('name', 'code', 'comment')
 
 

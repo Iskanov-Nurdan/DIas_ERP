@@ -22,6 +22,7 @@ from apps.production.views import (
     RecipeRunViewSet,
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
 )
+from apps.warehouse.gp_packaging_views import GpPackageViewSet, GpUnpackedBalanceView
 from apps.warehouse.views import WarehouseBatchViewSet
 from apps.sales.views import (
     ClientViewSet,
@@ -57,6 +58,7 @@ from apps.activity.views import (
     ActivityAdminView,
     ActivityAdminRetrieveView,
 )
+from apps.workshop.views import BlankProductionRunViewSet, PreparedBlankViewSet, WorkshopBlankViewSet
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -76,6 +78,7 @@ router.register(r'recipes', RecipeViewSet, basename='recipe')
 router.register(r'batches', BatchViewSet, basename='batch')
 router.register(r'production/requests', ProductionRequestViewSet, basename='production-request')
 router.register(r'warehouse/batches', WarehouseBatchViewSet, basename='warehouse-batch')
+router.register(r'warehouse/gp-packages', GpPackageViewSet, basename='warehouse-gp-package')
 router.register(r'clients', ClientViewSet, basename='client')
 router.register(r'sales', SaleViewSet, basename='sale')
 router.register(r'orders', OrderViewSet, basename='order')
@@ -105,9 +108,17 @@ router.register(r'client-prices', ClientPriceViewSet, basename='client-price')
 router.register(r'order-reservations', OrderReservationViewSet, basename='order-reservation')
 router.register(r'client-financial-summary', ClientFinancialSummaryView, basename='client-financial-summary')
 router.register(r'shifts', ShiftViewSet, basename='shift')
+router.register(r'workshop/blanks', WorkshopBlankViewSet, basename='workshop-blank')
+router.register(r'workshop/prepared-blanks', PreparedBlankViewSet, basename='workshop-prepared-blank')
+router.register(
+    r'workshop/blank-production-runs',
+    BlankProductionRunViewSet,
+    basename='workshop-blank-production-run',
+)
 
 # Фиксированные пути регистрируются ДО роутера, чтобы не конфликтовать с <pk>
 urlpatterns = [
+    path('warehouse/gp-unpacked-balance/', GpUnpackedBalanceView.as_view(), name='warehouse-gp-unpacked-balance'),
     path(
         'shifts/complaints/',
         ShiftComplaintViewSet.as_view({'get': 'list', 'post': 'create'}),

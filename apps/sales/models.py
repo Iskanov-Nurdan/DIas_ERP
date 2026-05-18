@@ -467,6 +467,14 @@ class SaleLine(models.Model):
     profit = models.DecimalField('Прибыль строки', max_digits=16, decimal_places=2, default=0)
     defect_flag = models.BooleanField('Строка брака', default=False)
     comment = models.TextField('Комментарий', blank=True, default='')
+    gp_pack_unit = models.ForeignKey(
+        'warehouse.GpPackUnit',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sale_lines',
+        verbose_name='Упаковка GP (продажа по gp_package_id)',
+    )
 
     class Meta:
         db_table = 'sale_lines'

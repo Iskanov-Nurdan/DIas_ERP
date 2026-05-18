@@ -1,7 +1,10 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from config.fields import CleanDecimalField
 from .models import PlasticProfile, Recipe, RecipeComponent
+from .profile_policy import generate_plastic_profile_code, plastic_profile_deletable
 
 
 class _NullableRecipeModelSerializer(serializers.ModelSerializer):
@@ -15,14 +18,24 @@ class _NullableRecipeModelSerializer(serializers.ModelSerializer):
 
 class PlasticProfileSerializer(serializers.ModelSerializer):
     deletable = serializers.SerializerMethodField()
+    code = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    weight_kg_per_piece = serializers.DecimalField(
+        max_digits=14, decimal_places=6, required=False, allow_null=True, coerce_to_string=False
+    )
+
+    _WRITE_FIELDS = frozenset({'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece'})
 
     class Meta:
         model = PlasticProfile
-        fields = ('id', 'name', 'code', 'comment', 'is_active', 'deletable')
+        fields = ('id', 'name', 'code', 'comment', 'is_active', 'deletable', 'weight_kg_per_piece')
+
+    def __init__(self, *args, **kwargs):
+        data = kwargs.get('data')
+        if data is not None and hasattr(data, 'keys'):
+            kwargs['data'] = {k: data[k] for k in data.keys() if k in self._WRITE_FIELDS}
+        super().__init__(*args, **kwargs)
 
     def get_deletable(self, obj):
-        from .profile_policy import plastic_profile_deletable
-
         return plastic_profile_deletable(obj)
 
     def validate_name(self, value):
@@ -30,23 +43,38 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Укажите название')
         return (value or '').strip()
 
-    def validate_code(self, value):
-        if not (value or '').strip():
-            raise serializers.ValidationError('Укажите код')
-        return (value or '').strip()
+    def validate_weight_kg_per_piece(self, value):
+        if value is None:
+            return value
+        if Decimal(str(value)) <= 0:
+            raise serializers.ValidationError('Вес одной штуки должен быть больше нуля.')
+        return value
 
     def validate(self, attrs):
-        code = attrs.get('code')
         instance = getattr(self, 'instance', None)
-        if code is None and instance is not None:
-            code = instance.code
-        if code is not None:
-            qs = PlasticProfile.objects.filter(code=code)
-            if instance is not None:
-                qs = qs.exclude(pk=instance.pk)
-            if qs.exists():
-                raise serializers.ValidationError({'code': 'Код уже занят'})
+        if 'code' in attrs:
+            raw = attrs['code']
+            if raw is None:
+                s = ''
+            else:
+                s = str(raw).strip()
+            if not s:
+                if instance is not None:
+                    raise serializers.ValidationError({'code': 'Код не может быть пустым'})
+                attrs.pop('code', None)
+            else:
+                attrs['code'] = s
+                qs = PlasticProfile.objects.filter(code=s)
+                if instance is not None:
+                    qs = qs.exclude(pk=instance.pk)
+                if qs.exists():
+                    raise serializers.ValidationError({'code': 'Код уже занят'})
         return attrs
+
+    def create(self, validated_data):
+        if 'code' not in validated_data or not (validated_data.get('code') or '').strip():
+            validated_data['code'] = generate_plastic_profile_code()
+        return super().create(validated_data)
 
 
 class PlasticProfileListSerializer(serializers.ModelSerializer):
@@ -63,6 +91,7 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
             'code',
             'comment',
             'is_active',
+            'weight_kg_per_piece',
             'recipes_count',
             'has_recipe',
             'recipes',
@@ -88,7 +117,7 @@ class PlasticProfileNestedSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PlasticProfile
-        fields = ('id', 'name', 'code', 'comment', 'is_active')
+        fields = ('id', 'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece')
 
 
 class RecipeComponentSerializer(serializers.ModelSerializer):

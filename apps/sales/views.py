@@ -15,7 +15,8 @@ from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import extend_schema, extend_schema_view, inline_serializer, OpenApiParameter
+from rest_framework import serializers as drf_serializers
 
 from apps.activity.mixins import ActivityLoggingMixin
 from config.api_numbers import api_decimal_str
@@ -761,6 +762,48 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 # ORDER (Заявка)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_OrderCartLineWrite = inline_serializer(
+    name='OrderCartLineWrite',
+    fields={
+        'profile': drf_serializers.IntegerField(help_text='ID пластикового профиля'),
+        'quantity': drf_serializers.IntegerField(help_text='Количество (шт), > 0'),
+        'length': drf_serializers.CharField(required=False, allow_null=True, allow_blank=True),
+        'recipe': drf_serializers.IntegerField(required=False, allow_null=True),
+    },
+)
+_OrderCreateRequestBody = inline_serializer(
+    name='OrderCreateRequestBody',
+    fields={
+        'client': drf_serializers.IntegerField(),
+        'date': drf_serializers.DateField(required=False),
+        'order_lines': drf_serializers.ListField(child=_OrderCartLineWrite, min_length=1, required=False),
+        'profile': drf_serializers.IntegerField(required=False),
+        'quantity': drf_serializers.IntegerField(required=False),
+        'length': drf_serializers.CharField(required=False, allow_null=True, allow_blank=True),
+        'recipe': drf_serializers.IntegerField(required=False, allow_null=True),
+        'total_amount': drf_serializers.CharField(required=False),
+        'paid_amount': drf_serializers.CharField(required=False),
+        'amount_remaining': drf_serializers.CharField(required=False),
+        'payment_type': drf_serializers.ChoiceField(choices=['full', 'partial', 'debt']),
+        'payment_method': drf_serializers.CharField(required=False, allow_blank=True, allow_null=True),
+        'source_type': drf_serializers.CharField(required=False),
+        'comment': drf_serializers.CharField(required=False, allow_blank=True),
+    },
+)
+
+
+@extend_schema_view(
+    create=extend_schema(
+        summary='Создать заявку',
+        description=(
+            'Минимум по строкам: profile + quantity. Поля recipe и length не обязательны; '
+            'либо массив order_lines, либо устаревший вариант с profile и quantity в корне. '
+            'При нескольких активных рецептах у профиля без recipe в строке — 400 AMBIGUOUS_RECIPE_FOR_PROFILE.'
+        ),
+        request=_OrderCreateRequestBody,
+        responses={201: OrderSerializer},
+    ),
+)
 class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Order.objects.select_related(
         'client', 'created_by', 'responsible_user', 'resolved_recipe', 'production_profile',
@@ -776,20 +819,9 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
         serializer.save(created_by=user)
-        self._broadcast(serializer.instance, created=True)
 
     def perform_update(self, serializer):
         super().perform_update(serializer)
-        self._broadcast(serializer.instance, created=False)
-
-    def _broadcast(self, instance, created):
-        from apps.realtime.broadcast import schedule_push
-        schedule_push(
-            resource='order',
-            action='created' if created else 'updated',
-            entity_id=instance.pk,
-            extra={'client_id': instance.client_id, 'status': instance.status},
-        )
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1008,7 +1040,6 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         order.status = new_status
         order.save(update_fields=['status', 'updated_at'])
-        self._broadcast(order, created=False)
         return Response(OrderSerializer(order).data)
 
     @action(detail=True, methods=['get'], url_path='waybill')
@@ -1146,7 +1177,6 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         released = release_all_for_order(order)
         order.status = Order.STATUS_CANCELED
         order.save(update_fields=['status', 'updated_at'])
-        self._broadcast(order, created=False)
         return Response({
             'status': order.status,
             'reservations_released': released,
@@ -1403,7 +1433,13 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         ],
         description=(
             'Справочники для формы продаж. В каждом order в полях orders/available_orders '
-            'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.'
+            'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.\n'
+            'Партии warehouse_batches / available_warehouse_batches: для packed строк '
+            'поле available_packages — строка с числом доступных целых упаковок (остаток штук в упаковках / pieces_per_package); '
+            'available_pieces — только неупакованный остаток (для inventory_form=packed всегда 0 — штуки только в составе упаковок / GP). '
+            'При unit_type=pieces партии packed не включаются. '
+            'supports_packages=true при inventory_form=packed и pieces_per_package>0. '
+            'Строки GP после POST /warehouse/gp-packages/ попадают сюда как отдельные packed-партии (1 упаковка = 1 warehouse_batch).'
         ),
     )
     def select_sources(self, request):
@@ -1464,48 +1500,62 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             WarehouseBatch.INVENTORY_UNPACKED: 'Неупаковано',
         }
         for b in wb_qs:
-            available_qty = Decimal(str(get_available_quantity(b.pk)))
-            if available_qty <= 0:
+            raw_available = Decimal(str(get_available_quantity(b.pk)))
+            if raw_available <= 0:
                 continue
             ppp = Decimal(str(b.pieces_per_package or 0))
             avail_packages = None
             if ppp > 0:
-                avail_packages = api_decimal_str((available_qty / ppp).quantize(Decimal('0.0001')))
+                avail_packages = api_decimal_str((raw_available / ppp).quantize(Decimal('0.0001')))
+            is_packed = b.inventory_form == WarehouseBatch.INVENTORY_PACKED
+            # Во вкладке «штуки» не показываем закрытые упаковки — остаток только в GP/упаковках.
             if unit_type == Sale.MODE_PACKAGES:
-                if b.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+                if not is_packed:
                     continue
                 if ppp <= 0:
                     continue
-                if (available_qty / ppp) < Decimal('1'):
+                if (raw_available / ppp) < Decimal('1'):
                     continue
             elif unit_type == Sale.MODE_PIECES:
-                # pieces: доступны все строки, где можно списать штуки (включая packed через вскрытие)
-                pass
+                if is_packed:
+                    continue
+
             total_meters = None
             if b.length_per_piece is not None:
                 total_meters = api_decimal_str(
-                    (available_qty * Decimal(str(b.length_per_piece))).quantize(Decimal('0.0001')),
+                    (raw_available * Decimal(str(b.length_per_piece))).quantize(Decimal('0.0001')),
                 )
-            display = (
-                f"{(b.profile.name if b.profile_id else b.product)} — "
-                f"{api_decimal_str(Decimal(str(b.length_per_piece or 0)))} м — "
-                f"остаток: {api_decimal_str(available_qty)} шт"
-            )
-            if avail_packages is not None:
-                display += f" / {avail_packages} уп."
+            if is_packed:
+                display = (
+                    f"{(b.profile.name if b.profile_id else b.product)} — "
+                    f"{api_decimal_str(Decimal(str(b.length_per_piece or 0)))} м — "
+                    f"остаток: {avail_packages or '0'} уп."
+                )
+            else:
+                display = (
+                    f"{(b.profile.name if b.profile_id else b.product)} — "
+                    f"{api_decimal_str(Decimal(str(b.length_per_piece or 0)))} м — "
+                    f"остаток: {api_decimal_str(loose_available)} шт"
+                )
+                if avail_packages is not None:
+                    display += f" / {avail_packages} уп."
+            if is_packed and ppp > 0 and avail_packages is not None:
+                free_label = f'{avail_packages} уп.'
+            else:
+                free_label = f'{api_decimal_str(loose_available)} шт'
             warehouse_batches.append(
                 {
                     'id': b.pk,
                     'label': (
-                        f"#{b.pk} — {b.product} — свободно {api_decimal_str(available_qty)} шт — "
+                        f"#{b.pk} — {b.product} — свободно {free_label} — "
                         f"{quality_labels.get(b.quality, b.quality)} — "
                         f"{inventory_labels.get(b.inventory_form, b.inventory_form)}"
                     ),
                     'product': b.product,
-                    'available_quantity': api_decimal_str(available_qty),
-                    'available_pieces': api_decimal_str(available_qty),
+                    'available_quantity': api_decimal_str(loose_available),
+                    'available_pieces': api_decimal_str(loose_available),
                     'available_packages': avail_packages,
-                    'supports_pieces': True,
+                    'supports_pieces': not is_packed,
                     'supports_packages': bool(
                         b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
                     ),
@@ -1529,9 +1579,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         api_decimal_str(Decimal(str(b.length_per_piece)))
                         if b.length_per_piece is not None else None
                     ),
-                    'available_pieces': api_decimal_str(available_qty),
+                    'available_pieces': api_decimal_str(loose_available),
                     'available_packages': avail_packages,
-                    'supports_pieces': True,
+                    'supports_pieces': not is_packed,
                     'supports_packages': bool(
                         b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
                     ),

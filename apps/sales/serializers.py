@@ -1,5 +1,5 @@
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Optional
 
 from django.core.exceptions import ObjectDoesNotExist
@@ -12,7 +12,7 @@ from rest_framework.exceptions import ValidationError as DrfValidationError
 from config.api_numbers import api_decimal_str
 from config.fields import CleanDecimalField
 from apps.recipes.models import PlasticProfile, Recipe
-from apps.warehouse.models import WarehouseBatch
+from apps.warehouse.models import GpPackUnit, WarehouseBatch
 from apps.warehouse.packaging import q4
 from apps.warehouse.stock_ops import (
     PIECE_FROM_SEALED,
@@ -471,7 +471,7 @@ class OrderSerializer(serializers.ModelSerializer):
         raw = initial_data.get('order_lines')
         if raw in (None, ''):
             raw = initial_data.get('lines')
-        if (raw in (None, '')) and all(k in initial_data for k in ('profile', 'recipe', 'length', 'quantity')):
+        if (raw in (None, '')) and all(k in initial_data for k in ('profile', 'quantity')):
             raw = [
                 {
                     'profile': initial_data.get('profile'),
@@ -483,8 +483,8 @@ class OrderSerializer(serializers.ModelSerializer):
         if not isinstance(raw, list) or len(raw) < 1:
             self._raise_order_error('MISSING_ORDER_LINES', 'Поле order_lines обязательно и должно содержать строки.', field='order_lines')
 
-        errors = []
-        normalized = []
+        errors: list[dict] = []
+        parsed: list[dict] = []
         for idx, row in enumerate(raw):
             row = row or {}
             profile_id = row.get('profile') or row.get('profile_id')
@@ -494,34 +494,32 @@ class OrderSerializer(serializers.ModelSerializer):
             unit_type = (row.get('unit_type') or Sale.MODE_PIECES).strip().lower() if isinstance(row.get('unit_type', Sale.MODE_PIECES), str) else Sale.MODE_PIECES
             if unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
                 unit_type = Sale.MODE_PIECES
-            line_errors = []
+            line_errors: list[dict] = []
             if not profile_id:
                 line_errors.append({'field': f'order_lines[{idx}].profile', 'message': 'Поле profile обязательно.'})
-            if not recipe_id:
-                line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'Поле recipe обязательно.'})
-            if length_raw in (None, ''):
-                line_errors.append({'field': f'order_lines[{idx}].length', 'message': 'Поле length обязательно.'})
             if qty_raw in (None, ''):
                 line_errors.append({'field': f'order_lines[{idx}].quantity', 'message': 'Поле quantity обязательно.'})
-            profile_obj = None
-            recipe_obj = None
             length_d = None
-            qty_d = None
-            if not line_errors:
-                try:
-                    profile_obj = PlasticProfile.objects.get(pk=profile_id)
-                except PlasticProfile.DoesNotExist:
-                    line_errors.append({'field': f'order_lines[{idx}].profile', 'message': 'Профиль не найден.'})
-                try:
-                    recipe_obj = Recipe.objects.get(pk=recipe_id, is_active=True)
-                except Recipe.DoesNotExist:
-                    line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'Рецепт не найден или неактивен.'})
+            if length_raw not in (None, ''):
                 try:
                     length_d = Decimal(str(length_raw))
                     if length_d <= 0:
                         raise InvalidOperation()
                 except Exception:
                     line_errors.append({'field': f'order_lines[{idx}].length', 'message': 'length должно быть > 0.'})
+            profile_obj = None
+            recipe_obj = None
+            qty_d = None
+            if not line_errors:
+                try:
+                    profile_obj = PlasticProfile.objects.get(pk=profile_id)
+                except PlasticProfile.DoesNotExist:
+                    line_errors.append({'field': f'order_lines[{idx}].profile', 'message': 'Профиль не найден.'})
+                if recipe_id:
+                    try:
+                        recipe_obj = Recipe.objects.get(pk=recipe_id, is_active=True)
+                    except Recipe.DoesNotExist:
+                        line_errors.append({'field': f'order_lines[{idx}].recipe', 'message': 'Рецепт не найден или неактивен.'})
                 try:
                     qty_d = Decimal(str(qty_raw))
                     if qty_d <= 0:
@@ -533,28 +531,78 @@ class OrderSerializer(serializers.ModelSerializer):
             if line_errors:
                 errors.extend(line_errors)
                 continue
-            recipe_name = (recipe_obj.recipe or '').strip() or (recipe_obj.product or '')
-            normalized.append(
+            parsed.append(
                 {
-                    'product': (profile_obj.name or '').strip() or recipe_name,
-                    'profile': profile_obj,
-                    'ordered_quantity': qty_d,
-                    'unit_price': Decimal('0'),
-                    'comment': self._inject_order_line_meta(
-                        row.get('comment', ''),
-                        recipe_id=recipe_obj.id,
-                        recipe_name=recipe_name,
-                        length=length_d,
-                        unit_type=unit_type,
-                    ),
+                    'row': row,
+                    'profile_obj': profile_obj,
+                    'recipe_obj_explicit': recipe_obj,
+                    'recipe_id': recipe_id,
+                    'length_d': length_d,
+                    'qty_d': qty_d,
+                    'unit_type': unit_type,
                 },
             )
+
         if errors:
             raise serializers.ValidationError(
                 {
                     'code': 'ORDER_LINES_VALIDATION_ERROR',
                     'detail': 'Ошибка в строках корзины заявки.',
                     'errors': errors,
+                },
+            )
+
+        implicit_profile_ids: set[int] = set()
+        for p in parsed:
+            if not p['recipe_id'] and p['profile_obj'] is not None:
+                implicit_profile_ids.add(p['profile_obj'].id)
+
+        ambiguous_ids: list[int] = []
+        implicit_map: dict[int, Recipe | None] = {}
+        for pid in sorted(implicit_profile_ids):
+            recipes_two = list(Recipe.objects.filter(profile_id=pid, is_active=True).order_by('id')[:2])
+            if len(recipes_two) > 1:
+                ambiguous_ids.append(pid)
+            elif len(recipes_two) == 1:
+                implicit_map[pid] = recipes_two[0]
+            else:
+                implicit_map[pid] = None
+
+        if ambiguous_ids:
+            ids_str = ', '.join(str(i) for i in ambiguous_ids)
+            self._raise_order_error(
+                'AMBIGUOUS_RECIPE_FOR_PROFILE',
+                f'Несколько активных рецептов у профиля(ей): {ids_str}. Укажите recipe в строке заявки.',
+                field='order_lines',
+            )
+
+        normalized: list[dict] = []
+        for p in parsed:
+            profile_obj = p['profile_obj']
+            recipe_obj = p['recipe_obj_explicit']
+            if recipe_obj is None and profile_obj is not None:
+                recipe_obj = implicit_map.get(profile_obj.id)
+            recipe_name = (
+                (recipe_obj.recipe or '').strip() or (recipe_obj.product or '')
+                if recipe_obj is not None
+                else None
+            )
+            display_name = (profile_obj.name or '').strip() or (recipe_name or '') or f'#{profile_obj.id}'
+            normalized.append(
+                {
+                    'product': display_name,
+                    'profile': profile_obj,
+                    'ordered_quantity': p['qty_d'],
+                    'unit_price': Decimal('0'),
+                    'comment': self._inject_order_line_meta(
+                        p['row'].get('comment', ''),
+                        recipe_id=recipe_obj.id if recipe_obj is not None else None,
+                        recipe_name=recipe_name,
+                        length=p['length_d'],
+                        unit_type=p['unit_type'],
+                    ),
+                    '_recipe': recipe_obj,
+                    '_length': p['length_d'],
                 },
             )
         return normalized
@@ -643,6 +691,45 @@ class OrderSerializer(serializers.ModelSerializer):
         if raw.get('quantity') in (None, ''):
             return False
         return True
+
+    @staticmethod
+    def _parse_total_amount_input(initial: dict) -> Decimal | None:
+        if not hasattr(initial, 'get'):
+            return None
+        raw = initial.get('total_amount')
+        if raw in (None, ''):
+            return None
+        try:
+            return Decimal(str(raw)).quantize(Decimal('0.01'))
+        except (InvalidOperation, TypeError, ValueError):
+            raise serializers.ValidationError(
+                {
+                    'code': 'INVALID_TOTAL_AMOUNT',
+                    'message': 'total_amount должен быть числом.',
+                    'detail': 'total_amount должен быть числом.',
+                    'fields': [{'field': 'total_amount', 'message': 'total_amount должен быть числом.'}],
+                    'errors': [{'field': 'total_amount', 'message': 'total_amount должен быть числом.'}],
+                },
+            )
+
+    @staticmethod
+    def _apply_declared_total_to_normalized_lines(normalized: list[dict], declared_total: Decimal) -> None:
+        """Распределяет сумму заявки по unit_price строк (должна совпадать с order.total_amount)."""
+        declared_total = declared_total.quantize(Decimal('0.01'))
+        total_qty = sum(Decimal(str(row['ordered_quantity'])) for row in normalized)
+        if total_qty <= 0:
+            return
+        even = (declared_total / total_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        acc_line_totals = Decimal('0')
+        for i, row in enumerate(normalized):
+            qty = Decimal(str(row['ordered_quantity']))
+            if i < len(normalized) - 1:
+                line_total = (even * qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                acc_line_totals += line_total
+                row['unit_price'] = (line_total / qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if qty else Decimal('0')
+            else:
+                line_total = (declared_total - acc_line_totals).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                row['unit_price'] = (line_total / qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if qty else Decimal('0')
 
     @staticmethod
     def _parse_paid_amount_input(initial: dict) -> Decimal | None:
@@ -761,12 +848,10 @@ class OrderSerializer(serializers.ModelSerializer):
             has_legacy_any = any(k in idata for k in legacy_keys)
             if not has_explicit_lines and has_legacy_any:
                 profile = attrs.get('production_profile')
-                recipe = attrs.get('resolved_recipe')
                 if profile is None:
                     self._raise_order_error('MISSING_PROFILE', 'Поле profile обязательно.', field='profile')
-                if recipe is None:
-                    self._raise_order_error('MISSING_RECIPE', 'Поле recipe обязательно.', field='recipe')
-                if recipe and profile and recipe.profile_id != profile.id:
+                recipe = attrs.get('resolved_recipe')
+                if recipe is not None and profile is not None and recipe.profile_id != profile.id:
                     self._raise_order_error(
                         'RECIPE_PROFILE_MISMATCH',
                         'recipe не относится к выбранному profile.',
@@ -774,23 +859,31 @@ class OrderSerializer(serializers.ModelSerializer):
                     )
                 ln = attrs.get('production_length')
                 qt = attrs.get('production_quantity')
-                if ln in (None, ''):
-                    self._raise_order_error('INVALID_LENGTH', 'Поле length обязательно.', field='length')
                 if qt in (None, ''):
                     self._raise_order_error('INVALID_QUANTITY', 'Поле quantity обязательно.', field='quantity')
-                try:
-                    ln_d = Decimal(str(ln))
-                except Exception:
-                    self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
+                if ln not in (None, ''):
+                    try:
+                        ln_d = Decimal(str(ln))
+                    except Exception:
+                        self._raise_order_error('INVALID_LENGTH', 'Некорректная длина (length).', field='length')
+                    if ln_d <= 0:
+                        self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
                 try:
                     q_d = Decimal(str(qt))
                 except Exception:
                     self._raise_order_error('INVALID_QUANTITY', 'Некорректное количество (quantity).', field='quantity')
-                if ln_d <= 0:
-                    self._raise_order_error('INVALID_LENGTH', 'length должно быть > 0.', field='length')
                 if q_d <= 0:
                     self._raise_order_error('INVALID_QUANTITY', 'quantity должно быть > 0.', field='quantity')
             self._normalized_order_lines = self._normalize_cart_order_lines(idata)
+            declared_total = self._parse_total_amount_input(idata)
+            if declared_total is not None and declared_total < 0:
+                self._raise_order_error(
+                    'INVALID_TOTAL_AMOUNT',
+                    'total_amount не может быть отрицательным.',
+                    field='total_amount',
+                )
+            if declared_total is not None:
+                self._apply_declared_total_to_normalized_lines(self._normalized_order_lines, declared_total)
             total_amount = Decimal('0')
             for normalized in self._normalized_order_lines:
                 total_amount += (
@@ -917,12 +1010,43 @@ class OrderSerializer(serializers.ModelSerializer):
 
         with transaction.atomic():
             order = super().create(validated_data)
+            first_line_internal = None
             for line_data in lines_data:
                 if normalized_order_lines is not None:
-                    OrderLine.objects.create(order=order, **line_data)
+                    if first_line_internal is None:
+                        first_line_internal = line_data
+                    ld = {k: v for k, v in line_data.items() if not str(k).startswith('_')}
+                    OrderLine.objects.create(order=order, **ld)
                 else:
                     normalized = self._validate_order_line_payload(line_data)
                     OrderLine.objects.create(order=order, **normalized)
+            if first_line_internal is not None:
+                r = first_line_internal.get('_recipe')
+                prof = first_line_internal.get('profile')
+                ln_d = first_line_internal.get('_length')
+                qty_raw = first_line_internal.get('ordered_quantity')
+                uf = []
+                if prof is not None:
+                    order.production_profile = prof
+                    uf.append('production_profile')
+                if r is not None:
+                    order.resolved_recipe = r
+                    uf.append('resolved_recipe')
+                if ln_d is not None:
+                    order.production_length = ln_d
+                    uf.append('production_length')
+                if qty_raw is not None:
+                    order.production_quantity = int(qty_raw)
+                    uf.append('production_quantity')
+                if r is not None and prof is not None and ln_d is not None and qty_raw is not None:
+                    order.request_status = Order.REQUEST_STATUS_DRAFT
+                    order.request_total_meters = (
+                        Decimal(str(ln_d)) * Decimal(int(qty_raw))
+                    ).quantize(Decimal('0.0001'))
+                    order.resource_check_snapshot = {}
+                    uf.extend(['request_status', 'request_total_meters', 'resource_check_snapshot'])
+                if uf:
+                    order.save(update_fields=list(dict.fromkeys(uf)) + ['updated_at'])
             pay_type, pay_method, pay_amount = payment_input
             if pay_type in (self.PAYMENT_FULL, self.PAYMENT_PARTIAL):
                 req = self.context.get('request')
@@ -1001,17 +1125,31 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class ClientOrderProductionRequestSerializer(serializers.ModelSerializer):
-    """GET /api/production/requests/ — заявки в статусе ready (производство)."""
+    """GET /api/production/requests/ — заявки клиента (id = id в /api/orders/)."""
     client = serializers.SerializerMethodField()
     profile = serializers.SerializerMethodField()
     recipe = serializers.SerializerMethodField()
     length = serializers.SerializerMethodField()
     quantity = serializers.SerializerMethodField()
     total_meters = serializers.SerializerMethodField()
+    allowed_blank_ids = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
-        fields = ('id', 'client', 'profile', 'recipe', 'length', 'quantity', 'total_meters')
+        fields = (
+            'id',
+            'order_number',
+            'date',
+            'status',
+            'request_status',
+            'client',
+            'profile',
+            'recipe',
+            'length',
+            'quantity',
+            'total_meters',
+            'allowed_blank_ids',
+        )
 
     def get_client(self, obj):
         c = obj.client
@@ -1052,9 +1190,23 @@ class ClientOrderProductionRequestSerializer(serializers.ModelSerializer):
             )
         return None
 
+    def get_allowed_blank_ids(self, obj):
+        from django.db.models import Q
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAYMENT (Оплата)
+        from apps.workshop.models import WorkshopBlank
+
+        pid = obj.production_profile_id
+        if pid is None:
+            first = obj.lines.filter(profile_id__isnull=False).order_by('id').first()
+            pid = first.profile_id if first else None
+        if pid is None:
+            return []
+        return list(
+            WorkshopBlank.objects.filter(is_active=True)
+            .filter(Q(plastic_profile_id=pid) | Q(plastic_profile_id__isnull=True))
+            .order_by('id')
+            .values_list('id', flat=True)[:400],
+        )
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -1327,7 +1479,7 @@ class SaleLineSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'product', 'warehouse_batch', 'order_line',
             'stock_form', 'piece_pick', 'quantity', 'unit_price', 'line_total',
-            'cost', 'profit', 'defect_flag', 'comment', 'unit_type',
+            'cost', 'profit', 'defect_flag', 'comment', 'unit_type', 'gp_pack_unit',
         )
         read_only_fields = ('line_total', 'cost', 'profit')
         extra_kwargs = {
@@ -2156,11 +2308,61 @@ class SaleSerializer(serializers.ModelSerializer):
                     field='sale_lines',
                 )
             if line_unit_type == Sale.MODE_PACKAGES:
+                gp_pid = row_in.get('gp_package_id')
+                if gp_pid not in (None, ''):
+                    try:
+                        gp_int = int(gp_pid)
+                    except (TypeError, ValueError):
+                        self._raise_sale_line_error(
+                            'INVALID_GP_PACKAGE_ID',
+                            'gp_package_id должен быть целым числом.',
+                            line_idx=line_idx,
+                            field_name='gp_package_id',
+                        )
+                    gp_unit_obj = (
+                        GpPackUnit.objects.select_related('warehouse_batch', 'operation')
+                        .filter(pk=gp_int)
+                        .first()
+                    )
+                    if gp_unit_obj is None:
+                        self._raise_sale_line_error(
+                            'GP_PACKAGE_NOT_FOUND',
+                            'Упаковка gp_package_id не найдена.',
+                            line_idx=line_idx,
+                            field_name='gp_package_id',
+                        )
+                    if not gp_unit_obj.warehouse_batch_id:
+                        self._raise_sale_line_error(
+                            'GP_PACKAGE_NOT_ON_STOCK',
+                            'Упаковка GP не привязана к партии склада.',
+                            line_idx=line_idx,
+                            field_name='gp_package_id',
+                        )
+                    wb_id_in = row_in.get('warehouse_batch')
+                    if wb_id_in not in (None, ''):
+                        try:
+                            if int(wb_id_in) != int(gp_unit_obj.warehouse_batch_id):
+                                self._raise_sale_line_error(
+                                    'WAREHOUSE_BATCH_GP_MISMATCH',
+                                    'warehouse_batch не совпадает с партией выбранной упаковки gp_package_id.',
+                                    line_idx=line_idx,
+                                    field_name='warehouse_batch',
+                                )
+                        except (TypeError, ValueError):
+                            self._raise_sale_line_error(
+                                'INVALID_WAREHOUSE_BATCH',
+                                'Некорректный warehouse_batch.',
+                                line_idx=line_idx,
+                                field_name='warehouse_batch',
+                            )
+                    row_in['warehouse_batch'] = gp_unit_obj.warehouse_batch_id
+                    row_in['gp_pack_unit'] = gp_unit_obj
+
                 wb_id = row_in.get('warehouse_batch')
                 if wb_id in (None, ''):
                     self._raise_sale_error(
                         'MISSING_WAREHOUSE_BATCH',
-                        'Для unit_type=packages в строке обязателен warehouse_batch.',
+                        'Для unit_type=packages в строке обязателен warehouse_batch или gp_package_id.',
                         field='sale_lines',
                     )
                 try:
@@ -2327,10 +2529,16 @@ class SaleSerializer(serializers.ModelSerializer):
                 sld.pop('_input_quantity', None)
                 sld.pop('_line_unit_type', None)
                 sld.pop('unit_type', None)
+                sld.pop('gp_package_id', None)
                 sld['cost'] = Decimal('0')
                 sld['profit'] = Decimal(str(sld['line_total'] or 0))
-                sld['sale'] = instance
-                SaleLine.objects.create(**sld)
+                allowed_sl = {
+                    'product', 'warehouse_batch', 'order_line', 'stock_form', 'piece_pick',
+                    'quantity', 'unit_price', 'line_total', 'cost', 'profit', 'defect_flag', 'comment', 'gp_pack_unit',
+                }
+                create_kwargs = {k: sld[k] for k in allowed_sl if k in sld}
+                create_kwargs['sale'] = instance
+                SaleLine.objects.create(**create_kwargs)
             instance = Sale.objects.select_for_update().get(pk=instance.pk)
             if not instance.sale_lines.exists():
                 raise serializers.ValidationError(

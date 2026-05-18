@@ -41,6 +41,7 @@ class OrdersApiContractTests(APITestCase):
             'recipe': self.recipe.pk,
             'length': '6',
             'quantity': 10,
+            'total_amount': '1000',
             'payment_type': 'partial',
             'payment_method': 'cash',
             'paid_amount': '100',
@@ -84,12 +85,49 @@ class OrdersApiContractTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(resp.data.get('code'), 'MISSING_PROFILE')
 
-    def test_create_fails_without_recipe(self):
+    def test_create_success_without_recipe_when_profile_has_no_recipe(self):
+        bare = PlasticProfile.objects.create(name='Без рецепта', code='P-NOREC', is_active=True)
+        payload = {
+            'client': self.active_client.pk,
+            'date': '2026-04-26',
+            'order_lines': [{'profile': bare.pk, 'quantity': 5}],
+            'payment_type': 'full',
+            'payment_method': 'cash',
+            'total_amount': '500',
+            'paid_amount': '500',
+        }
+        resp = self.client.post('/api/orders/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(resp.data.get('recipe_id'))
+        lines = resp.data.get('order_lines') or []
+        self.assertTrue(lines)
+        self.assertIsNone(lines[0].get('recipe_id'))
+
+    def test_create_fails_ambiguous_recipe_for_profile(self):
+        Recipe.objects.create(recipe='Второй рецепт', profile=self.profile, is_active=True)
         payload = self._order_payload()
         payload.pop('recipe')
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(resp.data.get('code'), 'MISSING_RECIPE')
+        self.assertEqual(resp.data.get('code'), 'AMBIGUOUS_RECIPE_FOR_PROFILE')
+
+    def test_create_ambiguous_same_profile_two_lines_single_error(self):
+        Recipe.objects.create(recipe='Второй рецепт', profile=self.profile, is_active=True)
+        payload = {
+            'client': self.active_client.pk,
+            'date': '2026-04-30',
+            'order_lines': [
+                {'profile': self.profile.pk, 'quantity': 2},
+                {'profile': self.profile.pk, 'quantity': 3},
+            ],
+            'payment_type': 'full',
+            'payment_method': 'cash',
+            'total_amount': '100',
+            'paid_amount': '100',
+        }
+        resp = self.client.post('/api/orders/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.data.get('code'), 'AMBIGUOUS_RECIPE_FOR_PROFILE')
 
     def test_create_fails_recipe_profile_mismatch(self):
         other_profile = PlasticProfile.objects.create(name='Профиль 80', code='P-80', is_active=True)
@@ -118,9 +156,10 @@ class OrdersApiContractTests(APITestCase):
         payload['payment_type'] = 'debt'
         payload['paid_amount'] = '0'
         payload['payment_method'] = ''
+        payload['total_amount'] = '100'
         resp = self.client.post('/api/orders/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(resp.data.get('payment_type'), 'full')
+        self.assertEqual(resp.data.get('payment_type'), 'debt')
 
     def test_create_success_with_one_line(self):
         resp = self.client.post('/api/orders/', data=self._order_payload(), format='json')
@@ -135,11 +174,12 @@ class OrdersApiContractTests(APITestCase):
             'client': self.active_client.pk,
             'date': '2026-04-30',
             'order_lines': [
-                {'profile': self.profile.pk, 'recipe': self.recipe.pk, 'length': '6', 'quantity': 12},
-                {'profile': p2.pk, 'recipe': r2.pk, 'length': '3', 'quantity': 7},
+                {'profile': self.profile.pk, 'quantity': 12},
+                {'profile': p2.pk, 'quantity': 7},
             ],
             'payment_type': 'partial',
             'payment_method': 'cash',
+            'total_amount': '50000',
             'paid_amount': '1000',
         }
         resp = self.client.post('/api/orders/', data=payload, format='json')
@@ -147,6 +187,14 @@ class OrdersApiContractTests(APITestCase):
         self.assertEqual(len(resp.data.get('order_lines') or []), 2)
         self.assertIn('total_quantity', resp.data)
         self.assertIn('total_meters', resp.data)
+        self.assertEqual(resp.data.get('recipe_id'), self.recipe.pk)
+
+    def test_create_success_without_recipe_legacy_single_line(self):
+        payload = self._order_payload()
+        payload.pop('recipe')
+        resp = self.client.post('/api/orders/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.data.get('recipe_id'), self.recipe.pk)
 
     def test_retrieve_returns_stable_order_lines_shape(self):
         payload = self._order_payload()

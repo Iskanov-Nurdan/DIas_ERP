@@ -64,7 +64,18 @@ def reverse_production_batch_stock(
 
 
 @transaction.atomic
-def apply_production_batch_stock_and_cost(batch: ProductionBatch) -> None:
+def apply_production_batch_stock_and_cost(batch: ProductionBatch, *, skip_recipe_consumption: bool = False) -> None:
+    if skip_recipe_consumption or getattr(batch, 'workshop_blank_id', None):
+        batch.material_cost_total = Decimal('0')
+        batch.cost_price = Decimal('0')
+        batch.cost_per_meter = Decimal('0')
+        batch.cost_per_piece = Decimal('0')
+        batch.save(
+            update_fields=[
+                'material_cost_total', 'total_meters', 'quantity', 'cost_per_meter', 'cost_per_piece', 'cost_price',
+            ],
+        )
+        return
     if not batch.recipe_id:
         raise DRFValidationError({'recipe_id': 'У партии должен быть рецепт'})
     recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)
@@ -175,11 +186,8 @@ def assert_production_batch_ready_for_otk_pipeline(batch: ProductionBatch) -> No
     """
     Партия должна иметь рецепт с компонентами, положительный выпуск и (при ненулевой норме расхода)
     ненулевую material_cost_total после apply_production_batch_stock_and_cost.
+    Партия с заготовкой цеха без рецепта допускается (FIFO по рецепту не выполнялся).
     """
-    if not batch.recipe_id:
-        raise DRFValidationError(
-            {'code': 'BATCH_INCOMPLETE', 'detail': 'У партии нет рецепта', 'error': 'У партии нет рецепта'},
-        )
     tm = _q(batch.total_meters)
     if tm <= 0:
         raise DRFValidationError(
@@ -188,6 +196,32 @@ def assert_production_batch_ready_for_otk_pipeline(batch: ProductionBatch) -> No
                 'detail': 'Выпуск партии (total_meters) должен быть > 0',
                 'error': 'Выпуск партии (total_meters) должен быть > 0',
             },
+        )
+    if getattr(batch, 'workshop_blank_id', None):
+        if not batch.recipe_id:
+            return
+        try:
+            recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)
+        except Recipe.DoesNotExist:
+            raise DRFValidationError(
+                {
+                    'code': 'BATCH_INCOMPLETE',
+                    'detail': 'Рецепт партии удалён из справочника — ОТК недоступен',
+                    'error': 'Рецепт партии удалён из справочника — ОТК недоступен',
+                },
+            )
+        if not recipe.components.exists():
+            raise DRFValidationError(
+                {
+                    'code': 'INVALID_RECIPE',
+                    'detail': 'Рецепт без компонентов — партия не может идти в ОТК',
+                    'error': 'Рецепт без компонентов — партия не может идти в ОТК',
+                },
+            )
+        return
+    if not batch.recipe_id:
+        raise DRFValidationError(
+            {'code': 'BATCH_INCOMPLETE', 'detail': 'У партии нет рецепта', 'error': 'У партии нет рецепта'},
         )
     try:
         recipe = Recipe.objects.prefetch_related('components').get(pk=batch.recipe_id)

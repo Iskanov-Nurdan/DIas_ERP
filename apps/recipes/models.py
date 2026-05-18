@@ -6,6 +6,13 @@ class PlasticProfile(models.Model):
 
     name = models.CharField('Наименование', max_length=255)
     code = models.CharField('Код', max_length=100)
+    weight_kg_per_piece = models.DecimalField(
+        'Вес одной штуки, кг',
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
     comment = models.TextField('Комментарий', blank=True, default='')
     is_active = models.BooleanField('Активен', default=True)
 

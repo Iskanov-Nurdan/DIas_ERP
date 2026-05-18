@@ -4,7 +4,8 @@ from datetime import date
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view, inline_serializer
+from rest_framework import serializers as drf_serializers
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, ValidationError as DRFValidationError
@@ -1800,7 +1801,9 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
 class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewSet):
     """
-    GET /api/production/requests/ — заявки клиента в статусе ready (к производству).
+    GET /api/production/requests/ — заявки клиента к производству (тот же id, что /api/orders/{id}/).
+    Список не ограничиваем ready/складом: всё с клиентом, кроме уже в производстве, отклонённых
+    производством и коммерчески закрытых/отменённых.
     POST /api/production/requests/{id}/start/ — создание партии, FIFO сырьё/химия, заявка → in_production.
     """
     permission_classes = [IsAdminOrHasProductionOrOtk]
@@ -1814,34 +1817,58 @@ class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewS
     required_access_key = 'batches'
 
     def get_queryset(self):
+        excluded_request = (
+            ClientOrder.REQUEST_STATUS_IN_PRODUCTION,
+            ClientOrder.REQUEST_STATUS_REJECTED,
+        )
+        excluded_commercial = (
+            ClientOrder.STATUS_CANCELED,
+            ClientOrder.STATUS_CLOSED,
+        )
         return (
-            ClientOrder.objects.filter(
-                request_status=ClientOrder.REQUEST_STATUS_READY,
-            )
+            ClientOrder.objects.filter(client_id__isnull=False)
+            .exclude(request_status__in=excluded_request)
+            .exclude(status__in=excluded_commercial)
             .select_related('client', 'production_profile', 'resolved_recipe')
             .order_by('-date', '-id')
         )
 
+    @extend_schema(
+        summary='Старт производства по заявке',
+        description='Тело: { "blank": id } — заготовка цеха; линия выбирается по открытой смене пользователя.',
+        request=inline_serializer(
+            name='ProductionRequestStartBody',
+            fields={
+                'blank': drf_serializers.IntegerField(help_text='ID WorkshopBlank (GET /api/workshop/blanks/)'),
+            },
+        ),
+    )
     @action(detail=True, methods=['post'], url_path='start')
     def start(self, request, pk=None):
         from .client_order_start import start_production_for_client_order
 
         raw = getattr(request, 'data', None) or {}
-        line_id = raw.get('line') if isinstance(raw, dict) else None
-        if line_id is None or str(line_id).strip() == '':
-            return _err('MISSING_LINE', 'Укажите line (id линии) в теле.', http_status=400)
+        if not isinstance(raw, dict):
+            raw = {}
+        line_id = raw.get('line')
+        blank_id = raw.get('blank')
+        if blank_id is None or str(blank_id).strip() == '':
+            if line_id not in (None, '') and str(line_id).strip() != '':
+                return _err(
+                    'MISSING_BLANK',
+                    'Укажите blank (id заготовки цеха). Передача только line больше не поддерживается.',
+                    http_status=400,
+                )
+            return _err('MISSING_BLANK', 'Укажите blank: { "blank": <int> }', http_status=400)
         try:
-            line_pk = int(line_id)
+            blank_pk = int(blank_id)
         except (TypeError, ValueError):
-            return _err('INVALID_LINE', 'line должен быть числом.', http_status=400)
-        line = Line.objects.filter(pk=line_pk).first()
-        if line is None:
-            return _err('LINE_NOT_FOUND', 'Линия не найдена.', http_status=404)
+            return _err('INVALID_BLANK', 'blank должен быть числом.', http_status=400)
         try:
             batch = start_production_for_client_order(
                 user=request.user,
-                line=line,
                 client_order_id=int(pk),
+                workshop_blank_id=blank_pk,
             )
         except DRFValidationError as exc:
             return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)

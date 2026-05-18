@@ -186,6 +186,14 @@ class ProductionBatch(models.Model):
         related_name='production_batches',
         verbose_name='Заявка клиента',
     )
+    workshop_blank = models.ForeignKey(
+        'workshop.WorkshopBlank',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='production_batches',
+        verbose_name='Заготовка цеха',
+    )
     profile = models.ForeignKey(
         'recipes.PlasticProfile',
         on_delete=models.PROTECT,
