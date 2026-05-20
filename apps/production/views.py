@@ -20,7 +20,7 @@ from config.openapi_common import DiasErrorSerializer, paginated_inline
 from apps.sales.models import Order as ClientOrder
 from apps.sales.serializers import ClientOrderProductionRequestSerializer
 from config.permissions import CanAccessShiftComplaints, IsAdminOrHasAccess, IsAdminOrHasProductionOrOtk
-from config.pagination import StandardResultsSetPagination
+from config.pagination import StandardResultsSetPagination, WarehouseResultsSetPagination
 from .shift_state import (
     line_current_shift_open_event,
     line_current_shift_params_event,
@@ -194,6 +194,7 @@ def _body_for_line_shift_close(line, request_data):
 class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Line.objects.all()
     serializer_class = LineSerializer
+    pagination_class = WarehouseResultsSetPagination
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'lines'
     activity_section = 'Линии'

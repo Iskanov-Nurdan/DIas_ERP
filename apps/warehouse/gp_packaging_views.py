@@ -1,7 +1,10 @@
 """API: остаток неупакованного ГП, журнал упаковок (по физ. единице), создание операции (FIFO)."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 from django.db import models
+from django.db.models import Prefetch
 from rest_framework import mixins, status, viewsets
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.filters import OrderingFilter
@@ -12,8 +15,10 @@ from apps.realtime.broadcast import schedule_push
 from config.pagination import WarehouseResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 
+from apps.sales.models import SaleLine
+
 from .gp_packaging_service import balance_group_detail, build_gp_unpacked_balance, create_gp_pack_operation
-from .models import GpPackOperation, GpPackUnit
+from .models import GpPackOperation, GpPackUnit, WarehouseBatch
 from .serializers import GpPackageCreateSerializer, GpPackageJournalSerializer, GpPackOperationDetailSerializer
 
 
@@ -23,7 +28,7 @@ def _kg_json(d: Decimal) -> float:
 
 def _serialize_balance_line(ln):
     rid = int(ln.run_id)
-    return {
+    row = {
         'run_id': rid,
         'blank_production_run_id': rid,
         'product_name': ln.product_name,
@@ -34,6 +39,10 @@ def _serialize_balance_line(ln):
         'unpacked_pieces': int(ln.unpacked_pieces),
         'unpacked_kg': _kg_json(ln.unpacked_kg),
     }
+    if getattr(ln, 'sold_pieces', 0):
+        row['sold_pieces'] = int(ln.sold_pieces)
+        row['sold_kg'] = _kg_json(getattr(ln, 'sold_kg', Decimal('0')))
+    return row
 
 
 def _serialize_balance_group(g):
@@ -103,13 +112,28 @@ class GpPackageViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.
     http_method_names = ['get', 'post', 'head', 'options']
 
     def get_queryset(self):
-        return (
+        status_filter = (self.request.query_params.get('status') or 'available').strip().lower()
+        qs = (
             GpPackUnit.objects.select_related(
                 'operation', 'operation__product', 'operation__blank', 'warehouse_batch',
             )
-            .prefetch_related('operation__run_allocations')
+            .prefetch_related(
+                'operation__run_allocations',
+                Prefetch(
+                    'sale_lines',
+                    queryset=SaleLine.objects.select_related('sale').order_by('-sale__date', '-sale__id'),
+                ),
+            )
+            .filter(warehouse_batch__quality=WarehouseBatch.QUALITY_GOOD)
             .annotate(created_at=models.F('operation__created_at'))
         )
+        if status_filter == 'sold':
+            qs = qs.filter(warehouse_batch__status=WarehouseBatch.STATUS_SHIPPED)
+        elif status_filter == 'all':
+            pass
+        else:
+            qs = qs.filter(warehouse_batch__status=WarehouseBatch.STATUS_AVAILABLE)
+        return qs
 
     def get_serializer_class(self):
         if self.action == 'create':

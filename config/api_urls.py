@@ -23,6 +23,7 @@ from apps.production.views import (
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
 )
 from apps.warehouse.gp_packaging_views import GpPackageViewSet, GpUnpackedBalanceView
+from apps.warehouse.operations_views import WarehouseOperationsView
 from apps.warehouse.views import WarehouseBatchViewSet
 from apps.sales.views import (
     ClientViewSet,
@@ -38,13 +39,16 @@ from apps.sales.views import (
     SaleViewSet,
 )
 from apps.otk.views import OtkPendingView
+from apps.analytics.other_expenses_views import AnalyticsOtherExpenseViewSet
 from apps.analytics.views import (
     AnalyticsSummaryView,
     AnalyticsRevenueDetailsView,
     AnalyticsSalesCostDetailsView,
+    AnalyticsProductUnitCostsView,
     AnalyticsProductionCostDetailsView,
     AnalyticsPurchaseDetailsView,
     AnalyticsProfitDetailsView,
+    AnalyticsDebtDetailsView,
     AnalyticsOtkDetailsView,
     AnalyticsWriteoffDetailsView,
     AnalyticsDefectView,
@@ -91,12 +95,23 @@ router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')
 router.register(r'analytics/sales-cost-details', AnalyticsSalesCostDetailsView, basename='analytics-sales-cost-details')
 router.register(
+    r'analytics/product-unit-costs',
+    AnalyticsProductUnitCostsView,
+    basename='analytics-product-unit-costs',
+)
+router.register(
+    r'analytics/other-expenses',
+    AnalyticsOtherExpenseViewSet,
+    basename='analytics-other-expense',
+)
+router.register(
     r'analytics/production-cost-details',
     AnalyticsProductionCostDetailsView,
     basename='analytics-production-cost-details',
 )
 router.register(r'analytics/purchase-details', AnalyticsPurchaseDetailsView, basename='analytics-purchase-details')
 router.register(r'analytics/profit-details', AnalyticsProfitDetailsView, basename='analytics-profit-details')
+router.register(r'analytics/debt-details', AnalyticsDebtDetailsView, basename='analytics-debt-details')
 router.register(r'analytics/otk-details', AnalyticsOtkDetailsView, basename='analytics-otk-details')
 router.register(r'analytics/writeoff-details', AnalyticsWriteoffDetailsView, basename='analytics-writeoff-details')
 router.register(r'analytics/defect-analytics', AnalyticsDefectView, basename='analytics-defect')
@@ -119,6 +134,7 @@ router.register(
 # Фиксированные пути регистрируются ДО роутера, чтобы не конфликтовать с <pk>
 urlpatterns = [
     path('warehouse/gp-unpacked-balance/', GpUnpackedBalanceView.as_view(), name='warehouse-gp-unpacked-balance'),
+    path('warehouse/operations/', WarehouseOperationsView.as_view(), name='warehouse-operations'),
     path(
         'shifts/complaints/',
         ShiftComplaintViewSet.as_view({'get': 'list', 'post': 'create'}),

@@ -324,6 +324,11 @@ class GpPackageJournalSerializer(serializers.ModelSerializer):
     total_kg = serializers.SerializerMethodField()
     total_weight_kg = serializers.SerializerMethodField()
     warehouse_batch_id = serializers.IntegerField(read_only=True, allow_null=True)
+    status = serializers.SerializerMethodField()
+    is_sold = serializers.SerializerMethodField()
+    sold_at = serializers.SerializerMethodField()
+    sold_sale_id = serializers.SerializerMethodField()
+    warehouse_batch_status = serializers.SerializerMethodField()
 
     class Meta:
         model = GpPackUnit
@@ -340,7 +345,47 @@ class GpPackageJournalSerializer(serializers.ModelSerializer):
             'total_kg',
             'total_weight_kg',
             'warehouse_batch_id',
+            'status',
+            'is_sold',
+            'sold_at',
+            'sold_sale_id',
+            'warehouse_batch_status',
         )
+
+    def _sale_line_for_unit(self, obj):
+        lines = list(obj.sale_lines.all())
+        return lines[0] if lines else None
+
+    def get_status(self, obj):
+        wb = obj.warehouse_batch
+        if wb and wb.status == WarehouseBatch.STATUS_SHIPPED:
+            return 'sold'
+        return 'available'
+
+    def get_is_sold(self, obj):
+        return self.get_status(obj) == 'sold'
+
+    def get_warehouse_batch_status(self, obj):
+        wb = obj.warehouse_batch
+        return wb.status if wb else ''
+
+    def get_sold_sale_id(self, obj):
+        sl = self._sale_line_for_unit(obj)
+        return sl.sale_id if sl else None
+
+    def get_sold_at(self, obj):
+        sl = self._sale_line_for_unit(obj)
+        if not sl:
+            return None
+        sale = sl.sale
+        dt = sale.updated_at or sale.created_at
+        if dt is None:
+            return None
+        from django.utils import timezone as tz
+
+        if tz.is_naive(dt):
+            dt = tz.make_aware(dt, tz.get_current_timezone())
+        return dt.astimezone(tz.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
     def get_product_name(self, obj):
         op = obj.operation

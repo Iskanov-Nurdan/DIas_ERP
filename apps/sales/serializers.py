@@ -1472,14 +1472,16 @@ class PaymentSerializer(serializers.ModelSerializer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SaleLineSerializer(serializers.ModelSerializer):
-    unit_type = serializers.CharField(required=False, allow_blank=False, write_only=True)
+    unit_type = serializers.CharField(required=False, allow_blank=False)
+    warehouse_batch_id = serializers.IntegerField(read_only=True, allow_null=True)
+    gp_package_id = serializers.IntegerField(source='gp_pack_unit_id', read_only=True, allow_null=True)
 
     class Meta:
         model = SaleLine
         fields = (
-            'id', 'product', 'warehouse_batch', 'order_line',
+            'id', 'product', 'warehouse_batch', 'warehouse_batch_id', 'order_line',
             'stock_form', 'piece_pick', 'quantity', 'unit_price', 'line_total',
-            'cost', 'profit', 'defect_flag', 'comment', 'unit_type', 'gp_pack_unit',
+            'cost', 'profit', 'defect_flag', 'comment', 'unit_type', 'gp_pack_unit', 'gp_package_id',
         )
         read_only_fields = ('line_total', 'cost', 'profit')
         extra_kwargs = {
@@ -1492,7 +1494,23 @@ class SaleLineSerializer(serializers.ModelSerializer):
         for k in ('quantity', 'unit_price', 'line_total', 'cost', 'profit'):
             if ret.get(k) is not None:
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
+        if not ret.get('unit_type'):
+            ret['unit_type'] = self._derive_unit_type(instance)
         return ret
+
+    @staticmethod
+    def _derive_unit_type(line: SaleLine) -> str:
+        from apps.warehouse.models import WarehouseBatch
+
+        if line.gp_pack_unit_id:
+            return Sale.MODE_PACKAGES
+        wb = line.warehouse_batch
+        if wb and wb.inventory_form == WarehouseBatch.INVENTORY_PACKED and wb.pieces_per_package:
+            ppp = Decimal(str(wb.pieces_per_package))
+            qty = Decimal(str(line.quantity or 0))
+            if ppp > 0 and qty > 0 and qty % ppp == 0 and line.piece_pick == 'from_sealed_package':
+                return Sale.MODE_PACKAGES
+        return Sale.MODE_PIECES
 
 
 class SaleSerializer(serializers.ModelSerializer):
@@ -1649,6 +1667,8 @@ class SaleSerializer(serializers.ModelSerializer):
             unit_type = d.get('unit_type')
             if unit_type not in (None, ''):
                 d['sale_mode'] = unit_type
+            if d.get('client') in (None, '') and d.get('client_id') not in (None, ''):
+                d['client'] = d.get('client_id')
             return super().to_internal_value(d)
         return super().to_internal_value(data)
 
@@ -1677,8 +1697,16 @@ class SaleSerializer(serializers.ModelSerializer):
         pmethod = (initial.get('payment_method') or '').strip().lower() if hasattr(initial, 'get') else ''
         paid_input = self._parse_paid_amount_input(initial)
 
-        if not ptype and not pmethod and paid_input is None:
-            return None, None, Decimal('0')
+        if not ptype:
+            if paid_input is None and not pmethod:
+                return None, None, Decimal('0')
+            if paid_input is not None and paid_input > 0:
+                ptype = self.PAYMENT_PARTIAL
+            else:
+                ptype = self.PAYMENT_DEBT
+                paid_input = None
+        if not pmethod:
+            pmethod = 'cash'
         if ptype not in self.PAYMENT_KIND_CHOICES:
             self._raise_sale_error(
                 'INVALID_PAYMENT_TYPE',
@@ -2391,12 +2419,21 @@ class SaleSerializer(serializers.ModelSerializer):
                         field='sale_lines',
                     )
                 row_in['quantity'] = (input_qty * ppp).quantize(Decimal('0.0001'))
+                row_in['stock_form'] = WarehouseBatch.INVENTORY_PACKED
                 row_in.setdefault('piece_pick', PIECE_FROM_SEALED)
             else:
                 if row_in.get('warehouse_batch') not in (None, ''):
                     try:
                         wb_pcs = WarehouseBatch.objects.get(pk=row_in.get('warehouse_batch'))
-                        if wb_pcs.inventory_form == WarehouseBatch.INVENTORY_PACKED and not row_in.get('piece_pick'):
+                        inv = wb_pcs.inventory_form
+                        if inv == WarehouseBatch.INVENTORY_UNPACKED:
+                            row_in['stock_form'] = WarehouseBatch.INVENTORY_UNPACKED
+                            row_in.setdefault('piece_pick', PIECE_LOOSE)
+                        elif inv == WarehouseBatch.INVENTORY_OPEN_PACKAGE:
+                            row_in['stock_form'] = WarehouseBatch.INVENTORY_OPEN_PACKAGE
+                            row_in.setdefault('piece_pick', PIECE_FROM_OPEN)
+                        elif inv == WarehouseBatch.INVENTORY_PACKED and not row_in.get('piece_pick'):
+                            row_in['stock_form'] = WarehouseBatch.INVENTORY_PACKED
                             row_in['piece_pick'] = PIECE_FROM_SEALED
                     except WarehouseBatch.DoesNotExist:
                         pass
@@ -2512,7 +2549,7 @@ class SaleSerializer(serializers.ModelSerializer):
             validated_data['date'] = timezone.now().date()
 
         validated_data['stock_quality'] = WarehouseBatch.QUALITY_GOOD
-        from .sale_warehouse import apply_warehouse_for_sale
+        from .sale_warehouse import apply_warehouse_for_sale, sale_requires_warehouse_apply
         from .reservations import auto_fulfill_sale_lines_after_shipping
         from .state_machine import validate_sale_ship
         sale_model_fields = {f.name for f in Sale._meta.concrete_fields}
@@ -2549,10 +2586,15 @@ class SaleSerializer(serializers.ModelSerializer):
             except ValueError as e:
                 raise serializers.ValidationError({'non_field_errors': [str(e)]})
             try:
-                apply_warehouse_for_sale(instance)
+                applied = apply_warehouse_for_sale(instance)
             except (ValueError, DrfValidationError) as e:
                 msg = getattr(e, 'detail', e) if isinstance(e, DrfValidationError) else str(e)
                 raise serializers.ValidationError({'non_field_errors': [str(msg)]})
+            if sale_requires_warehouse_apply(instance) and not applied:
+                self._raise_sale_error(
+                    'WAREHOUSE_NOT_APPLIED',
+                    'Не удалось списать склад по строкам продажи.',
+                )
             if linked_order is not None:
                 auto_fulfill_sale_lines_after_shipping(
                     sale=instance,
@@ -2603,7 +2645,7 @@ class SaleSerializer(serializers.ModelSerializer):
 
         request = self.context.get('request')
         user = getattr(request, 'user', None)
-        from .sale_warehouse import apply_warehouse_for_sale
+        from .sale_warehouse import apply_warehouse_for_sale, sale_requires_warehouse_apply
         from .reservations import auto_fulfill_sale_lines_after_shipping
         from .state_machine import validate_sale_ship
         with transaction.atomic():

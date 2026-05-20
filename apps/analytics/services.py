@@ -309,13 +309,25 @@ def sale_scope_q(scope: AnalyticsScope) -> Q:
     if scope.client_id:
         q &= Q(client_id=scope.client_id)
     if scope.line_id:
-        q &= Q(warehouse_batch__source_batch__line_id=scope.line_id)
+        q &= (
+            Q(warehouse_batch__source_batch__line_id=scope.line_id)
+            | Q(sale_lines__warehouse_batch__source_batch__line_id=scope.line_id)
+        )
     if scope.profile_id:
-        q &= Q(warehouse_batch__profile_id=scope.profile_id)
+        q &= (
+            Q(warehouse_batch__profile_id=scope.profile_id)
+            | Q(sale_lines__warehouse_batch__profile_id=scope.profile_id)
+        )
     if scope.recipe_id:
-        q &= Q(warehouse_batch__source_batch__recipe_id=scope.recipe_id)
+        q &= (
+            Q(warehouse_batch__source_batch__recipe_id=scope.recipe_id)
+            | Q(sale_lines__warehouse_batch__source_batch__recipe_id=scope.recipe_id)
+        )
     if scope.batch_id:
-        q &= Q(warehouse_batch__source_batch_id=scope.batch_id)
+        q &= (
+            Q(warehouse_batch__source_batch_id=scope.batch_id)
+            | Q(sale_lines__warehouse_batch__source_batch_id=scope.batch_id)
+        )
     return q
 
 

@@ -14,7 +14,9 @@ from apps.materials.models import MaterialStockDeduction
 from .services import parse_analytics_scope, parse_period, _parse_iso_date, _parse_int_param, _qp_first
 from .reporting import (
     build_analytics_summary,
+    build_debt_details,
     build_otk_details,
+    build_product_unit_costs,
     build_production_cost_details,
     build_profit_details,
     build_purchase_details,
@@ -22,23 +24,14 @@ from .reporting import (
     build_sales_cost_details,
 )
 
-_ANALYTICS_SCOPE_PARAMS = [
+_ANALYTICS_UI_SCOPE_PARAMS = [
     OpenApiParameter('year', int, required=False, description='Год (если нет date_from/date_to — по умолчанию текущий).'),
     OpenApiParameter('month', int, required=False, description='Месяц 1–12 или пусто = весь год.'),
     OpenApiParameter('day', int, required=False, description='День или пусто = весь месяц/год.'),
     OpenApiParameter('date_from', str, required=False, description='Начало периода YYYY-MM-DD.'),
     OpenApiParameter('date_to', str, required=False, description='Конец периода YYYY-MM-DD.'),
-    OpenApiParameter('line_id', int, required=False, description='Линия производства (партия / продажа через склад).'),
-    OpenApiParameter('client_id', int, required=False),
-    OpenApiParameter('profile_id', int, required=False),
-    OpenApiParameter('recipe_id', int, required=False),
-    OpenApiParameter('batch_id', int, required=False, description='Партия производства (production batch id).'),
-    OpenApiParameter(
-        'otk_status',
-        str,
-        required=False,
-        description='Статус ОТК партии производства: pending | accepted | rejected.',
-    ),
+    OpenApiParameter('line_id', int, required=False, description='Линия производства.'),
+    OpenApiParameter('client_id', int, required=False, description='Клиент.'),
     OpenApiParameter(
         'trend_group',
         str,
@@ -47,17 +40,30 @@ _ANALYTICS_SCOPE_PARAMS = [
     ),
 ]
 
+_ANALYTICS_SCOPE_PARAMS = [
+    *_ANALYTICS_UI_SCOPE_PARAMS,
+    OpenApiParameter('profile_id', int, required=False, description='(расширенные отчёты)'),
+    OpenApiParameter('recipe_id', int, required=False, description='(расширенные отчёты)'),
+    OpenApiParameter('batch_id', int, required=False, description='(расширенные отчёты)'),
+    OpenApiParameter(
+        'otk_status',
+        str,
+        required=False,
+        description='(расширенные отчёты) pending | accepted | rejected.',
+    ),
+]
+
 @extend_schema_view(
     list=extend_schema(
         tags=['analytics'],
-        summary='Сводная аналитика (KPI, ОТК, склад, тренды, разрезы)',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        summary='Сводная аналитика (Dias Front)',
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
         description=(
-            'Ответ: `period`, `trend_group`, `cards` (в т.ч. `purchase_total` — сумма закупок сырья за период), '
-            '`otk_summary`, `warehouse_summary`, `production_summary`, `trends` '
-            '(revenue, sales_cost, profit, production_cost, purchase_total), '
-            '`sales_by_profile`, `sales_by_client`, `production_by_line`.'
+            'Карточки: revenue, sales_cost, profit, purchase_total (+алиасы), production_cost_total (+алиасы), '
+            'expense_total, sales_count, sold_units, client_debt_total. trends: period, revenue, profit (числа). '
+            'packaging_summary при ненулевых GP-операциях за период. warehouse_summary — числа (шт). '
+            'debt_as_of=current_outstanding_by_sale_date_in_period.'
         ),
     ),
 )
@@ -75,7 +81,7 @@ class AnalyticsSummaryView(viewsets.ViewSet):
     list=extend_schema(
         tags=['analytics'],
         summary='Детализация выручки (продажи)',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
     ),
 )
@@ -92,7 +98,7 @@ class AnalyticsRevenueDetailsView(viewsets.ViewSet):
     list=extend_schema(
         tags=['analytics'],
         summary='Детализация себестоимости продаж (Sale.cost)',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
     ),
 )
@@ -108,8 +114,28 @@ class AnalyticsSalesCostDetailsView(viewsets.ViewSet):
 @extend_schema_view(
     list=extend_schema(
         tags=['analytics'],
+        summary='Себестоимость товара за 1 шт (справочник профилей, без фильтра периода)',
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+        description=(
+            'Актуальные unit_cost_per_piece по каждому PlasticProfile. Query-период игнорируется. '
+            'Алиасы: cost_per_piece, material_cost_per_piece, current_unit_cost, unit_cost.'
+        ),
+    ),
+)
+class AnalyticsProductUnitCostsView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        return Response(build_product_unit_costs())
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
         summary='Детализация себестоимости производства (ProductionBatch.material_cost_total)',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
     ),
 )
@@ -126,7 +152,7 @@ class AnalyticsProductionCostDetailsView(viewsets.ViewSet):
     list=extend_schema(
         tags=['analytics'],
         summary='Детализация закупок сырья (партии прихода)',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
     ),
 )
@@ -143,7 +169,7 @@ class AnalyticsPurchaseDetailsView(viewsets.ViewSet):
     list=extend_schema(
         tags=['analytics'],
         summary='Детализация прибыли по продажам',
-        parameters=_ANALYTICS_SCOPE_PARAMS,
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
         responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
     ),
 )
@@ -154,6 +180,27 @@ class AnalyticsProfitDetailsView(viewsets.ViewSet):
     def list(self, request):
         scope = parse_analytics_scope(request)
         return Response(build_profit_details(scope))
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Дебиторская задолженность по клиентам (продажи периода с debt > 0)',
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+        description=(
+            'total_debt = sum(items.debt_amount) = cards.client_debt_total при тех же фильтрах. '
+            'debt_as_of=current_outstanding_by_sale_date_in_period.'
+        ),
+    ),
+)
+class AnalyticsDebtDetailsView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        scope = parse_analytics_scope(request)
+        return Response(build_debt_details(scope))
 
 
 @extend_schema_view(

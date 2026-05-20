@@ -95,12 +95,17 @@ def accept_goods_to_warehouse_gp(
     if accepted_pieces <= 0:
         return None
 
+    from .unit_cost import workshop_run_unit_cost_per_piece
+
+    unit_cost = workshop_run_unit_cost_per_piece(wp) or Decimal('0')
+
     warehouse_row = WarehouseBatch.objects.create(
         profile=wp.product,
         product=wp.product_name_snapshot or wp.product.name,
         length_per_piece=None,
         total_meters=None,
         quantity=_q_kg(Decimal(accepted_pieces)),
+        cost_per_piece=unit_cost.quantize(Decimal('0.0001')),
         date=_today_for_warehouse(),
         status=WarehouseBatch.STATUS_AVAILABLE,
         inventory_form=WarehouseBatch.INVENTORY_UNPACKED,

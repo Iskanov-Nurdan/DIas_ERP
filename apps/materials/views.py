@@ -160,21 +160,32 @@ class RawMaterialViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     search_fields = ['name']
     ordering_fields = ['id', 'name']
 
-    def partial_update(self, request, *args, **kwargs):
+    def _guard_unit_change(self, request) -> Response | None:
+        if 'unit' not in request.data:
+            return None
         instance = self.get_object()
-        if 'unit' in request.data:
-            new_u = request.data.get('unit')
-            if normalize_material_unit(new_u) != normalize_material_unit(instance.unit):
-                denied, msg = raw_material_unit_change_denial(instance)
-                if denied:
-                    return Response(
-                        {'detail': msg, 'error': msg},
-                        status=status.HTTP_409_CONFLICT,
-                    )
-        return super().partial_update(request, *args, **kwargs)
+        new_u = request.data.get('unit')
+        if normalize_material_unit(new_u) == normalize_material_unit(instance.unit):
+            return None
+        denied, msg = raw_material_unit_change_denial(instance)
+        if not denied:
+            return None
+        return Response(
+            {'detail': msg, 'error': msg},
+            status=status.HTTP_409_CONFLICT,
+        )
 
     def update(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
+        blocked = self._guard_unit_change(request)
+        if blocked is not None:
+            return blocked
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        blocked = self._guard_unit_change(request)
+        if blocked is not None:
+            return blocked
+        return super().partial_update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()

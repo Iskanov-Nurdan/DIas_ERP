@@ -125,6 +125,15 @@ class SalesApiContractTests(APITestCase):
         resp = self.client.post('/api/sales/', data=self._payload(sale_status=Sale.STATUS_DRAFT), format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
 
+    def test_create_draft_applies_warehouse_stock(self):
+        before = Decimal(str(self.good_batch.quantity))
+        resp = self.client.post('/api/sales/', data=self._payload(sale_status=Sale.STATUS_DRAFT, qty='5'), format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        sale = Sale.objects.get(pk=resp.data['id'])
+        self.assertTrue(sale.warehouse_stock_applied)
+        self.good_batch.refresh_from_db()
+        self.assertLess(Decimal(str(self.good_batch.quantity)), before)
+
     def test_create_shipped_success_with_batch(self):
         resp = self.client.post('/api/sales/', data=self._payload(sale_status=Sale.STATUS_SHIPPED), format='json')
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
@@ -310,6 +319,61 @@ class SalesApiContractTests(APITestCase):
         self.assertIn('payment_type', order_row)
         self.assertIn('payment_method', order_row)
 
+    def test_select_sources_pieces_unpacked_without_packages_count_no_virtual_packages(self):
+        wb = WarehouseBatch.objects.create(
+            product='Профиль в куче',
+            quantity=Decimal('38'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+            pieces_per_package=Decimal('10'),
+            packages_count=None,
+        )
+        resp = self.client.get('/api/sales/select-sources/?unit_type=pieces')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        row = next((b for b in resp.data['available_warehouse_batches'] if b['id'] == wb.pk), None)
+        self.assertIsNotNone(row)
+        self.assertEqual(row['available_pieces'], '38')
+        self.assertEqual(row['available_unpacked_pieces'], '38')
+        self.assertEqual(row['unpacked_pieces'], '38')
+        self.assertEqual(row['available_pieces_total'], '38')
+        self.assertIsNone(row['available_packages'])
+
+    def test_select_sources_pieces_mixed_open_package_splits_loose(self):
+        wb = WarehouseBatch.objects.create(
+            product='Смешанный остаток',
+            quantity=Decimal('38'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_OPEN_PACKAGE,
+            pieces_per_package=Decimal('10'),
+            packages_count=Decimal('3'),
+        )
+        resp = self.client.get('/api/sales/select-sources/?unit_type=pieces')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        row = next(b for b in resp.data['available_warehouse_batches'] if b['id'] == wb.pk)
+        self.assertEqual(row['available_pieces'], '8')
+        self.assertEqual(row['available_unpacked_pieces'], '8')
+        self.assertEqual(row['available_pieces_total'], '38')
+        self.assertEqual(row['available_packages'], '3')
+
+    def test_select_sources_pieces_all_sealed_open_package_excluded(self):
+        wb = WarehouseBatch.objects.create(
+            product='Только коробки',
+            quantity=Decimal('30'),
+            date=date(2026, 4, 26),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_OPEN_PACKAGE,
+            pieces_per_package=Decimal('10'),
+            packages_count=Decimal('3'),
+        )
+        resp = self.client.get('/api/sales/select-sources/?unit_type=pieces')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertNotIn(wb.pk, {b['id'] for b in resp.data['available_warehouse_batches']})
+
     def test_create_sale_applies_order_prepayment_without_double_payment_doc(self):
         Payment.objects.create(
             client=self.client_active,
@@ -388,6 +452,53 @@ class SalesApiContractTests(APITestCase):
         resp = self.client.post('/api/sales/preview/', data=payload, format='json')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(len(resp.data.get('normalized_lines') or []), 2)
+
+    def test_preview_without_payment_fields_defaults_to_debt(self):
+        payload = {
+            'client': self.client_active.pk,
+            'unit_type': 'pieces',
+            'sale_lines': [
+                {
+                    'warehouse_batch': self.good_batch.pk,
+                    'quantity': '1',
+                    'unit_price': '100',
+                    'unit_type': 'pieces',
+                },
+            ],
+        }
+        resp = self.client.post('/api/sales/preview/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data.get('payment_status'), 'debt')
+
+    def test_preview_accepts_client_id_alias(self):
+        payload = {
+            'client_id': self.client_active.pk,
+            'unit_type': 'pieces',
+            'sale_lines': [
+                {
+                    'warehouse_batch': self.good_batch.pk,
+                    'quantity': '1',
+                    'unit_price': '10',
+                    'unit_type': 'pieces',
+                },
+            ],
+        }
+        resp = self.client.post('/api/sales/preview/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_create_sale_accepts_client_id_alias(self):
+        payload = self._payload()
+        cid = payload.pop('client')
+        payload['client_id'] = cid
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_create_sale_payment_method_without_payment_type(self):
+        payload = self._payload()
+        payload.pop('payment_type', None)
+        payload['payment_method'] = 'transfer'
+        resp = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
 
     def test_waybill_and_receipt_are_html(self):
         sale = self._create_sale()

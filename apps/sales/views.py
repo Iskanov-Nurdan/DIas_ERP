@@ -20,6 +20,7 @@ from rest_framework import serializers as drf_serializers
 
 from apps.activity.mixins import ActivityLoggingMixin
 from config.api_numbers import api_decimal_str
+from config.pagination import WarehouseResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 from .filters import ClientFilter, DefectFilter, OrderFilter, PaymentFilter, ReturnFilter, SaleFilter
 from .models import (
@@ -122,6 +123,55 @@ def _is_packages_mode(sale: Sale, line: SaleLine) -> bool:
     if line_mode in package_aliases or sale_mode in package_aliases:
         return True
     return sale.sale_mode == Sale.MODE_PACKAGES
+
+
+def _warehouse_batch_select_sources_availability(b, raw_available: Decimal) -> dict:
+    """
+    Разбивка остатка для GET sales/select-sources/.
+
+    - total_pieces: всегда get_available_quantity (штуки).
+    - unpacked_pieces: неупакованный хвост для вкладки «штуки».
+    - available_packages_str: только если это не приведёт к двойному вычитанию на фронте:
+      для packed — raw / pieces_per_package;
+      для unpacked/open_package — только при известном packages_count > 0 (запечатанные коробки),
+      иначе None (даже при pieces_per_package > 0).
+    """
+    from apps.warehouse.models import WarehouseBatch
+
+    raw = Decimal(str(raw_available))
+    ppp = (
+        Decimal(str(b.pieces_per_package))
+        if b.pieces_per_package is not None
+        else Decimal('0')
+    )
+    is_packed = b.inventory_form == WarehouseBatch.INVENTORY_PACKED
+
+    if is_packed:
+        unpacked = Decimal('0')
+        if ppp > 0:
+            pkg = (raw / ppp).quantize(Decimal('0.0001'))
+            avail_pkg = api_decimal_str(pkg) if pkg > 0 else None
+        else:
+            avail_pkg = None
+        return {'total_pieces': raw, 'unpacked_pieces': unpacked, 'available_packages_str': avail_pkg}
+
+    pc_raw = b.packages_count
+    if ppp > 0 and pc_raw is not None and Decimal(str(pc_raw)) > 0:
+        pc = Decimal(str(pc_raw))
+        sealed_pieces = min(raw, (pc * ppp)).quantize(Decimal('0.0001'))
+        unpacked = (raw - sealed_pieces).quantize(Decimal('0.0001'))
+        if unpacked < 0:
+            unpacked = Decimal('0')
+        if sealed_pieces > 0 and ppp > 0:
+            sealed_pkg = (sealed_pieces / ppp).quantize(Decimal('0.0001'))
+            avail_pkg = api_decimal_str(sealed_pkg) if sealed_pkg > 0 else None
+        else:
+            avail_pkg = None
+    else:
+        unpacked = raw
+        avail_pkg = None
+
+    return {'total_pieces': raw, 'unpacked_pieces': unpacked, 'available_packages_str': avail_pkg}
 
 
 def _sale_line_packaging_payload(sale: Sale, line: SaleLine, lines_count: int) -> dict:
@@ -518,6 +568,7 @@ def _order_display_payload(order: Order) -> dict:
 class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
+    pagination_class = WarehouseResultsSetPagination
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'clients'
     activity_section = 'Клиенты'
@@ -1434,10 +1485,15 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         description=(
             'Справочники для формы продаж. В каждом order в полях orders/available_orders '
             'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.\n'
-            'Партии warehouse_batches / available_warehouse_batches: для packed строк '
-            'поле available_packages — строка с числом доступных целых упаковок (остаток штук в упаковках / pieces_per_package); '
-            'available_pieces — только неупакованный остаток (для inventory_form=packed всегда 0 — штуки только в составе упаковок / GP). '
-            'При unit_type=pieces партии packed не включаются. '
+            'Партии warehouse_batches / available_warehouse_batches:\n'
+            '- available_pieces_total — суммарные доступные штуки по партии (get_available_quantity).\n'
+            '- available_pieces, available_unpacked_pieces, unpacked_pieces — только неупакованный хвост; '
+            'для packed всегда 0 (штуки только в упаковках / GP).\n'
+            '- available_packages — только когда известны запечатанные упаковки: для packed = total/ipp; '
+            'для unpacked/open_package — только если задано packages_count>0 (иначе null, '
+            'чтобы фронт не вычитал «виртуальные коробки» из total при отсутствии учёта запечатанного).\n'
+            'При unit_type=pieces партии packed не включаются; строки без неупакованного хвоста '
+            '(unpacked_pieces<=0) тоже исключаются. '
             'supports_packages=true при inventory_form=packed и pieces_per_package>0. '
             'Строки GP после POST /warehouse/gp-packages/ попадают сюда как отдельные packed-партии (1 упаковка = 1 warehouse_batch).'
         ),
@@ -1503,10 +1559,11 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             raw_available = Decimal(str(get_available_quantity(b.pk)))
             if raw_available <= 0:
                 continue
-            ppp = Decimal(str(b.pieces_per_package or 0))
-            avail_packages = None
-            if ppp > 0:
-                avail_packages = api_decimal_str((raw_available / ppp).quantize(Decimal('0.0001')))
+            ppp = Decimal(str(b.pieces_per_package or 0)) if b.pieces_per_package is not None else Decimal('0')
+            av = _warehouse_batch_select_sources_availability(b, raw_available)
+            loose_available = av['unpacked_pieces']
+            total_pieces = av['total_pieces']
+            avail_packages = av['available_packages_str']
             is_packed = b.inventory_form == WarehouseBatch.INVENTORY_PACKED
             # Во вкладке «штуки» не показываем закрытые упаковки — остаток только в GP/упаковках.
             if unit_type == Sale.MODE_PACKAGES:
@@ -1518,6 +1575,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     continue
             elif unit_type == Sale.MODE_PIECES:
                 if is_packed:
+                    continue
+                if loose_available <= 0:
                     continue
 
             total_meters = None
@@ -1543,6 +1602,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 free_label = f'{avail_packages} уп.'
             else:
                 free_label = f'{api_decimal_str(loose_available)} шт'
+            loose_s = api_decimal_str(loose_available)
+            total_s = api_decimal_str(total_pieces)
             warehouse_batches.append(
                 {
                     'id': b.pk,
@@ -1552,8 +1613,11 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         f"{inventory_labels.get(b.inventory_form, b.inventory_form)}"
                     ),
                     'product': b.product,
-                    'available_quantity': api_decimal_str(loose_available),
-                    'available_pieces': api_decimal_str(loose_available),
+                    'available_quantity': loose_s,
+                    'available_pieces': loose_s,
+                    'available_pieces_total': total_s,
+                    'available_unpacked_pieces': loose_s,
+                    'unpacked_pieces': loose_s,
                     'available_packages': avail_packages,
                     'supports_pieces': not is_packed,
                     'supports_packages': bool(
@@ -1579,7 +1643,10 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         api_decimal_str(Decimal(str(b.length_per_piece)))
                         if b.length_per_piece is not None else None
                     ),
-                    'available_pieces': api_decimal_str(loose_available),
+                    'available_pieces': loose_s,
+                    'available_pieces_total': total_s,
+                    'available_unpacked_pieces': loose_s,
+                    'unpacked_pieces': loose_s,
                     'available_packages': avail_packages,
                     'supports_pieces': not is_packed,
                     'supports_packages': bool(
@@ -1634,7 +1701,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         data = request.data or {}
         client_id = data.get('client')
         if client_id in (None, ''):
-            return _err('MISSING_CLIENT', 'Поле client обязательно.', http_status=400)
+            client_id = data.get('client_id')
+        if client_id in (None, ''):
+            return _err('MISSING_CLIENT', 'Поле client (или client_id) обязательно.', http_status=400)
         sale_lines = data.get('sale_lines')
         if not isinstance(sale_lines, list) or len(sale_lines) < 1:
             return _err('MISSING_SALE_LINES', 'sale_lines обязателен и должен содержать минимум одну строку.', http_status=400)
@@ -1734,6 +1803,18 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         payment_type = (data.get('payment_type') or '').strip().lower()
         payment_method = (data.get('payment_method') or '').strip().lower()
         paid_raw = data.get('paid_amount')
+        if not payment_type:
+            if paid_raw not in (None, ''):
+                try:
+                    pd = Decimal(str(paid_raw))
+                    payment_type = 'partial' if pd > 0 else 'debt'
+                except (InvalidOperation, TypeError, ValueError):
+                    payment_type = 'debt'
+                    paid_raw = None
+            else:
+                payment_type = 'debt'
+        if not payment_method:
+            payment_method = 'cash'
         total_amount = total_amount.quantize(Decimal('0.01'))
         paid_amount = Decimal('0')
         debt_amount = Decimal('0')

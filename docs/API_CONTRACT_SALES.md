@@ -177,8 +177,10 @@ Response:
 - clients: только active,
 - orders: фильтруются по `client_id` (если передан),
 - order_lines: фильтруются по `order_id` (если передан),
-- warehouse_batches: только `status=available`, `quality=good`, `available_quantity>0`,
+- warehouse_batches / available_warehouse_batches: только `status=available`, `quality=good`, сегмент `stock_bucket=standard`, остаток по `get_available_quantity>0`,
 - defect batches не возвращаются.
+- Поля остатка: `available_pieces_total` — суммарные штуки; `available_pieces`, `available_unpacked_pieces`, `unpacked_pieces` — неупакованный хвост (для `packed` всегда 0); `available_packages` — только для `packed` (total/ipp) или при `packages_count>0` на `unpacked`/`open_package`; если запечатанных упаковок в данных нет (`packages_count` пусто), `available_packages` = null даже при `pieces_per_package`, чтобы UI не делал двойное вычитание.
+- `?unit_type=pieces`: не показываются `packed` партии и строки с `unpacked_pieces<=0`; `?unit_type=packages`: только `packed` с целой упаковкой.
 
 ---
 

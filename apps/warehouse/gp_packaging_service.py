@@ -45,13 +45,48 @@ def _annotated_runs_for_group(product_id: int, blank_id: int):
     )
 
 
-def compute_unpacked_for_run(run: BlankProductionRun) -> tuple[int, Decimal]:
+def _warehouse_unpacked_pieces_for_run(run_id: int) -> int | None:
+    """Фактический неупакованный остаток на складе по приёмке (если есть строки unpacked)."""
+    rows = WarehouseBatch.objects.filter(
+        blank_production_run_id=run_id,
+        inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        status=WarehouseBatch.STATUS_AVAILABLE,
+        quality=WarehouseBatch.QUALITY_GOOD,
+    )
+    if not rows.exists():
+        return None
+    total = rows.aggregate(s=Sum('quantity'))['s'] or 0
+    return max(0, int(Decimal(str(total)).to_integral_value()))
+
+
+def compute_unpacked_for_run(run: BlankProductionRun) -> tuple[int, Decimal, int, Decimal]:
     accepted = int(run.gp_accepted_pieces or 0)
     packed = int(getattr(run, 'packed_pieces', 0) or 0)
-    up = max(0, accepted - packed)
+    sold = _sold_unpacked_pieces_for_run(run.pk)
+    up = max(0, accepted - packed - sold)
+    wh_up = _warehouse_unpacked_pieces_for_run(run.pk)
+    if wh_up is not None:
+        up = min(up, wh_up)
     wpp = Decimal(str(run.weight_kg_per_piece))
     kg = _q_kg(Decimal(up) * wpp) if up else Decimal('0')
-    return up, kg
+    sold_kg = _q_kg(Decimal(sold) * wpp) if sold else Decimal('0')
+    return up, kg, sold, sold_kg
+
+
+def _sold_unpacked_pieces_for_run(run_id: int) -> int:
+    """Штуки, проданные со склада (unpacked) по приёмке."""
+    from apps.sales.models import Sale, SaleLine
+
+    agg = (
+        SaleLine.objects.filter(
+            sale__warehouse_stock_applied=True,
+            warehouse_batch__blank_production_run_id=run_id,
+            warehouse_batch__inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
+        .exclude(sale__sale_status=Sale.STATUS_CANCELED)
+        .aggregate(s=Sum('quantity'))
+    )
+    return max(0, int(Decimal(str(agg['s'] or 0)).to_integral_value()))
 
 
 @dataclass
@@ -64,6 +99,8 @@ class BalanceLine:
     gp_accepted_kg: Decimal
     unpacked_pieces: int
     unpacked_kg: Decimal
+    sold_pieces: int = 0
+    sold_kg: Decimal = Decimal('0')
 
 
 @dataclass
@@ -103,7 +140,7 @@ def balance_group_detail(*, product_id: int, blank_id: int) -> BalanceGroup:
             first_blank_name = run.blank_name_snapshot or (run.blank.name if run.blank_id else '')
         acc = int(run.gp_accepted_pieces or 0)
         acc_kg = Decimal(str(run.gp_accepted_kg or '0'))
-        up, uk = compute_unpacked_for_run(run)
+        up, uk, sold_pcs, sold_kg = compute_unpacked_for_run(run)
         tap += acc
         tak += acc_kg
         tup += up
@@ -120,6 +157,8 @@ def balance_group_detail(*, product_id: int, blank_id: int) -> BalanceGroup:
                 gp_accepted_kg=_q_kg(acc_kg),
                 unpacked_pieces=up,
                 unpacked_kg=uk,
+                sold_pieces=sold_pcs,
+                sold_kg=sold_kg,
             )
         )
     return BalanceGroup(
@@ -189,7 +228,7 @@ def _fifo_allocate(
     for run in runs_ordered:
         if left <= 0:
             break
-        up, _ = compute_unpacked_for_run(run)
+        up, *_ = compute_unpacked_for_run(run)
         if up <= 0:
             continue
         take = min(up, left)

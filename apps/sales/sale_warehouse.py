@@ -18,6 +18,36 @@ from apps.warehouse.stock_ops import (
 from .models import Sale, SaleLine
 
 
+def _schedule_sale_warehouse_ws_push(sale_pk: int, *, gp_pack_unit_ids: list[int] | None = None) -> None:
+    """После коммита: refetch продажи и затронутых партий на других экранах."""
+    from django.db import transaction as db_txn
+
+    from apps.realtime.broadcast import schedule_push
+
+    gp_ids = list(gp_pack_unit_ids or [])
+
+    def _push():
+        sale_fresh = Sale.objects.filter(pk=sale_pk).first()
+        if not sale_fresh:
+            return
+        schedule_push(resource='sale', action='changed', entity_id=sale_pk)
+        schedule_push(resource='sale', action='changed')
+        wb_ids = list(
+            SaleLine.objects.filter(sale_id=sale_pk, warehouse_batch_id__isnull=False)
+            .values_list('warehouse_batch_id', flat=True)
+            .distinct()
+        )
+        for wid in wb_ids:
+            schedule_push(resource='warehouse_batch', action='changed', entity_id=wid)
+        schedule_push(resource='warehouse_batch', action='changed')
+        for gid in gp_ids:
+            schedule_push(resource='warehouse_package', action='changed', entity_id=gid)
+        if gp_ids:
+            schedule_push(resource='warehouse_package', action='changed')
+
+    db_txn.on_commit(_push)
+
+
 def _is_shipping_status(status: str) -> bool:
     return status in (
         Sale.STATUS_PARTIALLY_SHIPPED,
@@ -32,11 +62,14 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
     if sale.sale_status == Sale.STATUS_CANCELED:
         return False
 
-    lines = list(sale.sale_lines.all())
+    lines = list(
+        sale.sale_lines.select_related('warehouse_batch', 'gp_pack_unit').order_by('id')
+    )
     any_line_batch = bool(lines) and any(ln.warehouse_batch_id for ln in lines)
 
     if lines and any_line_batch:
         mutations: list = []
+        gp_pack_ids: list[int] = []
         with transaction.atomic():
             sale_locked = Sale.objects.select_for_update().get(pk=sale.pk)
             if sale_locked.warehouse_stock_applied:
@@ -59,11 +92,15 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
                     pp,
                 )
                 mutations.append(mut)
+                if line.gp_pack_unit_id:
+                    gp_pack_ids.append(line.gp_pack_unit_id)
             if not mutations:
                 return False
             sale_locked.warehouse_stock_applied = True
             sale_locked.warehouse_mutation = mutations
             sale_locked.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
+            sale_pk = sale_locked.pk
+        _schedule_sale_warehouse_ws_push(sale_pk, gp_pack_unit_ids=gp_pack_ids)
         return True
 
     if lines and (not any_line_batch) and sale.warehouse_batch_id:
@@ -83,6 +120,8 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
             s2.warehouse_stock_applied = True
             s2.warehouse_mutation = [mut]
             s2.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
+            sale_pk = s2.pk
+        _schedule_sale_warehouse_ws_push(sale_pk, gp_pack_unit_ids=[])
         return True
 
     if (not lines) and sale.warehouse_batch_id:
@@ -100,8 +139,17 @@ def apply_warehouse_for_sale(sale: Sale) -> bool:
             s2.warehouse_stock_applied = True
             s2.warehouse_mutation = [mut]
             s2.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
+            sale_pk = s2.pk
+        _schedule_sale_warehouse_ws_push(sale_pk, gp_pack_unit_ids=[])
         return True
     return False
+
+
+def sale_requires_warehouse_apply(sale: Sale) -> bool:
+    """Нужно ли списание склада по этой продаже (есть строки/шапка с партией)."""
+    if sale.warehouse_batch_id:
+        return True
+    return SaleLine.objects.filter(sale_id=sale.pk, warehouse_batch_id__isnull=False).exists()
 
 
 def reverse_warehouse_for_sale(sale: Sale) -> bool:
@@ -129,4 +177,11 @@ def reverse_warehouse_for_sale(sale: Sale) -> bool:
         s2.warehouse_stock_applied = False
         s2.warehouse_mutation = None
         s2.save(update_fields=['warehouse_stock_applied', 'warehouse_mutation'])
+        sale_pk = s2.pk
+    gp_ids = list(
+        SaleLine.objects.filter(sale_id=sale_pk, gp_pack_unit_id__isnull=False)
+        .values_list('gp_pack_unit_id', flat=True)
+        .distinct()
+    )
+    _schedule_sale_warehouse_ws_push(sale_pk, gp_pack_unit_ids=gp_ids)
     return True
