@@ -7,6 +7,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from apps.recipes.models import PlasticProfile
 from apps.sales.models import Client, Order, OrderLine, Payment, Return, Sale, SaleLine
 from apps.warehouse.models import WarehouseBatch
 
@@ -767,6 +768,215 @@ class SalesApiContractTests(APITestCase):
         self.assertEqual(line.get('quantity_display'), '2 упак × 6 шт = 12 шт')
         self.assertIn('order_line', line)
         self.assertIn('order_line_display', line)
+
+    def test_multi_profile_order_select_sources_and_sale_two_lines(self):
+        profile_a = PlasticProfile.objects.create(name='Профиль 5м', code='P5', is_active=True)
+        profile_b = PlasticProfile.objects.create(name='Профиль 6м', code='P6', is_active=True)
+        order = Order.objects.create(
+            order_number='ORD-MULTI-01',
+            date=date(2026, 5, 21),
+            client=self.client_active,
+            status=Order.STATUS_CONFIRMED,
+        )
+        line_a = OrderLine.objects.create(
+            order=order,
+            product=profile_a.name,
+            profile=profile_a,
+            ordered_quantity=Decimal('20'),
+            unit_price=Decimal('150'),
+        )
+        line_b = OrderLine.objects.create(
+            order=order,
+            product=profile_b.name,
+            profile=profile_b,
+            ordered_quantity=Decimal('10'),
+            unit_price=Decimal('180'),
+        )
+        batch_a = WarehouseBatch.objects.create(
+            product=profile_a.name,
+            profile=profile_a,
+            quantity=Decimal('50'),
+            date=date(2026, 5, 21),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
+        batch_b = WarehouseBatch.objects.create(
+            product=profile_b.name,
+            profile=profile_b,
+            quantity=Decimal('30'),
+            date=date(2026, 5, 21),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
+        sources = self.client.get(f'/api/sales/select-sources/?client={self.client_active.pk}')
+        self.assertEqual(sources.status_code, status.HTTP_200_OK)
+        avail = sources.data.get('available_orders') or []
+        row = next(x for x in avail if x['id'] == order.pk)
+        self.assertEqual(row.get('lines_count'), 2)
+        self.assertEqual(len(row.get('order_lines') or []), 2)
+        self.assertIn('2026-05-21', row.get('display', ''))
+        self.assertIn('2', row.get('display', ''))
+        self.assertEqual(len(avail), len({x['id'] for x in avail}))
+
+        detail = self.client.get(f'/api/orders/{order.pk}/')
+        self.assertEqual(len(detail.data.get('order_lines') or []), 2)
+
+        payload = {
+            'date': '2026-05-21',
+            'client': self.client_active.pk,
+            'order': order.pk,
+            'sale_status': Sale.STATUS_DRAFT,
+            'sale_lines': [
+                {
+                    'order_line': line_a.pk,
+                    'warehouse_batch': batch_a.pk,
+                    'quantity': '20',
+                    'unit_price': '150',
+                    'unit_type': 'pieces',
+                    'product': profile_a.name,
+                },
+                {
+                    'order_line': line_b.pk,
+                    'warehouse_batch': batch_b.pk,
+                    'quantity': '10',
+                    'unit_price': '180',
+                    'unit_type': 'pieces',
+                    'product': profile_b.name,
+                },
+            ],
+        }
+        preview = self.client.post('/api/sales/preview/', data=payload, format='json')
+        self.assertEqual(preview.status_code, status.HTTP_200_OK)
+        create = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED)
+        sale = Sale.objects.get(pk=create.data['id'])
+        slines = list(sale.sale_lines.order_by('order_line_id'))
+        self.assertEqual(len(slines), 2)
+        self.assertEqual({sl.order_line_id for sl in slines}, {line_a.pk, line_b.pk})
+
+    def test_order_partial_prepayment_sale_supplemental_no_double_revenue(self):
+        profile_a = PlasticProfile.objects.create(name='Профиль A', code='PA', is_active=True)
+        profile_b = PlasticProfile.objects.create(name='Профиль B', code='PB', is_active=True)
+        order = Order.objects.create(
+            order_number='ORD-PAY-01',
+            date=date(2026, 5, 21),
+            client=self.client_active,
+            status=Order.STATUS_CONFIRMED,
+        )
+        line_a = OrderLine.objects.create(
+            order=order,
+            product=profile_a.name,
+            profile=profile_a,
+            ordered_quantity=Decimal('20'),
+            unit_price=Decimal('4000'),
+        )
+        line_b = OrderLine.objects.create(
+            order=order,
+            product=profile_b.name,
+            profile=profile_b,
+            ordered_quantity=Decimal('10'),
+            unit_price=Decimal('2000'),
+        )
+        Payment.objects.create(
+            client=self.client_active,
+            linked_order=order,
+            date=date(2026, 5, 21),
+            payment_type=Payment.TYPE_PREPAYMENT,
+            payment_method=Payment.METHOD_CASH,
+            amount=Decimal('40000'),
+            status=Payment.STATUS_ACTIVE,
+        )
+        batch_a = WarehouseBatch.objects.create(
+            product=profile_a.name,
+            profile=profile_a,
+            quantity=Decimal('50'),
+            date=date(2026, 5, 21),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
+        batch_b = WarehouseBatch.objects.create(
+            product=profile_b.name,
+            profile=profile_b,
+            quantity=Decimal('30'),
+            date=date(2026, 5, 21),
+            quality=WarehouseBatch.QUALITY_GOOD,
+            status=WarehouseBatch.STATUS_AVAILABLE,
+            inventory_form=WarehouseBatch.INVENTORY_UNPACKED,
+        )
+        sources = self.client.get(f'/api/sales/select-sources/?client={self.client_active.pk}')
+        self.assertEqual(sources.status_code, status.HTTP_200_OK)
+        row = next(x for x in sources.data['available_orders'] if x['id'] == order.pk)
+        self.assertEqual(Decimal(row['paid_amount']), Decimal('40000'))
+        self.assertEqual(Decimal(row['amount_remaining']), Decimal('60000'))
+        self.assertEqual(Decimal(row['total_amount']), Decimal('100000'))
+        self.assertEqual(row['payment_type'], 'partial')
+        self.assertEqual(len(row['order_lines']), 2)
+
+        detail = self.client.get(f'/api/orders/{order.pk}/')
+        self.assertEqual(Decimal(detail.data['amount_remaining']), Decimal('60000'))
+        self.assertEqual(Decimal(detail.data['paid_amount']), Decimal('40000'))
+
+        payload = {
+            'date': '2026-05-21',
+            'client': self.client_active.pk,
+            'order': order.pk,
+            'payment_type': 'partial',
+            'payment_method': 'cash',
+            'paid_amount': '60000',
+            'order_paid_amount_applied': '40000',
+            'sale_lines': [
+                {
+                    'order_line': line_a.pk,
+                    'warehouse_batch': batch_a.pk,
+                    'quantity': '20',
+                    'unit_price': '4000',
+                    'unit_type': 'pieces',
+                    'product': profile_a.name,
+                },
+                {
+                    'order_line': line_b.pk,
+                    'warehouse_batch': batch_b.pk,
+                    'quantity': '10',
+                    'unit_price': '2000',
+                    'unit_type': 'pieces',
+                    'product': profile_b.name,
+                },
+            ],
+        }
+        preview = self.client.post('/api/sales/preview/', data=payload, format='json')
+        self.assertEqual(preview.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(preview.data['paid_amount']), Decimal('60000'))
+        self.assertEqual(Decimal(preview.data['order_paid_amount_applied']), Decimal('40000'))
+        self.assertEqual(Decimal(preview.data['amount_remaining']), Decimal('0'))
+
+        create = self.client.post('/api/sales/', data=payload, format='json')
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED)
+        sale = Sale.objects.get(pk=create.data['id'])
+        self.assertEqual(sale.order_paid_amount_applied, Decimal('40000'))
+        self.assertEqual(sale.revenue, Decimal('100000'))
+        sale_pay = Payment.objects.filter(
+            linked_sale=sale,
+            status=Payment.STATUS_ACTIVE,
+            payment_type=Payment.TYPE_PAYMENT,
+        )
+        self.assertEqual(sale_pay.count(), 1)
+        self.assertEqual(sale_pay.first().amount, Decimal('60000'))
+        order_prepay = Payment.objects.filter(
+            linked_order=order,
+            status=Payment.STATUS_ACTIVE,
+            payment_type=Payment.TYPE_PREPAYMENT,
+        )
+        self.assertEqual(order_prepay.count(), 1)
+        self.assertEqual(order_prepay.first().amount, Decimal('40000'))
+
+        from apps.sales.payment_status import sale_payment_metrics
+
+        metrics = sale_payment_metrics(sale)
+        self.assertEqual(metrics['debt_amount'], Decimal('0'))
+        self.assertEqual(metrics['paid_amount'], Decimal('100000'))
 
     def test_credit_check_hard_block_and_override_access(self):
         self.client_active.credit_limit_mode = 'hard'

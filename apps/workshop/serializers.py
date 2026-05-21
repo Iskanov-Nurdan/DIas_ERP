@@ -255,6 +255,8 @@ class BlankProductionRunSerializer(serializers.ModelSerializer):
     blank_name = serializers.CharField(read_only=True, source='blank_name_snapshot')
     product_id = serializers.IntegerField(read_only=True)
     product_name = serializers.CharField(read_only=True, source='product_name_snapshot')
+    order_line_id = serializers.IntegerField(read_only=True, allow_null=True)
+    client_request_id = serializers.IntegerField(read_only=True, allow_null=True)
     packed_pieces = serializers.IntegerField(read_only=True, required=False, allow_null=True)
     unpacked_pieces = serializers.SerializerMethodField()
     unpacked_kg = serializers.SerializerMethodField()
@@ -268,6 +270,8 @@ class BlankProductionRunSerializer(serializers.ModelSerializer):
             'blank_name',
             'product_id',
             'product_name',
+            'order_line_id',
+            'client_request_id',
             'blank_total_kg',
             'blank_used_in_production_kg',
             'vat_max_kg_demo',

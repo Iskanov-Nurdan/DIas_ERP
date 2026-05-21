@@ -558,7 +558,37 @@ def _order_display_payload(order: Order) -> dict:
         'payment_method': payment_method,
         'prepayment_amount': api_decimal_str(paid_amount),
         'advance_amount': api_decimal_str(paid_amount),
+        'amount_remaining': api_decimal_str(debt_amount),
     }
+
+
+def _order_sources_payload(order: Order) -> dict:
+    """Заявка для sales/select-sources и available_orders: полный order_lines[], без дублей по профилю."""
+    from apps.sales.serializers import OrderSerializer
+
+    base = _order_display_payload(order)
+    order_lines, _, _ = OrderSerializer.build_order_lines_read_payload(order)
+    lines_count = len(order_lines)
+    date_s = order.date.isoformat() if order.date else None
+    if lines_count > 1:
+        display = f'{date_s or "—"} — {lines_count}'
+    elif lines_count == 1:
+        display = f'{date_s or "—"} — {order_lines[0].get("profile_name") or "—"}'
+    else:
+        display = base.get('display') or (date_s or '—')
+    base.update(
+        {
+            'client_id': order.client_id,
+            'date': date_s,
+            'order_lines': order_lines,
+            'lines_count': lines_count,
+            'display': display,
+            'order_display': display,
+            'label': f'{order.order_number} — {display}',
+            **OrderSerializer.build_order_payment_read_fields(order),
+        },
+    )
+    return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1514,27 +1544,42 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
-        orders = list(orders_qs.select_related('client', 'production_profile', 'resolved_recipe')[:200])
+        orders = list(
+            orders_qs.select_related('client', 'production_profile', 'resolved_recipe')
+            .prefetch_related('lines', 'lines__profile')[:200]
+        )
         order_id = request.query_params.get('order_id') or request.query_params.get('order')
         order_lines = []
         if order_id:
-            lines_qs = OrderLine.objects.filter(order_id=order_id).order_by('id')[:300]
-            order_lines = [
-                {
-                    'id': line.id,
-                    'label': (
-                        f"{line.product} — заказано {api_decimal_str(line.ordered_quantity)} — "
-                        f"продано {api_decimal_str(line.shipped_quantity)} — "
-                        f"осталось {api_decimal_str(line.remaining_quantity)}"
-                    ),
-                    'product': line.product,
-                    'ordered_quantity': api_decimal_str(line.ordered_quantity),
-                    'shipped_quantity': api_decimal_str(line.shipped_quantity),
-                    'remaining_quantity': api_decimal_str(line.remaining_quantity),
-                    'unit_price': api_decimal_str(line.unit_price or Decimal('0')),
-                }
-                for line in lines_qs
-            ]
+            from apps.sales.serializers import OrderSerializer
+
+            try:
+                order_pk = int(order_id)
+            except (TypeError, ValueError):
+                order_pk = None
+            target = next((o for o in orders if o.pk == order_pk), None) if order_pk else None
+            if target is None:
+                target = (
+                    Order.objects.filter(pk=order_id)
+                    .prefetch_related('lines', 'lines__profile')
+                    .first()
+                )
+            if target is not None:
+                built, _, _ = OrderSerializer.build_order_lines_read_payload(target)
+                for row in built:
+                    ol_id = row['id']
+                    order_lines.append(
+                        {
+                            **row,
+                            'label': (
+                                f"{row.get('profile_name') or row.get('product', '')} — "
+                                f"заказано {row.get('quantity')} — "
+                                f"осталось {row.get('remaining_quantity')}"
+                            ),
+                            'ordered_quantity': row.get('quantity'),
+                            'product': row.get('profile_name') or '',
+                        },
+                    )
         wb_qs = (
             WarehouseBatch.objects.filter(
                 status=WarehouseBatch.STATUS_AVAILABLE,
@@ -1658,21 +1703,22 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     'unit_labels': {'pieces': 'шт', 'packages': 'уп', 'meters': 'м'},
                 },
             )
-        available_orders = [_order_display_payload(o) for o in orders]
+        available_orders = [_order_sources_payload(o) for o in orders]
         orders_payload = []
         for o, op in zip(orders, available_orders):
             orders_payload.append(
                 {
                     'id': o.id,
                     'client_id': o.client_id,
-                    'label': (
-                        f"{o.order_number} — {(o.client.name if o.client_id else '—')} — "
-                        f"осталось {api_decimal_str(o.remaining_amount)}"
-                    ),
+                    'date': op.get('date'),
+                    'lines_count': op.get('lines_count'),
+                    'order_lines': op.get('order_lines') or [],
+                    'label': op.get('label'),
                     'display': op.get('display'),
                     'order_display': op.get('order_display'),
                     'paid_amount': op['paid_amount'],
                     'prepaid_amount': op.get('prepayment_amount'),
+                    'amount_remaining': op.get('amount_remaining'),
                     'debt_amount': op['debt_amount'],
                     'total_amount': op['total_amount'],
                     'payment_type': op['payment_type'],
@@ -1707,6 +1753,14 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         sale_lines = data.get('sale_lines')
         if not isinstance(sale_lines, list) or len(sale_lines) < 1:
             return _err('MISSING_SALE_LINES', 'sale_lines обязателен и должен содержать минимум одну строку.', http_status=400)
+
+        order_id = data.get('order') or data.get('linked_order')
+        linked_order = None
+        if order_id not in (None, ''):
+            try:
+                linked_order = Order.objects.prefetch_related('lines').get(pk=int(order_id))
+            except (Order.DoesNotExist, TypeError, ValueError):
+                return _err('ORDER_NOT_FOUND', 'Заявка не найдена.', http_status=400)
 
         unit_type = (data.get('unit_type') or Sale.MODE_PIECES).strip().lower()
         if unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
@@ -1759,6 +1813,21 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             if unit_price < 0:
                 errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price не может быть < 0'})
                 continue
+            ol_id = row.get('order_line')
+            if linked_order is not None and ol_id not in (None, ''):
+                try:
+                    ol_pk = int(ol_id)
+                except (TypeError, ValueError):
+                    errors.append({'field': f'sale_lines[{idx}].order_line', 'message': 'order_line должен быть числом'})
+                    continue
+                if not OrderLine.objects.filter(pk=ol_pk, order_id=linked_order.pk).exists():
+                    errors.append(
+                        {
+                            'field': f'sale_lines[{idx}].order_line',
+                            'message': 'order_line не принадлежит заявке.',
+                        },
+                    )
+                    continue
             available_pieces = Decimal(str(get_available_quantity(wb.pk)))
             if line_unit_type == Sale.MODE_PACKAGES:
                 try:
@@ -1816,42 +1885,71 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if not payment_method:
             payment_method = 'cash'
         total_amount = total_amount.quantize(Decimal('0.01'))
-        paid_amount = Decimal('0')
+        order_prepaid = Decimal('0')
+        if linked_order is not None:
+            from .payment_status import order_payment_metrics
+
+            order_prepaid = Decimal(str(order_payment_metrics(linked_order)['paid_amount'] or 0)).quantize(Decimal('0.01'))
+        order_applied_raw = data.get('order_paid_amount_applied')
+        if order_applied_raw not in (None, ''):
+            try:
+                order_prepaid = Decimal(str(order_applied_raw)).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                return _err('INVALID_ORDER_PAID_AMOUNT_APPLIED', 'order_paid_amount_applied должен быть числом.', http_status=400)
+
+        supplemental_paid = Decimal('0')
         debt_amount = Decimal('0')
         if payment_type == 'full':
-            paid_amount = total_amount
-            debt_amount = Decimal('0')
+            if paid_raw in (None, ''):
+                supplemental_paid = max(Decimal('0'), total_amount - order_prepaid).quantize(Decimal('0.01'))
+            else:
+                try:
+                    supplemental_paid = Decimal(str(paid_raw)).quantize(Decimal('0.01'))
+                except (InvalidOperation, TypeError, ValueError):
+                    return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть числом.', http_status=400)
+            if supplemental_paid > max(Decimal('0'), total_amount - order_prepaid) + Decimal('0.01'):
+                return _err(
+                    'PAID_AMOUNT_EXCEEDS_REMAINING',
+                    'Доплата не должна превышать остаток по продаже после аванса заявки.',
+                    http_status=400,
+                )
+            debt_amount = max(Decimal('0'), total_amount - order_prepaid - supplemental_paid).quantize(Decimal('0.01'))
         elif payment_type == 'partial':
             if paid_raw in (None, ''):
-                return _err('PAID_AMOUNT_REQUIRED', 'Для partial укажите paid_amount.', http_status=400)
+                return _err('PAID_AMOUNT_REQUIRED', 'Для partial укажите paid_amount (доплата).', http_status=400)
             try:
-                paid_amount = Decimal(str(paid_raw)).quantize(Decimal('0.01'))
+                supplemental_paid = Decimal(str(paid_raw)).quantize(Decimal('0.01'))
             except (InvalidOperation, TypeError, ValueError):
                 return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть числом.', http_status=400)
-            if paid_amount <= 0 or paid_amount > total_amount:
-                return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть в диапазоне (0, total_amount].', http_status=400)
-            debt_amount = (total_amount - paid_amount).quantize(Decimal('0.01'))
+            if supplemental_paid <= 0:
+                return _err('INVALID_PAID_AMOUNT', 'paid_amount (доплата) должен быть > 0.', http_status=400)
+            if supplemental_paid > max(Decimal('0'), total_amount - order_prepaid) + Decimal('0.01'):
+                return _err('PAID_AMOUNT_EXCEEDS_REMAINING', 'Доплата превышает остаток по продаже.', http_status=400)
+            debt_amount = max(Decimal('0'), total_amount - order_prepaid - supplemental_paid).quantize(Decimal('0.01'))
         elif payment_type == 'debt':
-            paid_amount = Decimal('0')
-            debt_amount = total_amount
+            if paid_raw not in (None, '') and Decimal(str(paid_raw)) > 0:
+                return _err('PAYMENT_TYPE_CONFLICT', 'Для debt paid_amount должен быть 0.', http_status=400)
+            debt_amount = max(Decimal('0'), total_amount - order_prepaid).quantize(Decimal('0.01'))
         else:
             return _err('INVALID_PAYMENT_TYPE', 'payment_type: full | partial | debt', http_status=400)
 
         if payment_method not in ('cash', 'card', 'transfer'):
             return _err('INVALID_PAYMENT_METHOD', 'payment_method: cash | card | transfer', http_status=400)
 
-        payment_status = 'paid' if debt_amount == 0 else ('partial' if paid_amount > 0 else 'debt')
+        payment_status = 'paid' if debt_amount == 0 else ('partial' if supplemental_paid > 0 else 'debt')
         return Response({
             'total_amount': api_decimal_str(total_amount),
-            'paid_amount': api_decimal_str(paid_amount),
+            'paid_amount': api_decimal_str(supplemental_paid),
+            'order_paid_amount_applied': api_decimal_str(order_prepaid),
+            'amount_remaining': api_decimal_str(debt_amount),
             'debt_amount': api_decimal_str(debt_amount),
             'payment_status': payment_status,
             'payment_type_label': {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[payment_type],
             'payment_method_label': {'cash': 'Наличные', 'card': 'Карта', 'transfer': 'Перевод'}[payment_method],
             'payment_status_label': {'paid': 'Оплачено', 'partial': 'Частично оплачено', 'debt': 'В долг'}[payment_status],
             'summary': (
-                f"Итого {api_decimal_str(total_amount)}; оплачено {api_decimal_str(paid_amount)}; "
-                f"долг {api_decimal_str(debt_amount)}"
+                f"Итого {api_decimal_str(total_amount)}; аванс заявки {api_decimal_str(order_prepaid)}; "
+                f"доплата {api_decimal_str(supplemental_paid)}; долг {api_decimal_str(debt_amount)}"
             ),
             'unit_type': unit_type,
             'normalized_lines': normalized_lines,

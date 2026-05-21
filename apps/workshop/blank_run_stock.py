@@ -16,6 +16,8 @@ def create_run_deduct_workshop_only(
     product,
     validated: dict,
     production_batch=None,
+    order_line=None,
+    client_request=None,
 ) -> BlankProductionRun:
     """
     Сырьё по составу заготовки здесь не трогаем — оно уже списано при приготовлении (+бочка и т.д.).
@@ -37,4 +39,6 @@ def create_run_deduct_workshop_only(
         weight_kg_per_piece=validated['weight_kg_per_piece'],
         status=BlankProductionRun.STATUS_IN_PRODUCTION,
         production_batch=production_batch,
+        order_line=order_line,
+        client_request=client_request,
     )

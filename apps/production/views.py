@@ -1831,49 +1831,83 @@ class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewS
             .exclude(request_status__in=excluded_request)
             .exclude(status__in=excluded_commercial)
             .select_related('client', 'production_profile', 'resolved_recipe')
+            .prefetch_related('lines', 'lines__profile')
             .order_by('-date', '-id')
         )
 
     @extend_schema(
         summary='Старт производства по заявке',
-        description='Тело: { "blank": id } — заготовка цеха; линия выбирается по открытой смене пользователя.',
+        description=(
+            'line_starts: [{ order_line_id, blank }, …] — по одной заготовке на позицию; '
+            'или { blank, order_line_id }. Поле line и массив blanks без привязки к позиции не поддерживаются. '
+            'Личная смена («Моя смена») или X-Shift-Id / X-Audit-Shift-Id.'
+        ),
         request=inline_serializer(
             name='ProductionRequestStartBody',
             fields={
-                'blank': drf_serializers.IntegerField(help_text='ID WorkshopBlank (GET /api/workshop/blanks/)'),
+                'line_starts': drf_serializers.ListField(
+                    child=inline_serializer(
+                        name='ProductionLineStartItem',
+                        fields={
+                            'order_line_id': drf_serializers.IntegerField(required=False),
+                            'profile_id': drf_serializers.IntegerField(required=False),
+                            'blank': drf_serializers.IntegerField(),
+                        },
+                    ),
+                    required=False,
+                ),
+                'blank': drf_serializers.IntegerField(required=False),
+                'order_line_id': drf_serializers.IntegerField(required=False),
+                'profile_id': drf_serializers.IntegerField(required=False),
             },
         ),
     )
     @action(detail=True, methods=['post'], url_path='start')
     def start(self, request, pk=None):
-        from .client_order_start import start_production_for_client_order
+        from apps.sales.models import Order as ClientOrder
+        from apps.workshop.serializers import BlankProductionRunSerializer
+
+        from .client_order_start import (
+            parse_line_starts_from_body,
+            start_production_for_client_order,
+        )
 
         raw = getattr(request, 'data', None) or {}
         if not isinstance(raw, dict):
             raw = {}
         line_id = raw.get('line')
-        blank_id = raw.get('blank')
-        if blank_id is None or str(blank_id).strip() == '':
-            if line_id not in (None, '') and str(line_id).strip() != '':
-                return _err(
-                    'MISSING_BLANK',
-                    'Укажите blank (id заготовки цеха). Передача только line больше не поддерживается.',
-                    http_status=400,
-                )
-            return _err('MISSING_BLANK', 'Укажите blank: { "blank": <int> }', http_status=400)
+        if line_id not in (None, '') and str(line_id).strip() != '':
+            return _err(
+                'LINE_NOT_SUPPORTED',
+                'Поле line в теле больше не поддерживается. Используйте line_starts или blank + order_line_id.',
+                http_status=400,
+            )
         try:
-            blank_pk = int(blank_id)
-        except (TypeError, ValueError):
-            return _err('INVALID_BLANK', 'blank должен быть числом.', http_status=400)
+            client_order = ClientOrder.objects.prefetch_related('lines', 'lines__profile').get(pk=int(pk))
+        except ClientOrder.DoesNotExist:
+            return _err('NOT_FOUND', 'Заявка не найдена', http_status=404)
         try:
-            batch = start_production_for_client_order(
+            specs = parse_line_starts_from_body(raw, client_order=client_order)
+            runs = start_production_for_client_order(
                 user=request.user,
                 client_order_id=int(pk),
-                workshop_blank_id=blank_pk,
+                line_starts=specs,
+                request=request,
             )
         except DRFValidationError as exc:
             return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
-        return Response(
-            BatchListSerializer(batch, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
-        )
+        runs_data = BlankProductionRunSerializer(
+            runs,
+            many=True,
+            context=self.get_serializer_context(),
+        ).data
+        payload = {
+            'client_request_id': int(pk),
+            'runs': runs_data,
+        }
+        if runs:
+            payload['batch'] = BatchListSerializer(
+                runs[0].production_batch,
+                context=self.get_serializer_context(),
+            ).data
+        return Response(payload, status=status.HTTP_201_CREATED)

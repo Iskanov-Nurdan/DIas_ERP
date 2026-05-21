@@ -196,6 +196,39 @@ class OrdersApiContractTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(resp.data.get('recipe_id'), self.recipe.pk)
 
+    def test_list_returns_all_order_lines_for_multi_line_order(self):
+        p2 = PlasticProfile.objects.create(name='Профиль 80', code='P-80L', is_active=True)
+        Recipe.objects.create(recipe='Рецепт 80', profile=p2, is_active=True)
+        create_resp = self.client.post(
+            '/api/orders/',
+            {
+                'client': self.active_client.pk,
+                'date': '2026-05-21',
+                'order_lines': [
+                    {'profile': self.profile.pk, 'quantity': 20},
+                    {'profile': p2.pk, 'quantity': 10},
+                ],
+                'payment_type': 'debt',
+                'total_amount': '50000',
+                'paid_amount': '0',
+            },
+            format='json',
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
+        order_id = create_resp.data['id']
+        list_resp = self.client.get('/api/orders/')
+        self.assertEqual(list_resp.status_code, status.HTTP_200_OK)
+        items = list_resp.data.get('items') or list_resp.data
+        row = next(x for x in items if x['id'] == order_id)
+        lines = row.get('order_lines') or []
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertEqual(row.get('lines_count'), 2)
+        profile_ids = {int(l['profile_id']) for l in lines}
+        self.assertEqual(profile_ids, {self.profile.pk, p2.pk})
+        self.assertEqual(len(row.get('lines') or []), 2)
+        for key in ('items', 'request_lines', 'positions', 'products'):
+            self.assertEqual(len(row.get(key) or []), 2)
+
     def test_retrieve_returns_stable_order_lines_shape(self):
         payload = self._order_payload()
         create_resp = self.client.post('/api/orders/', data=payload, format='json')

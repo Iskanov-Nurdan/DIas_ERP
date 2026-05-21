@@ -182,7 +182,7 @@ class BlankProductionRunViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return (
-            BlankProductionRun.objects.select_related('blank', 'product')
+            BlankProductionRun.objects.select_related('blank', 'product', 'order_line', 'client_request')
             .annotate(
                 packed_pieces=Coalesce(
                     Sum('gp_pack_allocations__pieces'),

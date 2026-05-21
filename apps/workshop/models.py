@@ -142,6 +142,22 @@ class BlankProductionRun(models.Model):
         related_name='blank_production_runs',
         verbose_name='Партия производства (линия)',
     )
+    client_request = models.ForeignKey(
+        'sales.Order',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='blank_production_runs',
+        verbose_name='Заявка клиента',
+    )
+    order_line = models.ForeignKey(
+        'sales.OrderLine',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='blank_production_runs',
+        verbose_name='Строка заявки',
+    )
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_IN_PRODUCTION)
 
