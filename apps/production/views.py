@@ -83,11 +83,13 @@ def _audit_line_history_row(
         section = 'Смены'
     else:
         section = 'Линии'
+    from apps.activity.audit_messages import line_history_audit_text
+
     schedule_entity_audit(
         user=user,
         request=request,
         section=section,
-        description=f'{hist.get_action_display()} на линии «{line_label}» (событие #{hist.pk})',
+        description=line_history_audit_text(hist),
         action='create',
         model_cls=LineHistory,
         after_instance=hist,
@@ -109,11 +111,14 @@ def _audit_shift_row(
 ) -> None:
     if shift_context is None:
         shift_context = shift_instance_audit_context(shift)
+    from apps.activity.audit_messages import shift_audit_text
+
+    text = shift_audit_text(endpoint=endpoint, shift=shift, action=action)
     kw = dict(
         user=user,
         request=request,
         section='Смены',
-        description=f'Смена #{shift.pk}: {endpoint}',
+        description=text,
         action=action,
         model_cls=Shift,
         payload_extra={'endpoint': endpoint},
@@ -129,11 +134,13 @@ def _audit_shift_row(
 
 
 def _audit_shift_note_row(request, user, note: ShiftNote, *, endpoint: str) -> None:
+    from apps.activity.audit_messages import shift_note_audit_text
+
     schedule_entity_audit(
         user=user,
         request=request,
         section='Смены',
-        description=f'Заметка к смене #{note.shift_id} (запись #{note.pk})',
+        description=shift_note_audit_text(note),
         action='create',
         model_cls=ShiftNote,
         after_instance=note,
@@ -868,7 +875,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             user=request.user,
             request=request,
             section='ОТК',
-            description=f'Приёмка ОТК: партия #{batch.pk}, заказ #{batch.order_id}',
+            description=f'Приёмка ОТК: {batch.product or "партия"}',
             action='update',
             model_cls=ProductionBatch,
             before=before_batch,
@@ -1760,7 +1767,7 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             user=request.user,
             request=request,
             section='Производство',
-            description=f'Отправка запуска #{run.pk} в ОТК (партия {batch.pk})',
+            description='Отправка замеса в ОТК',
             action='update',
             model_cls=RecipeRun,
             before=before_run,

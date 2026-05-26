@@ -385,6 +385,12 @@ ACCESS_KEYS = [
     'client_orders', 'payments', 'returns', 'defects',
 ]
 
+# Журнал «Действия за смену»: entity_type (app_label.model_name), которые привязываются к shift_id.
+# Переопределение: AUDIT_SHIFT_ENTITY_TYPES=materials.rawmaterial,sales.sale,... (через env)
+# Полный список по умолчанию — apps.activity.shift_audit.DEFAULT_AUDIT_SHIFT_ENTITY_TYPES
+AUDIT_SHIFT_ENTITY_TYPES = None  # None → дефолт из shift_audit.py
+
+
 # Имена ролей из seed_roles: при создании User без role назначается «Планировщик»,
 # для суперпользователя — «Админ» (чтобы вкладки UI совпадали с матрицей RoleAccess).
 USERS_DEFAULT_ROLE_NAME = 'Планировщик'

@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime
 
-from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import generics, viewsets
@@ -14,6 +13,7 @@ from config.permissions import IsAdminOrHasAccess
 
 from .models import UserActivity
 from .serializers import UserActivitySerializer
+from .shift_audit import filter_activities_for_shift
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,10 @@ class ActivityMyView(viewsets.ViewSet):
     Параметры: page, page_size, shift_id,
     entity_type, entity_id, action, request_id,
     date_from, date_to (YYYY-MM-DD).
-    shift_id — действия этой смены: по полю shift_id ИЛИ по времени opened_at … closed_at
-    (чтобы попадали записи без shift_id, пока смена была открыта).
-    При переданном shift_id фильтры date_from / date_to не применяются — окно смены уже задаёт интервал;
-    иначе комбинация shift_id + даты часто давала пустой список (часовой пояс / другой календарный день).
+    shift_id — операционные действия смены (whitelist entity_type в AUDIT_SHIFT_ENTITY_TYPES):
+    shift_id=смена ИЛИ legacy без shift_id в интервале opened_at … closed_at (только whitelist).
+    Вне whitelist (users, recipes, analytics, …) в отчёт смены не попадают.
+    При переданном shift_id фильтры date_from / date_to не применяются.
     """
 
     permission_classes = [IsAuthenticated]
@@ -85,7 +85,6 @@ class ActivityMyView(viewsets.ViewSet):
         shift_applied = False
         if shift_id:
             from apps.production.models import Shift
-            from django.utils import timezone
 
             shift = Shift.objects.filter(pk=shift_id, user=request.user).first()
             if not shift:
@@ -94,12 +93,7 @@ class ActivityMyView(viewsets.ViewSet):
                     {'code': 'not_found', 'error': msg, 'detail': msg},
                     status=404,
                 )
-            end = shift.closed_at or timezone.now()
-            # Явная привязка к смене ИЛИ попадание во временной интервал смены (старые строки без shift_id)
-            qs = qs.filter(
-                Q(shift_id=shift.pk)
-                | Q(created_at__gte=shift.opened_at, created_at__lte=end)
-            )
+            qs = filter_activities_for_shift(qs, shift)
             shift_applied = True
 
         qs = _apply_activity_filters(qs, request.query_params)
@@ -202,7 +196,6 @@ class ActivityAdminView(viewsets.ViewSet):
         shift_applied = False
         if shift_id:
             from apps.production.models import Shift
-            from django.utils import timezone
 
             shift = Shift.objects.filter(pk=shift_id).first()
             if not shift:
@@ -211,11 +204,7 @@ class ActivityAdminView(viewsets.ViewSet):
                     {'code': 'not_found', 'error': msg, 'detail': msg},
                     status=404,
                 )
-            end = shift.closed_at or timezone.now()
-            qs = qs.filter(
-                Q(shift_id=shift.pk)
-                | Q(created_at__gte=shift.opened_at, created_at__lte=end)
-            )
+            qs = filter_activities_for_shift(qs, shift)
             shift_applied = True
 
         qs = _apply_activity_filters(qs, request.query_params)
