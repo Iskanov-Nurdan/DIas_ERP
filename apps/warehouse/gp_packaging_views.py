@@ -11,7 +11,6 @@ from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.realtime.broadcast import schedule_push
 from config.pagination import WarehouseResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 
@@ -165,12 +164,5 @@ class GpPackageViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.
             return Response(_normalize_post_error(exc.detail), status=status.HTTP_400_BAD_REQUEST)
         op = GpPackOperation.objects.prefetch_related('units', 'run_allocations').get(pk=op.pk)
         out = GpPackOperationDetailSerializer(op).data
-        if created:
-            schedule_push(
-                resource='warehouse_package',
-                action='created',
-                entity_id=op.pk,
-                extra={'product_id': op.product_id, 'blank_id': op.blank_id},
-            )
         st = status.HTTP_201_CREATED if created else status.HTTP_200_OK
         return Response(out, status=st)

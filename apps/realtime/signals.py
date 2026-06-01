@@ -19,11 +19,16 @@ from apps.production.models import (
     ShiftNote,
 )
 from apps.recipes.models import PlasticProfile, Recipe, RecipeComponent
-from apps.sales.models import DefectRecord, Order, Payment, Return, ReworkRequest, Sale
-from apps.warehouse.models import WarehouseBatch
-from apps.workshop.models import WorkshopBlank
+from apps.sales.models import Client, DefectRecord, Order, Payment, Return, ReworkRequest, Sale
+from apps.warehouse.models import GpPackOperation, WarehouseBatch
+from apps.workshop.models import (
+    BlankProductionRun,
+    WorkshopBlank,
+    WorkshopBlankCompositionLine,
+    WorkshopPreparedState,
+)
 
-from .broadcast import schedule_push
+from .broadcast import schedule_blank_run_push, schedule_push
 
 
 def _act(created: bool) -> str:
@@ -433,6 +438,79 @@ def workshop_blank_saved(sender, instance, created, **kwargs):
 @receiver(post_delete, sender=WorkshopBlank)
 def workshop_blank_deleted(sender, instance, **kwargs):
     schedule_push(resource='workshop_blank', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=WorkshopBlankCompositionLine)
+def workshop_blank_composition_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='workshop_blank', action='updated', entity_id=instance.blank_id)
+
+
+@receiver(post_delete, sender=WorkshopBlankCompositionLine)
+def workshop_blank_composition_deleted(sender, instance, **kwargs):
+    schedule_push(resource='workshop_blank', action='updated', entity_id=instance.blank_id)
+
+
+@receiver(post_save, sender=WorkshopPreparedState)
+def workshop_prepared_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='prepared_blank',
+        action=_act(created),
+        entity_id=instance.blank_id,
+        extra={'blank_id': instance.blank_id},
+    )
+
+
+@receiver(post_delete, sender=WorkshopPreparedState)
+def workshop_prepared_deleted(sender, instance, **kwargs):
+    schedule_push(
+        resource='prepared_blank',
+        action='deleted',
+        entity_id=instance.blank_id,
+        extra={'blank_id': instance.blank_id},
+    )
+
+
+@receiver(post_save, sender=BlankProductionRun)
+def blank_production_run_saved(sender, instance, created, **kwargs):
+    schedule_blank_run_push(
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={
+            'blank_id': instance.blank_id,
+            'status': instance.status,
+            'production_batch_id': instance.production_batch_id,
+        },
+    )
+
+
+@receiver(post_delete, sender=BlankProductionRun)
+def blank_production_run_deleted(sender, instance, **kwargs):
+    schedule_blank_run_push(action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=Client)
+def client_saved(sender, instance, created, **kwargs):
+    schedule_push(resource='client', action=_act(created), entity_id=instance.pk)
+
+
+@receiver(post_delete, sender=Client)
+def client_deleted(sender, instance, **kwargs):
+    schedule_push(resource='client', action='deleted', entity_id=instance.pk)
+
+
+@receiver(post_save, sender=GpPackOperation)
+def gp_pack_operation_saved(sender, instance, created, **kwargs):
+    schedule_push(
+        resource='warehouse_package',
+        action=_act(created),
+        entity_id=instance.pk,
+        extra={'product_id': instance.product_id, 'blank_id': instance.blank_id},
+    )
+
+
+@receiver(post_delete, sender=GpPackOperation)
+def gp_pack_operation_deleted(sender, instance, **kwargs):
+    schedule_push(resource='warehouse_package', action='deleted', entity_id=instance.pk)
 
 
 @receiver(post_save, sender=Payment)
