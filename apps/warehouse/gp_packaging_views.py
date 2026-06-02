@@ -139,6 +139,24 @@ class GpPackageViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.
             return GpPackageCreateSerializer
         return GpPackageJournalSerializer
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        if not isinstance(response.data, dict):
+            return response
+        items = response.data.get('items') or []
+        pieces_total = sum(int(x.get('total_pieces') or 0) for x in items)
+        meta = dict(response.data.get('meta') or {})
+        total = meta.get('total')
+        if total is None:
+            total = len(items)
+        meta['summary'] = {
+            'rows_count': len(items),
+            'packages_count': int(total),
+            'pieces_total': pieces_total,
+        }
+        response.data['meta'] = meta
+        return response
+
     def create(self, request, *args, **kwargs):
         ser = GpPackageCreateSerializer(data=request.data)
         if not ser.is_valid():

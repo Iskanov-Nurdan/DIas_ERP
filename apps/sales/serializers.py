@@ -2170,6 +2170,118 @@ class SaleSerializer(serializers.ModelSerializer):
             )
         return line_payload
 
+    def _prepare_packages_sale_line_row(self, row_in: dict, line_idx: int, input_qty: Decimal) -> dict:
+        """Разрешить gp_package_id и перевести quantity упаковок в штуки."""
+        from apps.warehouse.models import GpPackUnit, WarehouseBatch
+
+        row = dict(row_in)
+        gp_unit_obj = None
+        gp_pid = row.get('gp_package_id')
+        if gp_pid not in (None, ''):
+            try:
+                gp_int = int(gp_pid)
+            except (TypeError, ValueError):
+                self._raise_sale_line_error(
+                    'INVALID_GP_PACKAGE_ID',
+                    'gp_package_id должен быть целым числом.',
+                    line_idx=line_idx,
+                    field_name='gp_package_id',
+                )
+            gp_unit_obj = (
+                GpPackUnit.objects.select_related('warehouse_batch', 'operation')
+                .filter(pk=gp_int)
+                .first()
+            )
+            if gp_unit_obj is None:
+                self._raise_sale_line_error(
+                    'GP_PACKAGE_NOT_FOUND',
+                    'Упаковка gp_package_id не найдена.',
+                    line_idx=line_idx,
+                    field_name='gp_package_id',
+                )
+            if not gp_unit_obj.warehouse_batch_id:
+                self._raise_sale_line_error(
+                    'GP_PACKAGE_NOT_ON_STOCK',
+                    'Упаковка GP не привязана к партии склада.',
+                    line_idx=line_idx,
+                    field_name='gp_package_id',
+                )
+            from apps.warehouse.gp_sale_sources import gp_package_is_sold
+
+            if gp_package_is_sold(gp_unit_obj):
+                self._raise_sale_line_error(
+                    'GP_PACKAGE_ALREADY_SOLD',
+                    'Упаковка уже продана или недоступна.',
+                    line_idx=line_idx,
+                    field_name='gp_package_id',
+                )
+            if input_qty != Decimal('1'):
+                self._raise_sale_line_error(
+                    'GP_PACKAGE_QUANTITY_MUST_BE_ONE',
+                    'Для gp_package_id quantity должен быть 1 (одна физическая упаковка).',
+                    line_idx=line_idx,
+                    field_name='quantity',
+                )
+            wb_id_in = row.get('warehouse_batch')
+            if wb_id_in not in (None, ''):
+                try:
+                    if int(wb_id_in) != int(gp_unit_obj.warehouse_batch_id):
+                        self._raise_sale_line_error(
+                            'WAREHOUSE_BATCH_GP_MISMATCH',
+                            'warehouse_batch не совпадает с партией выбранной упаковки gp_package_id.',
+                            line_idx=line_idx,
+                            field_name='warehouse_batch',
+                        )
+                except (TypeError, ValueError):
+                    self._raise_sale_line_error(
+                        'INVALID_WAREHOUSE_BATCH',
+                        'Некорректный warehouse_batch.',
+                        line_idx=line_idx,
+                        field_name='warehouse_batch',
+                    )
+            row['warehouse_batch'] = gp_unit_obj.warehouse_batch_id
+            row['gp_pack_unit'] = gp_unit_obj
+
+        wb_id = row.get('warehouse_batch')
+        if wb_id in (None, ''):
+            self._raise_sale_error(
+                'MISSING_WAREHOUSE_BATCH',
+                'Для unit_type=packages в строке обязателен warehouse_batch или gp_package_id.',
+                field='sale_lines',
+            )
+        try:
+            wb_pkg = WarehouseBatch.objects.get(pk=wb_id)
+        except WarehouseBatch.DoesNotExist:
+            self._raise_sale_error(
+                'MISSING_WAREHOUSE_BATCH',
+                'Указанная warehouse_batch не найдена.',
+                field='sale_lines',
+            )
+        if wb_pkg.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+            self._raise_sale_line_error(
+                'BATCH_NOT_AVAILABLE_FOR_UNIT_TYPE',
+                'Для unit_type=packages нужна партия с inventory_form=packed.',
+                line_idx=line_idx,
+                field_name='warehouse_batch',
+            )
+        try:
+            ppp = Decimal(str(wb_pkg.pieces_per_package or 0))
+        except (InvalidOperation, TypeError, ValueError):
+            ppp = Decimal('0')
+        if ppp <= 0 and gp_unit_obj is None:
+            self._raise_sale_error(
+                'INVALID_PACKAGE_BATCH',
+                'Для продажи упаковками у партии должен быть pieces_per_package > 0.',
+                field='sale_lines',
+            )
+        if gp_unit_obj is not None:
+            row['quantity'] = Decimal(str(gp_unit_obj.pieces)).quantize(Decimal('0.0001'))
+        else:
+            row['quantity'] = (input_qty * ppp).quantize(Decimal('0.0001'))
+        row['stock_form'] = WarehouseBatch.INVENTORY_PACKED
+        row.setdefault('piece_pick', PIECE_FROM_SEALED)
+        return row
+
     def validate(self, attrs):
         initial = self.initial_data or {}
         if self.instance is not None and ('sale_status' in initial or 'status' in initial):
@@ -2266,9 +2378,31 @@ class SaleSerializer(serializers.ModelSerializer):
                         field=forbidden,
                     )
             shipping_target = True
+            top_level_unit_type = str(
+                initial.get('unit_type') or attrs.get('sale_mode') or Sale.MODE_PIECES
+            ).strip().lower()
+            prepared_for_validate = []
+            for line_idx, row in enumerate(lines):
+                row_in = dict(row or {})
+                line_unit_type_raw = row_in.get('unit_type')
+                if line_unit_type_raw in (None, ''):
+                    line_unit_type = top_level_unit_type
+                else:
+                    line_unit_type = str(line_unit_type_raw).strip().lower()
+                try:
+                    input_qty = Decimal(str(row_in.get('quantity') or 0))
+                except (InvalidOperation, TypeError, ValueError):
+                    self._raise_sale_error(
+                        'SALE_QUANTITY_INVALID',
+                        'quantity в строке должен быть числом больше 0.',
+                        field='sale_lines',
+                    )
+                if line_unit_type == Sale.MODE_PACKAGES:
+                    row_in = self._prepare_packages_sale_line_row(row_in, line_idx, input_qty)
+                prepared_for_validate.append(row_in)
             normalized_lines = [
                 self._validate_sale_line_payload(row, shipping_target=shipping_target)
-                for row in lines
+                for row in prepared_for_validate
             ]
             if not attrs.get('product'):
                 attrs['product'] = normalized_lines[0]['product']
@@ -2519,91 +2653,7 @@ class SaleSerializer(serializers.ModelSerializer):
                     field='sale_lines',
                 )
             if line_unit_type == Sale.MODE_PACKAGES:
-                gp_pid = row_in.get('gp_package_id')
-                if gp_pid not in (None, ''):
-                    try:
-                        gp_int = int(gp_pid)
-                    except (TypeError, ValueError):
-                        self._raise_sale_line_error(
-                            'INVALID_GP_PACKAGE_ID',
-                            'gp_package_id должен быть целым числом.',
-                            line_idx=line_idx,
-                            field_name='gp_package_id',
-                        )
-                    gp_unit_obj = (
-                        GpPackUnit.objects.select_related('warehouse_batch', 'operation')
-                        .filter(pk=gp_int)
-                        .first()
-                    )
-                    if gp_unit_obj is None:
-                        self._raise_sale_line_error(
-                            'GP_PACKAGE_NOT_FOUND',
-                            'Упаковка gp_package_id не найдена.',
-                            line_idx=line_idx,
-                            field_name='gp_package_id',
-                        )
-                    if not gp_unit_obj.warehouse_batch_id:
-                        self._raise_sale_line_error(
-                            'GP_PACKAGE_NOT_ON_STOCK',
-                            'Упаковка GP не привязана к партии склада.',
-                            line_idx=line_idx,
-                            field_name='gp_package_id',
-                        )
-                    wb_id_in = row_in.get('warehouse_batch')
-                    if wb_id_in not in (None, ''):
-                        try:
-                            if int(wb_id_in) != int(gp_unit_obj.warehouse_batch_id):
-                                self._raise_sale_line_error(
-                                    'WAREHOUSE_BATCH_GP_MISMATCH',
-                                    'warehouse_batch не совпадает с партией выбранной упаковки gp_package_id.',
-                                    line_idx=line_idx,
-                                    field_name='warehouse_batch',
-                                )
-                        except (TypeError, ValueError):
-                            self._raise_sale_line_error(
-                                'INVALID_WAREHOUSE_BATCH',
-                                'Некорректный warehouse_batch.',
-                                line_idx=line_idx,
-                                field_name='warehouse_batch',
-                            )
-                    row_in['warehouse_batch'] = gp_unit_obj.warehouse_batch_id
-                    row_in['gp_pack_unit'] = gp_unit_obj
-
-                wb_id = row_in.get('warehouse_batch')
-                if wb_id in (None, ''):
-                    self._raise_sale_error(
-                        'MISSING_WAREHOUSE_BATCH',
-                        'Для unit_type=packages в строке обязателен warehouse_batch или gp_package_id.',
-                        field='sale_lines',
-                    )
-                try:
-                    wb_pkg = WarehouseBatch.objects.get(pk=wb_id)
-                except WarehouseBatch.DoesNotExist:
-                    self._raise_sale_error(
-                        'MISSING_WAREHOUSE_BATCH',
-                        'Указанная warehouse_batch не найдена.',
-                        field='sale_lines',
-                    )
-                if wb_pkg.inventory_form != WarehouseBatch.INVENTORY_PACKED:
-                    self._raise_sale_line_error(
-                        'BATCH_NOT_AVAILABLE_FOR_UNIT_TYPE',
-                        'Для unit_type=packages нужна партия с inventory_form=packed.',
-                        line_idx=line_idx,
-                        field_name='warehouse_batch',
-                    )
-                try:
-                    ppp = Decimal(str(wb_pkg.pieces_per_package or 0))
-                except (InvalidOperation, TypeError, ValueError):
-                    ppp = Decimal('0')
-                if ppp <= 0:
-                    self._raise_sale_error(
-                        'INVALID_PACKAGE_BATCH',
-                        'Для продажи упаковками у партии должен быть pieces_per_package > 0.',
-                        field='sale_lines',
-                    )
-                row_in['quantity'] = (input_qty * ppp).quantize(Decimal('0.0001'))
-                row_in['stock_form'] = WarehouseBatch.INVENTORY_PACKED
-                row_in.setdefault('piece_pick', PIECE_FROM_SEALED)
+                row_in = self._prepare_packages_sale_line_row(row_in, line_idx, input_qty)
             else:
                 if row_in.get('warehouse_batch') not in (None, ''):
                     try:

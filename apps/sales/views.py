@@ -1522,6 +1522,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             '- available_packages — только когда известны запечатанные упаковки: для packed = total/ipp; '
             'для unpacked/open_package — только если задано packages_count>0 (иначе null, '
             'чтобы фронт не вычитал «виртуальные коробки» из total при отсутствии учёта запечатанного).\n'
+            'При unit_type=packages партии с индивидуальным учётом (GpPackUnit) не дублируются в '
+            'available_warehouse_batches — только в available_gp_packages[]. '
+            'Продажа таких упаковок — через sale_lines[].gp_package_id (quantity=1).\n'
             'При unit_type=pieces партии packed не включаются; строки без неупакованного хвоста '
             '(unpacked_pieces<=0) тоже исключаются. '
             'supports_packages=true при inventory_form=packed и pieces_per_package>0. '
@@ -1530,6 +1533,11 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     )
     def select_sources(self, request):
         from apps.warehouse.models import WarehouseBatch
+        from apps.warehouse.gp_sale_sources import (
+            available_gp_pack_units_queryset,
+            serialize_gp_package_for_sale,
+            warehouse_batch_ids_with_gp_units,
+        )
         from .reservations import get_available_quantity
 
         clients = list(
@@ -1542,6 +1550,13 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if not client_id:
             client_id = request.query_params.get('client')
         unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
+        gp_units_qs = available_gp_pack_units_queryset()
+        gp_tracked_batch_ids = warehouse_batch_ids_with_gp_units(gp_units_qs)
+        available_gp_packages = []
+        if unit_type == Sale.MODE_PACKAGES:
+            available_gp_packages = [
+                serialize_gp_package_for_sale(u) for u in gp_units_qs[:500]
+            ]
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
         orders = list(
@@ -1610,6 +1625,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             total_pieces = av['total_pieces']
             avail_packages = av['available_packages_str']
             is_packed = b.inventory_form == WarehouseBatch.INVENTORY_PACKED
+            if unit_type == Sale.MODE_PACKAGES and is_packed and b.pk in gp_tracked_batch_ids:
+                continue
             # Во вкладке «штуки» не показываем закрытые упаковки — остаток только в GP/упаковках.
             if unit_type == Sale.MODE_PACKAGES:
                 if not is_packed:
@@ -1734,6 +1751,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'warehouse_batches': warehouse_batches,
             'available_orders': available_orders,
             'available_warehouse_batches': available_batches,
+            'available_gp_packages': available_gp_packages,
         })
 
     @action(detail=False, methods=['post'], url_path='preview')
@@ -1741,7 +1759,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         """
         Предпросмотр продажи без списаний и без сохранения.
         """
-        from apps.warehouse.models import WarehouseBatch
+        from apps.warehouse.models import GpPackUnit, WarehouseBatch
+        from apps.warehouse.gp_sale_sources import gp_package_is_sold
         from .reservations import get_available_quantity
 
         data = request.data or {}
@@ -1781,10 +1800,30 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 )
                 continue
             wb_id = row.get('warehouse_batch')
+            gp_pid = row.get('gp_package_id')
             qty_raw = row.get('quantity')
             up_raw = row.get('unit_price')
+            gp_unit = None
+            if gp_pid not in (None, ''):
+                try:
+                    gp_int = int(gp_pid)
+                except (TypeError, ValueError):
+                    errors.append({'field': f'sale_lines[{idx}].gp_package_id', 'message': 'gp_package_id должен быть числом'})
+                    continue
+                gp_unit = (
+                    GpPackUnit.objects.select_related('warehouse_batch', 'operation')
+                    .filter(pk=gp_int)
+                    .first()
+                )
+                if gp_unit is None:
+                    errors.append({'field': f'sale_lines[{idx}].gp_package_id', 'message': 'Упаковка не найдена'})
+                    continue
+                if gp_package_is_sold(gp_unit):
+                    errors.append({'field': f'sale_lines[{idx}].gp_package_id', 'message': 'Упаковка уже продана'})
+                    continue
+                wb_id = gp_unit.warehouse_batch_id
             if wb_id in (None, ''):
-                errors.append({'field': f'sale_lines[{idx}].warehouse_batch', 'message': 'warehouse_batch обязателен'})
+                errors.append({'field': f'sale_lines[{idx}].warehouse_batch', 'message': 'warehouse_batch или gp_package_id обязателен'})
                 continue
             if qty_raw in (None, ''):
                 errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity обязателен'})
@@ -1842,10 +1881,16 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                         },
                     )
                     continue
-                if ppp <= 0:
+                if ppp <= 0 and gp_unit is None:
                     errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'Для продажи в упаковках у партии нет pieces_per_package'})
                     continue
-                qty_pieces = (qty_in * ppp).quantize(Decimal('0.0001'))
+                if gp_unit is not None:
+                    if qty_in != Decimal('1'):
+                        errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'Для gp_package_id quantity должен быть 1'})
+                        continue
+                    qty_pieces = Decimal(str(gp_unit.pieces)).quantize(Decimal('0.0001'))
+                else:
+                    qty_pieces = (qty_in * ppp).quantize(Decimal('0.0001'))
             else:
                 qty_pieces = qty_in.quantize(Decimal('0.0001'))
             if qty_pieces > available_pieces + Decimal('0.0001'):
@@ -1858,6 +1903,7 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             total_amount += line_total
             normalized_lines.append({
                 'warehouse_batch': wb.pk,
+                'gp_package_id': gp_unit.pk if gp_unit else None,
                 'warehouse_batch_display': f"{(wb.profile.name if wb.profile_id else wb.product)}",
                 'unit_type': line_unit_type,
                 'input_quantity': api_decimal_str(qty_in),

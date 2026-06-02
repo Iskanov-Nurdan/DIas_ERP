@@ -189,7 +189,12 @@ _raw_cors_origins = os.environ.get(
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _raw_cors_origins if o.strip()]
 if DEBUG and not os.environ.get('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOW_ALL_ORIGINS = False
-    CORS_ALLOWED_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000']
+    CORS_ALLOWED_ORIGINS = [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+    ]
 
 # Кастомные заголовки: расширяем default_headers (а не подменяем целиком).
 CORS_ALLOW_HEADERS = list(default_headers) + [

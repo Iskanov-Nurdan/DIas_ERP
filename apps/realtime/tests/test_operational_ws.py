@@ -80,6 +80,22 @@ class OperationalWsTests(TransactionTestCase):
 
         asyncio.run(_run())
 
+    def test_ping_pong(self):
+        async def _run():
+            comm = WebsocketCommunicator(
+                application, f'/ws/operational/?token={self.token}', headers=_WS_HEADERS
+            )
+            connected, _ = await comm.connect()
+            assert connected
+            await comm.receive_json_from()
+
+            await comm.send_json_to({'event': 'ping', 'protocol_version': 1})
+            msg = await comm.receive_json_from()
+            assert msg == {'event': 'pong', 'protocol_version': 1}
+            await comm.disconnect()
+
+        asyncio.run(_run())
+
     def test_group_name(self):
         assert OPERATIONAL_GROUP == 'operational'
         assert get_channel_layer() is not None
