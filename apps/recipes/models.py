@@ -13,6 +13,20 @@ class PlasticProfile(models.Model):
         null=True,
         blank=True,
     )
+    cost_price = models.DecimalField(
+        'Себестоимость за 1 шт, сом (только расчёт ОТК)',
+        max_digits=16,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        default=None,
+    )
+    markup_amount = models.DecimalField(
+        'Наценка за 1 шт, сом',
+        max_digits=16,
+        decimal_places=4,
+        default=0,
+    )
     comment = models.TextField('Комментарий', blank=True, default='')
     is_active = models.BooleanField('Активен', default=True)
 

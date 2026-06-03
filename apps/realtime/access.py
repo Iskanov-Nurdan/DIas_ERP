@@ -24,6 +24,7 @@ RESOURCE_ACCESS_KEYS: dict[str, tuple[str, ...]] = {
     'prepared_blank': ('materials',),
     'blank_production_run': ('materials', 'production'),
     'workshop_run': ('materials', 'production'),
+    'otk': ('materials', 'warehouse', 'production'),
     'plastic_profile': ('recipes', 'materials'),
     # Производство
     'order': ('client_orders', 'orders'),

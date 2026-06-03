@@ -13,7 +13,7 @@ from apps.workshop.services import deduct_blank_from_workshop, _q_kg
 def create_run_deduct_workshop_only(
     *,
     blank: WorkshopBlank,
-    product,
+    product=None,
     validated: dict,
     production_batch=None,
     order_line=None,
@@ -28,17 +28,21 @@ def create_run_deduct_workshop_only(
 
     deduct_blank_from_workshop(blank_locked, used)
 
-    return BlankProductionRun.objects.create(
+    from apps.workshop.otk_pool import add_otk_pool_intake
+
+    run = BlankProductionRun.objects.create(
         blank=blank_locked,
         blank_name_snapshot=blank_locked.name,
         product=product,
-        product_name_snapshot=product.name,
+        product_name_snapshot=(product.name if product else ''),
         blank_total_kg=validated['blank_total_kg'],
         blank_used_in_production_kg=used,
         vat_max_kg_demo=validated['vat_max_kg_demo'],
-        weight_kg_per_piece=validated['weight_kg_per_piece'],
+        weight_kg_per_piece=validated.get('weight_kg_per_piece'),
         status=BlankProductionRun.STATUS_IN_PRODUCTION,
         production_batch=production_batch,
         order_line=order_line,
         client_request=client_request,
     )
+    add_otk_pool_intake(blank=blank_locked, kg=used, run=run)
+    return run

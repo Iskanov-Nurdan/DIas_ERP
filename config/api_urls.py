@@ -63,6 +63,13 @@ from apps.activity.views import (
     ActivityAdminRetrieveView,
 )
 from apps.workshop.views import BlankProductionRunViewSet, PreparedBlankViewSet, WorkshopBlankViewSet
+from apps.workshop.otk_views import (
+    OtkAccountingViewSet,
+    OtkBlankAccountView,
+    OtkBlanksIntakesView,
+    OtkBlanksListView,
+)
+from apps.warehouse.gp_stock_views import GpStockView
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -130,11 +137,20 @@ router.register(
     BlankProductionRunViewSet,
     basename='workshop-blank-production-run',
 )
+router.register(r'workshop/otk-accounting', OtkAccountingViewSet, basename='workshop-otk-accounting')
 
 # Фиксированные пути регистрируются ДО роутера, чтобы не конфликтовать с <pk>
 urlpatterns = [
+    path('warehouse/gp-stock/', GpStockView.as_view(), name='warehouse-gp-stock'),
     path('warehouse/gp-unpacked-balance/', GpUnpackedBalanceView.as_view(), name='warehouse-gp-unpacked-balance'),
     path('warehouse/operations/', WarehouseOperationsView.as_view(), name='warehouse-operations'),
+    path('workshop/otk-blanks/', OtkBlanksListView.as_view(), name='workshop-otk-blanks'),
+    path('workshop/otk-blanks/intakes/', OtkBlanksIntakesView.as_view(), name='workshop-otk-blanks-intakes'),
+    path(
+        'workshop/otk-blanks/<int:blank_id>/account/',
+        OtkBlankAccountView.as_view(),
+        name='workshop-otk-blank-account',
+    ),
     path(
         'shifts/complaints/',
         ShiftComplaintViewSet.as_view({'get': 'list', 'post': 'create'}),

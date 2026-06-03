@@ -313,12 +313,18 @@ class BlankProductionRunCreateSerializer(serializers.Serializer):
         queryset=WorkshopBlank.objects.all(), write_only=True, source='blank'
     )
     product_id = serializers.PrimaryKeyRelatedField(
-        queryset=PlasticProfile.objects.all(), write_only=True, source='product'
+        queryset=PlasticProfile.objects.all(),
+        write_only=True,
+        source='product',
+        required=False,
+        allow_null=True,
     )
     blank_total_kg = serializers.DecimalField(max_digits=14, decimal_places=6)
     blank_used_in_production_kg = serializers.DecimalField(max_digits=14, decimal_places=6)
     vat_max_kg_demo = serializers.DecimalField(max_digits=14, decimal_places=6)
-    weight_kg_per_piece = serializers.DecimalField(max_digits=14, decimal_places=6)
+    weight_kg_per_piece = serializers.DecimalField(
+        max_digits=14, decimal_places=6, required=False, allow_null=True
+    )
 
     def validate_blank_used_in_production_kg(self, value):
         if Decimal(str(value)) <= 0:
@@ -326,6 +332,8 @@ class BlankProductionRunCreateSerializer(serializers.Serializer):
         return value
 
     def validate_weight_kg_per_piece(self, value):
+        if value is None:
+            return value
         if Decimal(str(value)) <= 0:
             raise serializers.ValidationError('Вес одной штуки должен быть больше нуля.')
         return value

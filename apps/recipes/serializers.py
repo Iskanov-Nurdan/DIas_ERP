@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 from config.fields import CleanDecimalField
 from .models import PlasticProfile, Recipe, RecipeComponent
+from .profile_cost import serialize_profile_cost_price
 from .profile_policy import generate_plastic_profile_code, plastic_profile_deletable
 
 
@@ -22,21 +23,35 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
     weight_kg_per_piece = serializers.DecimalField(
         max_digits=14, decimal_places=6, required=False, allow_null=True, coerce_to_string=False
     )
+    cost_price = serializers.SerializerMethodField()
+    markup_amount = serializers.DecimalField(
+        max_digits=16, decimal_places=4, required=False, coerce_to_string=False
+    )
 
-    _WRITE_FIELDS = frozenset({'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece'})
+    _WRITE_FIELDS = frozenset({
+        'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece', 'markup_amount',
+    })
 
     class Meta:
         model = PlasticProfile
-        fields = ('id', 'name', 'code', 'comment', 'is_active', 'deletable', 'weight_kg_per_piece')
+        fields = (
+            'id', 'name', 'code', 'comment', 'is_active', 'deletable',
+            'weight_kg_per_piece', 'cost_price', 'markup_amount',
+        )
 
     def __init__(self, *args, **kwargs):
         data = kwargs.get('data')
         if data is not None and hasattr(data, 'keys'):
-            kwargs['data'] = {k: data[k] for k in data.keys() if k in self._WRITE_FIELDS}
+            kwargs['data'] = {
+                k: data[k] for k in data.keys() if k in self._WRITE_FIELDS and k != 'cost_price'
+            }
         super().__init__(*args, **kwargs)
 
     def get_deletable(self, obj):
         return plastic_profile_deletable(obj)
+
+    def get_cost_price(self, obj):
+        return serialize_profile_cost_price(obj.cost_price)
 
     def validate_name(self, value):
         if not (value or '').strip():
@@ -82,6 +97,7 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
     has_recipe = serializers.SerializerMethodField()
     recipes = serializers.SerializerMethodField()
     deletable = serializers.SerializerMethodField()
+    cost_price = serializers.SerializerMethodField()
 
     class Meta:
         model = PlasticProfile
@@ -92,11 +108,16 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
             'comment',
             'is_active',
             'weight_kg_per_piece',
+            'cost_price',
+            'markup_amount',
             'recipes_count',
             'has_recipe',
             'recipes',
             'deletable',
         )
+
+    def get_cost_price(self, obj):
+        return serialize_profile_cost_price(obj.cost_price)
 
     def get_has_recipe(self, obj):
         return (getattr(obj, 'recipes_count', 0) or 0) > 0
@@ -115,9 +136,14 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
 class PlasticProfileNestedSerializer(serializers.ModelSerializer):
     """Вложение в рецепт (без deletable и списка рецептов)."""
 
+    cost_price = serializers.SerializerMethodField()
+
     class Meta:
         model = PlasticProfile
-        fields = ('id', 'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece')
+        fields = ('id', 'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece', 'cost_price', 'markup_amount')
+
+    def get_cost_price(self, obj):
+        return serialize_profile_cost_price(obj.cost_price)
 
 
 class RecipeComponentSerializer(serializers.ModelSerializer):

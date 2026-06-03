@@ -1,12 +1,11 @@
 """API цеха: заготовки (бочки + дробь), партии, ОТК, приёмка ГП."""
 from __future__ import annotations
 
-from decimal import ROUND_DOWN, Decimal
+from decimal import Decimal
 
-from django.db import models, transaction
+from django.db import models
 from django.db.models import IntegerField, Prefetch, Q, Sum, Value
 from django.db.models.functions import Coalesce
-from django.utils import timezone
 from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import serializers, status, viewsets
@@ -26,10 +25,8 @@ from apps.workshop.models import (
     WorkshopBlankCompositionLine,
 )
 from apps.workshop.serializers import (
-    AcceptGpSerializer,
     BlankProductionRunCreateSerializer,
     BlankProductionRunSerializer,
-    OtkDefectSerializer,
     WorkshopBlankCreateSerializer,
     WorkshopBlankPartialSerializer,
     WorkshopBlankReadSerializer,
@@ -37,11 +34,6 @@ from apps.workshop.serializers import (
 )
 from apps.workshop.barrel_materials import add_prepared_barrel_with_stock
 from apps.workshop.blank_run_stock import create_run_deduct_workshop_only
-from apps.workshop.services import (
-    accept_goods_to_warehouse_gp,
-    append_kg_to_workshop_prepared,
-    append_machine_remainder_to_workshop,
-)
 
 
 class WorkshopPreparedPagination(PageNumberPagination):
@@ -204,125 +196,31 @@ class BlankProductionRunViewSet(viewsets.ModelViewSet):
         v = ser.validated_data
         run = create_run_deduct_workshop_only(
             blank=v['blank'],
-            product=v['product'],
+            product=v.get('product'),
             validated={
                 'blank_total_kg': v['blank_total_kg'],
                 'blank_used_in_production_kg': v['blank_used_in_production_kg'],
                 'vat_max_kg_demo': v['vat_max_kg_demo'],
-                'weight_kg_per_piece': v['weight_kg_per_piece'],
+                'weight_kg_per_piece': v.get('weight_kg_per_piece'),
             },
         )
+        from apps.realtime.broadcast import schedule_otk_push, schedule_push
+
+        schedule_otk_push(action='created', entity_id=run.blank_id, extra={'blank_id': run.blank_id})
+        schedule_push(resource='workshop', action='updated', entity_id=run.blank_id, extra={'blank_id': run.blank_id})
         out = BlankProductionRunSerializer(run)
         return Response(out.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='otk-defect')
     def otk_defect(self, request, pk=None):
-        run = self.get_object()
-        ser = OtkDefectSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        defect_kg = Decimal(str(ser.validated_data['defect_kg']))
-        used = Decimal(str(run.blank_used_in_production_kg))
-        if defect_kg > used:
-            raise serializers.ValidationError({'defect_kg': 'Брак не может превышать массу партии с цеха.'})
-        if run.otk_recorded_at is not None:
-            raise WorkshopConflict(detail='Результат ОТК по этой партии уже зафиксирован.')
-
-        good_kg = used - defect_kg
-        w = Decimal(str(run.weight_kg_per_piece))
-        good_pieces = int((good_kg / w).to_integral_value(rounding=ROUND_DOWN))
-
-        with transaction.atomic():
-            run = BlankProductionRun.objects.select_for_update().get(pk=run.pk)
-            if run.otk_recorded_at is not None:
-                raise WorkshopConflict(detail='Результат ОТК по этой партии уже зафиксирован.')
-            run.defect_kg = defect_kg
-            run.good_kg = good_kg
-            run.good_pieces = good_pieces
-            run.otk_recorded_at = timezone.now()
-            run.status = BlankProductionRun.STATUS_OTK_DONE
-            run.save(
-                update_fields=[
-                    'defect_kg',
-                    'good_kg',
-                    'good_pieces',
-                    'otk_recorded_at',
-                    'status',
-                ]
-            )
-            if defect_kg > 0:
-                blank_w = WorkshopBlank.objects.select_for_update().get(pk=run.blank_id)
-                append_kg_to_workshop_prepared(blank_w, defect_kg)
-        return Response(BlankProductionRunSerializer(run).data)
+        return Response(
+            {'detail': 'Устарело: учёт ОТК через POST /api/workshop/otk-blanks/{blank_id}/account/.'},
+            status=status.HTTP_410_GONE,
+        )
 
     @action(detail=True, methods=['post'], url_path='accept-gp')
     def accept_gp(self, request, pk=None):
-        run = self.get_object()
-        ser = AcceptGpSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-
-        if run.otk_recorded_at is None:
-            raise serializers.ValidationError({'detail': 'Сначала зафиксируйте ОТК по партии.'})
-        if run.gp_accepted_at is not None:
-            raise WorkshopConflict(detail='Партия уже принята на склад ГП.')
-
-        good_pieces = run.good_pieces
-        if good_pieces is None:
-            raise serializers.ValidationError({'detail': 'Отсутствует расчётное количество годных штук.'})
-
-        good_kg = Decimal(str(run.good_kg))
-        w = Decimal(str(run.weight_kg_per_piece))
-        vat = Decimal(str(run.vat_max_kg_demo))
-
-        max_by_vat = None
-        if vat > 0 and w > 0:
-            max_by_vat = int((vat / w).to_integral_value(rounding=ROUND_DOWN))
-
-        candidates = [good_pieces]
-        if max_by_vat is not None:
-            candidates.append(max_by_vat)
-        allow = min(candidates)
-
-        req = ser.validated_data.get('accepted_pieces')
-        if req is None:
-            accepted = allow
-        else:
-            accepted = int(req)
-            if accepted > allow:
-                raise serializers.ValidationError(
-                    {'accepted_pieces': f'Не более допустимых {allow} шт с учётом годного и лимита.'}
-                )
-
-        accepted_kg = (w * Decimal(accepted)).quantize(Decimal('0.000001'))
-        machine_remainder_kg = (good_kg - accepted_kg).quantize(Decimal('0.000001'))
-        if machine_remainder_kg < 0:
-            machine_remainder_kg = Decimal('0')
-
-        with transaction.atomic():
-            run = BlankProductionRun.objects.select_for_update().get(pk=run.pk)
-            if run.gp_accepted_at is not None:
-                raise WorkshopConflict(detail='Партия уже принята на склад ГП.')
-
-            accept_goods_to_warehouse_gp(run, accepted)
-            if machine_remainder_kg > Decimal('0'):
-                append_machine_remainder_to_workshop(
-                    WorkshopBlank.objects.get(pk=run.blank_id), machine_remainder_kg
-                )
-
-            now = timezone.now()
-            run.gp_accepted_at = now
-            run.gp_accepted_pieces = accepted
-            run.gp_accepted_kg = accepted_kg
-            run.gp_machine_remainder_kg = machine_remainder_kg
-            run.status = BlankProductionRun.STATUS_GP_ACCEPTED
-            run.save(
-                update_fields=[
-                    'gp_accepted_at',
-                    'gp_accepted_pieces',
-                    'gp_accepted_kg',
-                    'gp_machine_remainder_kg',
-                    'status',
-                ]
-            )
-
-        fresh = BlankProductionRun.objects.select_related('blank', 'product').get(pk=run.pk)
-        return Response(BlankProductionRunSerializer(fresh).data)
+        return Response(
+            {'detail': 'Устарело: приёмка ГП выполняется в POST /api/workshop/otk-blanks/{blank_id}/account/.'},
+            status=status.HTTP_410_GONE,
+        )

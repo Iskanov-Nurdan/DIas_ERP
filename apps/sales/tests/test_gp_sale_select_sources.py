@@ -1,4 +1,5 @@
 """Smoke: GP-упаковки в продаже без дубля с warehouse_batch."""
+import unittest
 from datetime import date
 from decimal import Decimal
 
@@ -12,6 +13,7 @@ from apps.warehouse.models import GpPackOperation, GpPackUnit, WarehouseBatch
 from apps.workshop.models import WorkshopBlank
 
 
+@unittest.skip('Продажа в упаковках снята (BACKEND_SALES_SIMPLIFICATION).')
 class GpSaleSelectSourcesTests(APITestCase):
     def setUp(self):
         user_model = get_user_model()

@@ -90,6 +90,21 @@ def schedule_order_operational_push(
     transaction.on_commit(_fanout)
 
 
+def schedule_otk_push(
+    *,
+    action: str,
+    entity_id: int | None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """События домена ОТК (пул, учёт)."""
+    from django.db import transaction
+
+    def _fanout() -> None:
+        push_operational_event(resource='otk', action=action, entity_id=entity_id, extra=extra)
+
+    transaction.on_commit(_fanout)
+
+
 def schedule_blank_run_push(
     *,
     action: str,

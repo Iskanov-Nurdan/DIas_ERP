@@ -1,4 +1,5 @@
 """Контракт: line_starts → отдельный BlankProductionRun на профиль (ОТК)."""
+import unittest
 from datetime import date
 from decimal import Decimal
 
@@ -18,6 +19,7 @@ from apps.sales.models import (
 from apps.workshop.models import BlankProductionRun, WorkshopBlank, WorkshopPreparedState
 
 
+@unittest.skip('POST /production/requests/{id}/start/ снят (410); поток через workshop/blank-production-runs/')
 class ProductionRequestsApiTests(APITestCase):
     def setUp(self):
         user_model = get_user_model()

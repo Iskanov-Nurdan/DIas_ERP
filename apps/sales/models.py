@@ -413,6 +413,24 @@ class Sale(models.Model):
         decimal_places=2,
         default=0,
     )
+    checkout_payment_type = models.CharField(
+        'Тип оплаты при продаже (full/partial/debt)',
+        max_length=20,
+        blank=True,
+        default='',
+    )
+    checkout_payment_method = models.CharField(
+        'Основной способ оплаты при продаже (cash/card)',
+        max_length=20,
+        blank=True,
+        default='',
+    )
+    payment_reference = models.CharField(
+        'Реквизит оплаты (карта/телефон)',
+        max_length=255,
+        blank=True,
+        default='',
+    )
     warehouse_mutation = models.JSONField(
         'Снимок списания склада для отката', null=True, blank=True, default=None, editable=False,
     )

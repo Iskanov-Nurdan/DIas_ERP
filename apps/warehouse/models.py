@@ -66,6 +66,22 @@ class WarehouseBatch(models.Model):
         related_name='warehouse_gp_acceptance_batches',
         verbose_name='Приёмка ГП (неупакованная строка по приёмке)',
     )
+    workshop_blank = models.ForeignKey(
+        'workshop.WorkshopBlank',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='warehouse_batches',
+        verbose_name='Заготовка (цех)',
+    )
+    otk_account_session = models.ForeignKey(
+        'workshop.OtkAccountSession',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='warehouse_batches',
+        verbose_name='Учёт ОТК',
+    )
     inventory_form = models.CharField(
         'Форма учёта на складе ГП',
         max_length=20,

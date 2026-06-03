@@ -1871,6 +1871,10 @@ class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewS
     )
     @action(detail=True, methods=['post'], url_path='start')
     def start(self, request, pk=None):
+        return Response(
+            {'detail': 'Устарело: модуль заявок снят с фронта. Используйте workshop/blank-production-runs/.'},
+            status=status.HTTP_410_GONE,
+        )
         from apps.sales.models import Order as ClientOrder
         from apps.workshop.serializers import BlankProductionRunSerializer
 

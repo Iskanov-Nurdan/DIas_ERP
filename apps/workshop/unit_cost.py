@@ -7,7 +7,7 @@ from typing import Optional
 
 from apps.materials.fifo import simulate_fifo_cost_kg
 
-from .models import BlankProductionRun, WorkshopBlankCompositionLine
+from .models import BlankProductionRun, WorkshopBlank, WorkshopBlankCompositionLine
 
 DEC = Decimal('0.0001')
 
@@ -16,6 +16,36 @@ def _d(x) -> Decimal:
     if x is None:
         return Decimal('0')
     return Decimal(str(x))
+
+
+def workshop_blank_cost_per_kg(blank: WorkshopBlank) -> Optional[Decimal]:
+    """Себестоимость 1 кг заготовки по FIFO состава на одну бочку."""
+    barrel_kg = _d(blank.recipe_kg_per_barrel)
+    if barrel_kg <= 0:
+        return None
+    lines = WorkshopBlankCompositionLine.objects.filter(blank_id=blank.pk)
+    if not lines.exists():
+        return None
+    total_cost = Decimal('0')
+    for line in lines:
+        qty = _d(line.quantity_kg)
+        if qty > 0 and line.raw_material_id:
+            total_cost += simulate_fifo_cost_kg(line.raw_material_id, qty)
+    if total_cost <= 0:
+        return None
+    return (total_cost / barrel_kg).quantize(DEC)
+
+
+def profile_cost_price_from_blank(*, profile, blank: WorkshopBlank) -> Optional[Decimal]:
+    """cost_price = blank_cost_per_kg × weight_kg_per_piece."""
+    cpk = workshop_blank_cost_per_kg(blank)
+    w = profile.weight_kg_per_piece
+    if cpk is None or w is None:
+        return None
+    w_dec = _d(w)
+    if w_dec <= 0:
+        return None
+    return (cpk * w_dec).quantize(DEC)
 
 
 def workshop_run_unit_cost_per_piece(run: BlankProductionRun) -> Optional[Decimal]:

@@ -86,6 +86,133 @@ class WorkshopPreparedState(models.Model):
         return f'{self.blank}: {self.barrels} боч. + {self.extra_kg} кг'
 
 
+class OtkBlankPool(models.Model):
+    """Пул массы заготовки на ОТК (одна строка на blank_id)."""
+
+    blank = models.OneToOneField(
+        WorkshopBlank,
+        on_delete=models.CASCADE,
+        related_name='otk_pool',
+        verbose_name='Заготовка',
+    )
+    remaining_kg = models.DecimalField('Доступно для учёта, кг', max_digits=14, decimal_places=6, default=0)
+    total_intake_kg = models.DecimalField('Сумма приходов, кг', max_digits=14, decimal_places=6, default=0)
+    version = models.PositiveIntegerField('Версия (optimistic lock)', default=0)
+
+    class Meta:
+        db_table = 'workshop_otk_blank_pools'
+        verbose_name = 'Пул ОТК по заготовке'
+        verbose_name_plural = 'Пулы ОТК по заготовкам'
+
+    def __str__(self):
+        return f'ОТК пул #{self.blank_id}: {self.remaining_kg} кг'
+
+
+class OtkBlankIntake(models.Model):
+    """История прихода массы на ОТК (каждый «Произвести»)."""
+
+    blank = models.ForeignKey(
+        WorkshopBlank,
+        on_delete=models.CASCADE,
+        related_name='otk_intakes',
+        verbose_name='Заготовка',
+    )
+    run = models.ForeignKey(
+        'BlankProductionRun',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='otk_intakes',
+        verbose_name='Партия производства',
+    )
+    kg = models.DecimalField('Кг', max_digits=14, decimal_places=6)
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'workshop_otk_blank_intakes'
+        ordering = ('-created_at', '-pk')
+        verbose_name = 'Приход на ОТК'
+        verbose_name_plural = 'Приходы на ОТК'
+
+    def __str__(self):
+        return f'intake #{self.pk} blank={self.blank_id} {self.kg} кг'
+
+
+class OtkAccountSession(models.Model):
+    """Учёт ОТК: приёмка профилей + брак + склад."""
+
+    blank = models.ForeignKey(
+        WorkshopBlank,
+        on_delete=models.PROTECT,
+        related_name='otk_account_sessions',
+        verbose_name='Заготовка',
+    )
+    consumed_kg = models.DecimalField('Списано с пула, кг', max_digits=14, decimal_places=6)
+    defect_kg = models.DecimalField('Брак, кг', max_digits=14, decimal_places=6, default=0)
+    remaining_kg_after = models.DecimalField('Остаток пула после учёта, кг', max_digits=14, decimal_places=6)
+    operator = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='otk_sessions_as_operator',
+        verbose_name='Оператор',
+    )
+    chemist = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='otk_sessions_as_chemist',
+        verbose_name='Химик',
+    )
+    packer = models.ForeignKey(
+        'accounts.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='otk_sessions_as_packer',
+        verbose_name='Упаковщик',
+    )
+    comment = models.TextField('Комментарий', blank=True, default='')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'workshop_otk_account_sessions'
+        ordering = ('-created_at', '-pk')
+        verbose_name = 'Учёт ОТК'
+        verbose_name_plural = 'Учёты ОТК'
+
+    def __str__(self):
+        return f'otk account #{self.pk} blank={self.blank_id}'
+
+
+class OtkAccountLine(models.Model):
+    session = models.ForeignKey(
+        OtkAccountSession,
+        on_delete=models.CASCADE,
+        related_name='lines',
+        verbose_name='Сессия учёта',
+    )
+    profile = models.ForeignKey(
+        'recipes.PlasticProfile',
+        on_delete=models.PROTECT,
+        related_name='otk_account_lines',
+        verbose_name='Профиль',
+    )
+    profile_name_snapshot = models.CharField('Наименование профиля (снимок)', max_length=255)
+    pieces = models.PositiveIntegerField('Штук')
+    kg = models.DecimalField('Кг', max_digits=14, decimal_places=6)
+
+    class Meta:
+        db_table = 'workshop_otk_account_lines'
+        verbose_name = 'Строка учёта ОТК'
+        verbose_name_plural = 'Строки учёта ОТК'
+
+    def __str__(self):
+        return f'{self.profile_name_snapshot} × {self.pieces}'
+
+
 class BlankProductionRun(models.Model):
     STATUS_DRAFT = 'draft'
     STATUS_IN_PRODUCTION = 'in_production'
@@ -113,14 +240,18 @@ class BlankProductionRun(models.Model):
         on_delete=models.PROTECT,
         related_name='workshop_production_runs',
         verbose_name='Готовая продукция (SKU)',
+        null=True,
+        blank=True,
     )
-    product_name_snapshot = models.CharField('Наименование ГП (снимок)', max_length=255)
+    product_name_snapshot = models.CharField('Наименование ГП (снимок)', max_length=255, blank=True, default='')
 
     blank_total_kg = models.DecimalField('Общая масса заготовки по данным оператора', max_digits=14, decimal_places=6)
     blank_used_in_production_kg = models.DecimalField('Запуск партии с цеха, кг', max_digits=14, decimal_places=6)
     vat_max_kg_demo = models.DecimalField('Для демо: лимит веса VAT, кг', max_digits=14, decimal_places=6)
 
-    weight_kg_per_piece = models.DecimalField('Вес одной шт, кг', max_digits=14, decimal_places=6)
+    weight_kg_per_piece = models.DecimalField(
+        'Вес одной шт, кг', max_digits=14, decimal_places=6, null=True, blank=True
+    )
 
     defect_kg = models.DecimalField('Брак ОТК, кг', max_digits=14, decimal_places=6, null=True, blank=True)
     good_kg = models.DecimalField('Годный после ОТК, кг', max_digits=14, decimal_places=6, null=True, blank=True)

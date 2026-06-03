@@ -158,6 +158,10 @@ class GpPackageViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, viewsets.
         return response
 
     def create(self, request, *args, **kwargs):
+        return Response(
+            {'detail': 'Устарело: упаковка снята с фронта. Остатки — GET /api/warehouse/gp-stock/.'},
+            status=status.HTTP_410_GONE,
+        )
         ser = GpPackageCreateSerializer(data=request.data)
         if not ser.is_valid():
             return Response({'code': 'validation_error', 'errors': ser.errors}, status=status.HTTP_400_BAD_REQUEST)

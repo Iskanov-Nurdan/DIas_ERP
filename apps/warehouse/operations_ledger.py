@@ -16,6 +16,7 @@ from .models import GpPackOperation, GpPackUnit, WarehouseBatch
 
 KIND_LABELS = {
     'accept': 'Приёмка ГП',
+    'otk_account': 'Учёт ОТК',
     'package': 'Упаковка',
     'sale': 'Продажа',
     'return': 'Возврат',
@@ -80,7 +81,7 @@ class WarehouseOperationRow:
 def _parse_kinds(raw: Optional[str]) -> set[str] | None:
     if not raw or not str(raw).strip():
         return None
-    allowed = {'accept', 'package', 'sale', 'return', 'defect', 'rework'}
+    allowed = {'accept', 'otk_account', 'package', 'sale', 'return', 'defect', 'rework'}
     parts = {p.strip().lower() for p in str(raw).split(',') if p.strip()}
     picked = parts & allowed
     return picked if picked else None
@@ -118,6 +119,59 @@ def _kg_for_pieces(pieces: int, run: BlankProductionRun | None) -> float:
         return 0.0
     wpp = Decimal(str(run.weight_kg_per_piece or 0))
     return float((Decimal(pieces) * wpp).quantize(Decimal('0.0001')))
+
+
+def _collect_otk_account(
+    *,
+    product_id: Optional[int],
+    blank_id: Optional[int],
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> list[WarehouseOperationRow]:
+    from apps.workshop.models import OtkAccountLine, OtkAccountSession
+
+    qs = (
+        OtkAccountSession.objects.select_related('blank', 'operator')
+        .prefetch_related(
+            Prefetch('lines', queryset=OtkAccountLine.objects.select_related('profile'))
+        )
+        .order_by('-created_at')
+    )
+    if blank_id:
+        qs = qs.filter(blank_id=blank_id)
+    rows: list[WarehouseOperationRow] = []
+    for session in qs:
+        at = session.created_at
+        if not _in_range(at, start, end):
+            continue
+        for line in session.lines.all():
+            if product_id and line.profile_id != product_id:
+                continue
+            rows.append(
+                WarehouseOperationRow(
+                    id=f'otk_account-{session.pk}-{line.pk}',
+                    at=at,
+                    kind='otk_account',
+                    direction='in',
+                    product_id=line.profile_id,
+                    product_name=line.profile_name_snapshot or (line.profile.name if line.profile_id else ''),
+                    blank_id=session.blank_id,
+                    blank_name=session.blank.name if session.blank_id else '',
+                    pieces=int(line.pieces),
+                    kg=float(Decimal(str(line.kg))),
+                    packages=0,
+                    warehouse_batch_id=None,
+                    gp_package_id=None,
+                    sale_id=None,
+                    order_id=None,
+                    return_id=None,
+                    label='',
+                    actor=_actor_name(session.operator),
+                    comment=(session.comment or '')[:500],
+                    package_kind='',
+                )
+            )
+    return rows
 
 
 def _collect_accept(
@@ -479,6 +533,7 @@ def build_warehouse_operations(
     kind_set = _parse_kinds(kinds)
     collectors = {
         'accept': _collect_accept,
+        'otk_account': _collect_otk_account,
         'package': _collect_package,
         'sale': _collect_sale,
         'return': _collect_return,
