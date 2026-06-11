@@ -5,7 +5,19 @@ from rest_framework import serializers
 from config.fields import CleanDecimalField
 from .models import PlasticProfile, Recipe, RecipeComponent
 from .profile_cost import serialize_profile_cost_price
+from .profile_pricing import (
+    EXTRA_FIELD_NAMES,
+    READ_ONLY_PRICING_FIELDS,
+    serialize_other_expenses_total,
+    serialize_sale_unit_price,
+)
 from .profile_policy import generate_plastic_profile_code, plastic_profile_deletable
+
+from apps.workshop.models import WorkshopBlank
+
+
+def _profile_extra_fields_meta():
+    return tuple(EXTRA_FIELD_NAMES)
 
 
 class _NullableRecipeModelSerializer(serializers.ModelSerializer):
@@ -17,7 +29,30 @@ class _NullableRecipeModelSerializer(serializers.ModelSerializer):
         return super().to_representation(instance)
 
 
-class PlasticProfileSerializer(serializers.ModelSerializer):
+class _PlasticProfilePricingMixin:
+    """Валидация blank_id и extra_* (поля объявлены на ModelSerializer)."""
+
+    def _validate_extra_non_negative(self, attrs):
+        for name in EXTRA_FIELD_NAMES:
+            if name not in attrs:
+                continue
+            if Decimal(str(attrs[name])) < 0:
+                raise serializers.ValidationError({name: 'Значение должно быть ≥ 0.'})
+
+    def _validate_blank(self, attrs, *, required: bool):
+        blank = attrs.get('blank')
+        instance = getattr(self, 'instance', None)
+        if blank is None and 'blank' not in attrs:
+            if required and instance is None:
+                raise serializers.ValidationError({'blank_id': 'Укажите заготовку (blank_id).'})
+            return
+        if blank is None:
+            raise serializers.ValidationError({'blank_id': 'Укажите активную заготовку.'})
+        if not blank.is_active:
+            raise serializers.ValidationError({'blank_id': 'Заготовка не найдена или неактивна.'})
+
+
+class PlasticProfileSerializer(_PlasticProfilePricingMixin, serializers.ModelSerializer):
     deletable = serializers.SerializerMethodField()
     code = serializers.CharField(max_length=100, required=False, allow_blank=True)
     weight_kg_per_piece = serializers.DecimalField(
@@ -27,9 +62,19 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
     markup_amount = serializers.DecimalField(
         max_digits=16, decimal_places=4, required=False, coerce_to_string=False
     )
+    blank_id = serializers.PrimaryKeyRelatedField(
+        source='blank',
+        queryset=WorkshopBlank.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    blank_name = serializers.SerializerMethodField()
+    other_expenses_total = serializers.SerializerMethodField()
+    sale_unit_price = serializers.SerializerMethodField()
 
     _WRITE_FIELDS = frozenset({
         'name', 'code', 'comment', 'is_active', 'weight_kg_per_piece', 'markup_amount',
+        'blank_id', *_profile_extra_fields_meta(),
     })
 
     class Meta:
@@ -37,13 +82,18 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'name', 'code', 'comment', 'is_active', 'deletable',
             'weight_kg_per_piece', 'cost_price', 'markup_amount',
+            'blank_id', 'blank_name',
+            *_profile_extra_fields_meta(),
+            'other_expenses_total', 'sale_unit_price',
         )
 
     def __init__(self, *args, **kwargs):
         data = kwargs.get('data')
         if data is not None and hasattr(data, 'keys'):
             kwargs['data'] = {
-                k: data[k] for k in data.keys() if k in self._WRITE_FIELDS and k != 'cost_price'
+                k: data[k]
+                for k in data.keys()
+                if k in self._WRITE_FIELDS and k not in READ_ONLY_PRICING_FIELDS
             }
         super().__init__(*args, **kwargs)
 
@@ -52,6 +102,20 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
 
     def get_cost_price(self, obj):
         return serialize_profile_cost_price(obj.cost_price)
+
+    def get_blank_name(self, obj):
+        if obj.blank_id:
+            try:
+                return obj.blank.name
+            except Exception:
+                pass
+        return None
+
+    def get_other_expenses_total(self, obj):
+        return serialize_other_expenses_total(obj)
+
+    def get_sale_unit_price(self, obj):
+        return serialize_sale_unit_price(obj)
 
     def validate_name(self, value):
         if not (value or '').strip():
@@ -67,6 +131,8 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         instance = getattr(self, 'instance', None)
+        self._validate_extra_non_negative(attrs)
+        self._validate_blank(attrs, required=self.instance is None)
         if 'code' in attrs:
             raw = attrs['code']
             if raw is None:
@@ -92,12 +158,15 @@ class PlasticProfileSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-class PlasticProfileListSerializer(serializers.ModelSerializer):
+class PlasticProfileListSerializer(_PlasticProfilePricingMixin, serializers.ModelSerializer):
     recipes_count = serializers.IntegerField(read_only=True)
     has_recipe = serializers.SerializerMethodField()
     recipes = serializers.SerializerMethodField()
     deletable = serializers.SerializerMethodField()
     cost_price = serializers.SerializerMethodField()
+    blank_name = serializers.SerializerMethodField()
+    other_expenses_total = serializers.SerializerMethodField()
+    sale_unit_price = serializers.SerializerMethodField()
 
     class Meta:
         model = PlasticProfile
@@ -110,6 +179,11 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
             'weight_kg_per_piece',
             'cost_price',
             'markup_amount',
+            'blank_id',
+            'blank_name',
+            *_profile_extra_fields_meta(),
+            'other_expenses_total',
+            'sale_unit_price',
             'recipes_count',
             'has_recipe',
             'recipes',
@@ -118,6 +192,20 @@ class PlasticProfileListSerializer(serializers.ModelSerializer):
 
     def get_cost_price(self, obj):
         return serialize_profile_cost_price(obj.cost_price)
+
+    def get_blank_name(self, obj):
+        if obj.blank_id:
+            try:
+                return obj.blank.name
+            except Exception:
+                pass
+        return None
+
+    def get_other_expenses_total(self, obj):
+        return serialize_other_expenses_total(obj)
+
+    def get_sale_unit_price(self, obj):
+        return serialize_sale_unit_price(obj)
 
     def get_has_recipe(self, obj):
         return (getattr(obj, 'recipes_count', 0) or 0) > 0

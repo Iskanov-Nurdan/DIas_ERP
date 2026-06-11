@@ -17,15 +17,16 @@ class OtkApiTests(APITestCase):
         )
         self.client.force_authenticate(self.user)
 
+        self.blank = WorkshopBlank.objects.create(
+            name='ПВХ белая',
+            recipe_kg_per_barrel=Decimal('50'),
+        )
         self.profile = PlasticProfile.objects.create(
             name='Профиль белый',
             code='OTK-P1',
             weight_kg_per_piece=Decimal('1.7'),
+            blank=self.blank,
             is_active=True,
-        )
-        self.blank = WorkshopBlank.objects.create(
-            name='ПВХ белая',
-            recipe_kg_per_barrel=Decimal('50'),
         )
         WorkshopPreparedState.objects.create(
             blank=self.blank, barrels=10, extra_kg=Decimal('0')

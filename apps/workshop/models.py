@@ -141,15 +141,45 @@ class OtkBlankIntake(models.Model):
 class OtkAccountSession(models.Model):
     """Учёт ОТК: приёмка профилей + брак + склад."""
 
+    SHIFT_DAY = 'day'
+    SHIFT_NIGHT = 'night'
+    SHIFT_PERIOD_CHOICES = [
+        (SHIFT_DAY, 'День'),
+        (SHIFT_NIGHT, 'Ночь'),
+    ]
+
     blank = models.ForeignKey(
         WorkshopBlank,
         on_delete=models.PROTECT,
         related_name='otk_account_sessions',
-        verbose_name='Заготовка',
+        verbose_name='Заготовка (основная)',
     )
     consumed_kg = models.DecimalField('Списано с пула, кг', max_digits=14, decimal_places=6)
     defect_kg = models.DecimalField('Брак, кг', max_digits=14, decimal_places=6, default=0)
+    defect_blank = models.ForeignKey(
+        WorkshopBlank,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='otk_defect_account_sessions',
+        verbose_name='Заготовка для брака',
+    )
     remaining_kg_after = models.DecimalField('Остаток пула после учёта, кг', max_digits=14, decimal_places=6)
+    shift_period = models.CharField(
+        'Смена',
+        max_length=8,
+        choices=SHIFT_PERIOD_CHOICES,
+        blank=True,
+        default='',
+    )
+    shift = models.ForeignKey(
+        'production.Shift',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='otk_account_sessions',
+        verbose_name='Смена (привязка)',
+    )
     operator = models.ForeignKey(
         'accounts.User',
         on_delete=models.SET_NULL,
@@ -172,7 +202,13 @@ class OtkAccountSession(models.Model):
         null=True,
         blank=True,
         related_name='otk_sessions_as_packer',
-        verbose_name='Упаковщик',
+        verbose_name='Упаковщик (legacy)',
+    )
+    packers = models.ManyToManyField(
+        'accounts.User',
+        related_name='otk_packer_sessions',
+        blank=True,
+        verbose_name='Упаковщики',
     )
     comment = models.TextField('Комментарий', blank=True, default='')
     created_at = models.DateTimeField('Создано', auto_now_add=True)
@@ -185,6 +221,34 @@ class OtkAccountSession(models.Model):
 
     def __str__(self):
         return f'otk account #{self.pk} blank={self.blank_id}'
+
+
+class OtkAccountBlankAllocation(models.Model):
+    """Списание кг с пула по заготовке (multi-blank учёт)."""
+
+    session = models.ForeignKey(
+        OtkAccountSession,
+        on_delete=models.CASCADE,
+        related_name='blank_allocations',
+        verbose_name='Сессия учёта',
+    )
+    blank = models.ForeignKey(
+        WorkshopBlank,
+        on_delete=models.PROTECT,
+        related_name='otk_account_allocations',
+        verbose_name='Заготовка',
+    )
+    consumed_kg = models.DecimalField('Списано, кг', max_digits=14, decimal_places=6)
+    remaining_kg_after = models.DecimalField('Остаток пула после, кг', max_digits=14, decimal_places=6)
+
+    class Meta:
+        db_table = 'workshop_otk_account_blank_allocations'
+        ordering = ('blank__name', 'pk')
+        verbose_name = 'Списание ОТК по заготовке'
+        verbose_name_plural = 'Списания ОТК по заготовкам'
+
+    def __str__(self):
+        return f'session={self.session_id} blank={self.blank_id} {self.consumed_kg} кг'
 
 
 class OtkAccountLine(models.Model):

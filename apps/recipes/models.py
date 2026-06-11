@@ -27,6 +27,44 @@ class PlasticProfile(models.Model):
         decimal_places=4,
         default=0,
     )
+    blank = models.ForeignKey(
+        'workshop.WorkshopBlank',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='plastic_profiles',
+        verbose_name='Заготовка для ОТК',
+    )
+    extra_rubber = models.DecimalField(
+        'Резинка, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_label = models.DecimalField(
+        'Этикетка, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_labor = models.DecimalField(
+        'Рабочая сила, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_electricity = models.DecimalField(
+        'Свет, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_repair = models.DecimalField(
+        'Ремонт, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
     comment = models.TextField('Комментарий', blank=True, default='')
     is_active = models.BooleanField('Активен', default=True)
 

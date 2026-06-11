@@ -14,8 +14,46 @@ from config.api_numbers import api_decimal_str
 from config.pagination import StandardResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 
-from apps.workshop.models import OtkAccountLine, OtkAccountSession, OtkBlankIntake, OtkBlankPool, WorkshopBlank
-from apps.workshop.otk_pool import POOL_EPSILON, account_otk_blank
+from apps.workshop.models import (
+    OtkAccountBlankAllocation,
+    OtkAccountLine,
+    OtkAccountSession,
+    OtkBlankIntake,
+    OtkBlankPool,
+    WorkshopBlank,
+)
+from apps.workshop.otk_pool import POOL_EPSILON, account_otk_blank, account_otk_v2
+
+
+def _load_account_session(session_id: int) -> OtkAccountSession:
+    return (
+        OtkAccountSession.objects.prefetch_related(
+            'lines',
+            'packers',
+            Prefetch(
+                'blank_allocations',
+                queryset=OtkAccountBlankAllocation.objects.select_related('blank'),
+            ),
+        )
+        .select_related('blank', 'defect_blank', 'operator', 'chemist', 'packer', 'shift')
+        .get(pk=session_id)
+    )
+
+
+def _schedule_otk_account_ws(session: OtkAccountSession) -> None:
+    from apps.realtime.broadcast import schedule_otk_push, schedule_push
+
+    blank_ids = list(
+        session.blank_allocations.values_list('blank_id', flat=True).distinct()
+    )
+    if not blank_ids:
+        blank_ids = [session.blank_id]
+    for bid in blank_ids:
+        schedule_otk_push(action='updated', entity_id=bid, extra={'blank_id': bid})
+        schedule_push(resource='workshop', action='updated', entity_id=bid, extra={'blank_id': bid})
+    schedule_push(resource='warehouse', action='updated', entity_id=None)
+    if session.shift_id:
+        schedule_push(resource='shift', action='updated', entity_id=session.shift_id)
 
 
 def _parse_date(raw) -> datetime | None:
@@ -63,36 +101,50 @@ class OtkAccountLineOutSerializer(serializers.ModelSerializer):
 class OtkAccountSessionSerializer(serializers.ModelSerializer):
     lines = OtkAccountLineOutSerializer(many=True, read_only=True)
     blank_id = serializers.IntegerField(read_only=True)
+    blank_name = serializers.SerializerMethodField()
     consumed_kg = serializers.SerializerMethodField()
     defect_kg = serializers.SerializerMethodField()
+    defect_blank_id = serializers.IntegerField(read_only=True, allow_null=True)
     remaining_kg_after = serializers.SerializerMethodField()
     warehouse_posted = serializers.SerializerMethodField()
     operator_id = serializers.IntegerField(allow_null=True, read_only=True)
     chemist_id = serializers.IntegerField(allow_null=True, read_only=True)
     packer_id = serializers.IntegerField(allow_null=True, read_only=True)
+    packer_ids = serializers.SerializerMethodField()
     operator_name = serializers.SerializerMethodField()
     chemist_name = serializers.SerializerMethodField()
     packer_name = serializers.SerializerMethodField()
+    packer_names = serializers.SerializerMethodField()
+    blank_breakdown = serializers.SerializerMethodField()
 
     class Meta:
         model = OtkAccountSession
         fields = (
             'id',
             'blank_id',
+            'blank_name',
             'consumed_kg',
             'defect_kg',
+            'defect_blank_id',
             'remaining_kg_after',
             'warehouse_posted',
+            'shift_period',
             'lines',
             'operator_id',
             'chemist_id',
             'packer_id',
+            'packer_ids',
             'operator_name',
             'chemist_name',
             'packer_name',
+            'packer_names',
+            'blank_breakdown',
             'comment',
             'created_at',
         )
+
+    def get_blank_name(self, obj):
+        return obj.blank.name if obj.blank_id else ''
 
     def get_consumed_kg(self, obj):
         return api_decimal_str(obj.consumed_kg)
@@ -105,6 +157,34 @@ class OtkAccountSessionSerializer(serializers.ModelSerializer):
 
     def get_warehouse_posted(self, obj):
         return True
+
+    def get_packer_ids(self, obj):
+        if hasattr(obj, '_prefetched_objects_cache') and 'packers' in obj._prefetched_objects_cache:
+            return [u.pk for u in obj.packers.all()]
+        return list(obj.packers.values_list('pk', flat=True))
+
+    def get_packer_names(self, obj):
+        if hasattr(obj, '_prefetched_objects_cache') and 'packers' in obj._prefetched_objects_cache:
+            users = obj.packers.all()
+        else:
+            users = obj.packers.all()
+        return [self._user_name(u) for u in users if self._user_name(u)]
+
+    def get_blank_breakdown(self, obj):
+        rows = getattr(obj, '_prefetched_objects_cache', {}).get('blank_allocations')
+        if rows is None:
+            qs = obj.blank_allocations.select_related('blank').all()
+        else:
+            qs = rows
+        return [
+            {
+                'blank_id': row.blank_id,
+                'blank_name': row.blank.name,
+                'consumed_kg': api_decimal_str(row.consumed_kg),
+                'remaining_kg_after': api_decimal_str(row.remaining_kg_after),
+            }
+            for row in qs
+        ]
 
     def _user_name(self, user):
         if user is None:
@@ -127,14 +207,19 @@ class OtkAccountLineInSerializer(serializers.Serializer):
 
 
 class OtkDefectInSerializer(serializers.Serializer):
-    unit = serializers.ChoiceField(choices=['kg', 'pieces'])
-    value = serializers.DecimalField(max_digits=14, decimal_places=6)
+    unit = serializers.ChoiceField(choices=['kg', 'pieces'], required=False, default='kg')
+    value = serializers.DecimalField(max_digits=14, decimal_places=6, required=False, default=Decimal('0'))
     profile_id = serializers.IntegerField(required=False, allow_null=True)
 
 
 class OtkAccountInSerializer(serializers.Serializer):
     lines = OtkAccountLineInSerializer(many=True)
-    defect = OtkDefectInSerializer()
+    defect = OtkDefectInSerializer(required=False)
+    shift_period = serializers.ChoiceField(
+        choices=['day', 'night'],
+        required=False,
+        default='day',
+    )
     operator_id = serializers.IntegerField(required=False, allow_null=True)
     chemist_id = serializers.IntegerField(required=False, allow_null=True)
     packer_id = serializers.IntegerField(required=False, allow_null=True)
@@ -144,6 +229,38 @@ class OtkAccountInSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError('Укажите хотя бы одну строку профиля.')
         return value
+
+    def validate(self, attrs):
+        if attrs.get('defect') is None:
+            attrs['defect'] = {'unit': 'kg', 'value': Decimal('0')}
+        return attrs
+
+
+class OtkAccountV2InSerializer(serializers.Serializer):
+    lines = OtkAccountLineInSerializer(many=True)
+    defect_kg = serializers.DecimalField(
+        max_digits=14, decimal_places=6, required=False, allow_null=True,
+    )
+    defect_blank_id = serializers.IntegerField(required=False, allow_null=True)
+    shift_period = serializers.ChoiceField(choices=['day', 'night'])
+    operator_id = serializers.IntegerField(required=False, allow_null=True)
+    chemist_id = serializers.IntegerField(required=False, allow_null=True)
+    packer_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=True,
+    )
+    comment = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_lines(self, value):
+        if not value:
+            raise serializers.ValidationError('Укажите хотя бы одну строку профиля.')
+        return value
+
+    def validate_packer_ids(self, value):
+        if not value:
+            return []
+        return list(dict.fromkeys(value))
 
 
 class OtkBlanksListView(APIView):
@@ -232,19 +349,35 @@ class OtkBlankAccountView(APIView):
             chemist_id=v.get('chemist_id'),
             packer_id=v.get('packer_id'),
             comment=v.get('comment') or '',
+            shift_period=v.get('shift_period') or 'day',
         )
-        from apps.realtime.broadcast import schedule_otk_push, schedule_push
+        _schedule_otk_account_ws(session)
+        out = OtkAccountSessionSerializer(_load_account_session(session.pk)).data
+        return Response(out, status=status.HTTP_201_CREATED)
 
-        schedule_otk_push(action='updated', entity_id=blank_id, extra={'blank_id': blank_id})
-        schedule_push(resource='warehouse', action='updated', entity_id=None)
-        schedule_push(resource='workshop', action='updated', entity_id=blank_id, extra={'blank_id': blank_id})
 
-        session = (
-            OtkAccountSession.objects.prefetch_related('lines')
-            .select_related('operator', 'chemist', 'packer')
-            .get(pk=session.pk)
+class OtkAccountView(APIView):
+    """POST /api/workshop/otk-account/ — учёт v2 (multi-blank)."""
+
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'materials'
+
+    def post(self, request):
+        ser = OtkAccountV2InSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+        session = account_otk_v2(
+            lines=v['lines'],
+            defect_kg=v.get('defect_kg'),
+            defect_blank_id=v.get('defect_blank_id'),
+            shift_period=v['shift_period'],
+            operator_id=v.get('operator_id'),
+            chemist_id=v.get('chemist_id'),
+            packer_ids=v.get('packer_ids') or [],
+            comment=v.get('comment') or '',
         )
-        out = OtkAccountSessionSerializer(session).data
+        _schedule_otk_account_ws(session)
+        out = OtkAccountSessionSerializer(_load_account_session(session.pk)).data
         return Response(out, status=status.HTTP_201_CREATED)
 
 
@@ -254,8 +387,17 @@ class OtkAccountingViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = OtkAccountSessionSerializer
     pagination_class = StandardResultsSetPagination
     queryset = (
-        OtkAccountSession.objects.select_related('blank', 'operator', 'chemist', 'packer')
-        .prefetch_related(Prefetch('lines', queryset=OtkAccountLine.objects.select_related('profile')))
+        OtkAccountSession.objects.select_related(
+            'blank', 'defect_blank', 'operator', 'chemist', 'packer', 'shift',
+        )
+        .prefetch_related(
+            'packers',
+            Prefetch('lines', queryset=OtkAccountLine.objects.select_related('profile')),
+            Prefetch(
+                'blank_allocations',
+                queryset=OtkAccountBlankAllocation.objects.select_related('blank'),
+            ),
+        )
         .order_by('-created_at', '-pk')
     )
 

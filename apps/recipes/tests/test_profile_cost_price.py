@@ -55,6 +55,7 @@ class ProfileCostPriceApiTests(APITestCase):
                 'name': 'Новый профиль',
                 'weight_kg_per_piece': '2.0',
                 'markup_amount': '30',
+                'blank_id': self.blank.pk,
             },
             format='json',
         )
@@ -69,6 +70,7 @@ class ProfileCostPriceApiTests(APITestCase):
             name='Профиль',
             code='CP-1',
             weight_kg_per_piece=Decimal('1.7'),
+            blank=self.blank,
             is_active=True,
         )
         resp = self.client.patch(
@@ -86,6 +88,7 @@ class ProfileCostPriceApiTests(APITestCase):
             name='Профиль ОТК',
             code='CP-OTK',
             weight_kg_per_piece=Decimal('1.0'),
+            blank=self.blank,
             is_active=True,
         )
         self.client.post(
@@ -112,7 +115,6 @@ class ProfileCostPriceApiTests(APITestCase):
         self.assertIsNotNone(profile.cost_price)
         self.assertGreater(profile.cost_price, Decimal('0'))
 
-        listed = self.client.get('/api/plastic-profiles/')
-        row = next(p for p in listed.data['items'] if p['id'] == profile.pk)
-        self.assertIsNotNone(row['cost_price'])
-        self.assertGreater(Decimal(str(row['cost_price'])), Decimal('0'))
+        detail = self.client.get(f'/api/plastic-profiles/{profile.pk}/')
+        self.assertIsNotNone(detail.data['cost_price'])
+        self.assertGreater(Decimal(str(detail.data['cost_price'])), Decimal('0'))

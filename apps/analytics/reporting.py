@@ -527,10 +527,14 @@ def _profile_unit_cost_per_piece(profile_id: int) -> Optional[Decimal]:
 
 def build_product_unit_costs() -> dict[str, Any]:
     """Справочник профилей и текущей себестоимости за 1 шт (не зависит от периода в query)."""
+    from apps.recipes.profile_pricing import serialize_other_expenses_total, serialize_sale_unit_price
+
     items: list[dict[str, Any]] = []
     for p in PlasticProfile.objects.order_by('name', 'id'):
         cost = _profile_unit_cost_per_piece(p.pk)
         cost_str = api_decimal_str(cost) if cost is not None and cost > 0 else None
+        other_s = serialize_other_expenses_total(p)
+        sale_s = serialize_sale_unit_price(p)
         items.append(
             {
                 'profile_id': p.pk,
@@ -543,6 +547,9 @@ def build_product_unit_costs() -> dict[str, Any]:
                 'material_cost_per_piece': cost_str,
                 'current_unit_cost': cost_str,
                 'unit_cost': cost_str,
+                'cost_price': cost_str,
+                'other_expenses_total': other_s,
+                'sale_unit_price': sale_s,
             }
         )
     return {'items': items}

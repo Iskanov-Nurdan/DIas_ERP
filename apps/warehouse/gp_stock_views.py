@@ -67,6 +67,7 @@ class GpStockView(APIView):
             row['kg'] += pcs * wpp
 
         profiles = {p.pk: p for p in PlasticProfile.objects.filter(pk__in=profile_ids)}
+        from apps.recipes.profile_pricing import serialize_sale_unit_price
         from apps.workshop.models import WorkshopBlank
 
         blanks = {b.pk: b for b in WorkshopBlank.objects.filter(pk__in=blank_ids)}
@@ -75,6 +76,7 @@ class GpStockView(APIView):
         for (pid, bid), row in sorted(agg.items(), key=lambda x: (x[0][0] or 0, x[0][1] or 0)):
             prof = profiles.get(pid) if pid else None
             blank = blanks.get(bid) if bid else None
+            sale_price = serialize_sale_unit_price(prof) if prof else None
             items.append(
                 {
                     'product_id': pid,
@@ -83,6 +85,8 @@ class GpStockView(APIView):
                     'blank_name': row['blank_name'] or (blank.name if blank else ''),
                     'pieces': int(row['pieces'].to_integral_value()),
                     'kg': api_decimal_str(row['kg'].quantize(Decimal('0.000001'))),
+                    'unit_sale_price': sale_price,
+                    'sale_unit_price': sale_price,
                 }
             )
         return Response({'items': items})

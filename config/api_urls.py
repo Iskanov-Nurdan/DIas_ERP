@@ -64,6 +64,7 @@ from apps.activity.views import (
 )
 from apps.workshop.views import BlankProductionRunViewSet, PreparedBlankViewSet, WorkshopBlankViewSet
 from apps.workshop.otk_views import (
+    OtkAccountView,
     OtkAccountingViewSet,
     OtkBlankAccountView,
     OtkBlanksIntakesView,
@@ -146,6 +147,7 @@ urlpatterns = [
     path('warehouse/operations/', WarehouseOperationsView.as_view(), name='warehouse-operations'),
     path('workshop/otk-blanks/', OtkBlanksListView.as_view(), name='workshop-otk-blanks'),
     path('workshop/otk-blanks/intakes/', OtkBlanksIntakesView.as_view(), name='workshop-otk-blanks-intakes'),
+    path('workshop/otk-account/', OtkAccountView.as_view(), name='workshop-otk-account'),
     path(
         'workshop/otk-blanks/<int:blank_id>/account/',
         OtkBlankAccountView.as_view(),

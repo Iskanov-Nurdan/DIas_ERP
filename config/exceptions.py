@@ -153,6 +153,34 @@ def dias_exception_handler(exc, context):
             code = str(_first_scalar(exc.detail['code']))
         return _make_error_response(code, first_msg, errors=errors or None, http_status=400)
 
+    from apps.workshop.otk_errors import (
+        OtkPoolInsufficient,
+        OtkProfileBlankMismatch,
+        OtkProfileBlankMissing,
+    )
+
+    if isinstance(exc, OtkProfileBlankMismatch):
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return Response(
+            {
+                'error': str(detail.get('error', 'Профиль не привязан к этой заготовке')),
+                'profile_id': int(detail['profile_id']) if detail.get('profile_id') is not None else None,
+                'expected_blank_id': int(detail['expected_blank_id'])
+                if detail.get('expected_blank_id') is not None
+                else None,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if isinstance(exc, (OtkPoolInsufficient, OtkProfileBlankMissing)):
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        payload = {'error': str(detail.get('error', 'Ошибка учёта ОТК'))}
+        for key in ('blank_id', 'profile_id', 'remaining_kg', 'required_kg', 'expected_blank_id'):
+            if detail.get(key) is not None:
+                val = detail[key]
+                payload[key] = int(val) if key.endswith('_id') else str(val)
+        return Response(payload, status=status.HTTP_400_BAD_REQUEST)
+
     if isinstance(exc, MethodNotAllowed):
         return _make_error_response('bad_request', f'Метод {exc.args[0]} не поддерживается', http_status=405)
 
