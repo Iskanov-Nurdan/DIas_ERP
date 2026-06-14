@@ -27,6 +27,7 @@ from .services import (
     sale_scope_q,
     warehouse_batches_scope_qs,
 )
+from .sale_pnl import aggregate_sale_pnl, iter_sale_pnl_rows, profile_extra_breakdown
 
 # Непогашенный долг: продажи в фильтре периода (дата Sale.date), остаток — по активным платежам на момент запроса.
 DEBT_AS_OF_SEMANTICS = 'current_outstanding_by_sale_date_in_period'
@@ -135,15 +136,16 @@ def build_analytics_summary(scope: AnalyticsScope, trend_group: Optional[str] = 
 
     sales_agg = Sale.objects.filter(sq).distinct().aggregate(
         revenue=Sum('revenue'),
-        cost=Sum('cost'),
         count=Count('id'),
         qty=Sum(units_sum),
     )
     revenue_total = _d(sales_agg['revenue'])
-    sales_cost_total = _d(sales_agg['cost'])
+    pnl = aggregate_sale_pnl(scope)
+    sales_cost_total = pnl['sales_cost_total']
+    product_other_expenses_total = pnl['product_other_expenses_total']
+    sold_goods_cost_total = (sales_cost_total + product_other_expenses_total).quantize(Decimal('0.01'))
     sales_count = int(sales_agg['count'] or 0)
     sold_units_total = _d(sales_agg['qty'])
-    profit_total = _profit_dec(revenue_total, sales_cost_total)
     client_debt_total = _compute_client_debt_total(scope)
 
     prod_agg = ProductionBatch.objects.filter(bq).aggregate(cost=Sum('material_cost_total'))
@@ -153,6 +155,10 @@ def build_analytics_summary(scope: AnalyticsScope, trend_group: Optional[str] = 
     from .other_expenses import sum_accepted_other_expenses
 
     other_expenses_total = sum_accepted_other_expenses(scope)
+    period_expenses_total = (
+        purchase_total + other_expenses_total + sales_cost_total + product_other_expenses_total
+    ).quantize(Decimal('0.01'))
+    profit_total = _profit_dec(revenue_total, period_expenses_total)
     expense_total = (purchase_total + production_cost_total + sales_cost_total).quantize(Decimal('0.01'))
 
     pb_in_period = ProductionBatch.objects.filter(bq)
@@ -227,12 +233,16 @@ def build_analytics_summary(scope: AnalyticsScope, trend_group: Optional[str] = 
 
     pt_str = api_decimal_str(purchase_total)
     oe_str = api_decimal_str(other_expenses_total)
+    sc_str = api_decimal_str(sales_cost_total)
+    poe_str = api_decimal_str(product_other_expenses_total)
+    sgc_str = api_decimal_str(sold_goods_cost_total)
     pc_str = api_decimal_str(production_cost_total)
-    period_expenses = (purchase_total + other_expenses_total).quantize(Decimal('0.01'))
-    pe_str = api_decimal_str(period_expenses)
+    pe_str = api_decimal_str(period_expenses_total)
     cards = {
         'revenue_total': api_decimal_str(revenue_total),
-        'sales_cost_total': api_decimal_str(sales_cost_total),
+        'sales_cost_total': sc_str,
+        'product_other_expenses_total': poe_str,
+        'sold_goods_cost_total': sgc_str,
         'profit_total': api_decimal_str(profit_total),
         'purchase_total': pt_str,
         'purchases_total': pt_str,
@@ -291,6 +301,8 @@ def _empty_trend_slot() -> dict[str, Decimal]:
         'revenue': Decimal('0'),
         'purchase_total': Decimal('0'),
         'other_expenses_total': Decimal('0'),
+        'sales_cost_total': Decimal('0'),
+        'product_other_expenses_total': Decimal('0'),
     }
 
 
@@ -313,6 +325,23 @@ def _build_trends(scope: AnalyticsScope, sq: Q, tg: str) -> list[dict[str, Any]]
         ck = _trend_bucket_key(d, tg)
         slot = buckets.setdefault(ck, _empty_trend_slot())
         slot['revenue'] += _d(r.get('revenue'))
+
+    scope_in_range = AnalyticsScope(
+        period=scope.period,
+        date_from=start,
+        date_to=end,
+        line_id=scope.line_id,
+        client_id=scope.client_id,
+        profile_id=scope.profile_id,
+        recipe_id=scope.recipe_id,
+        batch_id=scope.batch_id,
+        otk_status=scope.otk_status,
+    )
+    for row in iter_sale_pnl_rows(scope_in_range):
+        ck = _trend_bucket_key(row.sale_date, tg)
+        slot = buckets.setdefault(ck, _empty_trend_slot())
+        slot['sales_cost_total'] += row.material_cost
+        slot['product_other_expenses_total'] += row.product_other_cost
 
     for r in (
         MaterialBatch.objects.filter(iq, received_at__date__gte=start, received_at__date__lte=end)
@@ -346,13 +375,17 @@ def _build_trends(scope: AnalyticsScope, sq: Q, tg: str) -> list[dict[str, Any]]
         rev = slot.get('revenue', Decimal('0'))
         pt = slot.get('purchase_total', Decimal('0'))
         oe = slot.get('other_expenses_total', Decimal('0'))
+        sc = slot.get('sales_cost_total', Decimal('0'))
+        poe = slot.get('product_other_expenses_total', Decimal('0'))
         if tg == 'month':
             period_key = f'{bucket.year}-{bucket.month:02d}'
         else:
             period_key = bucket.isoformat()
         pt_num = _trend_metric_num(pt)
         oe_num = _trend_metric_num(oe)
-        pe_num = _trend_metric_num(pt + oe)
+        sc_num = _trend_metric_num(sc)
+        poe_num = _trend_metric_num(poe)
+        pe_num = _trend_metric_num(pt + oe + sc + poe)
         out.append(
             {
                 'period': period_key,
@@ -361,6 +394,9 @@ def _build_trends(scope: AnalyticsScope, sq: Q, tg: str) -> list[dict[str, Any]]
                 'purchase': pt_num,
                 'other_expenses_total': oe_num,
                 'misc_expenses_total': oe_num,
+                'sales_cost_total': sc_num,
+                'product_other_expenses_total': poe_num,
+                'sold_goods_cost_total': _trend_metric_num(sc + poe),
                 'period_expenses_total': pe_num,
                 'period_expenses': pe_num,
                 'expenses': pe_num,
@@ -556,41 +592,66 @@ def build_product_unit_costs() -> dict[str, Any]:
 
 
 def build_sales_cost_details(scope: AnalyticsScope) -> dict[str, Any]:
-    """Себестоимость проданного (Sale.cost) — отдельно от производства и закупок."""
-    sq = _analytics_sale_q(scope)
-    qs = (
-        Sale.objects.filter(sq)
-        .select_related('client', 'warehouse_batch', 'warehouse_batch__profile')
-        .order_by('-date', '-id')
-    )
-    total = _d(qs.aggregate(t=Sum('cost'))['t'])
+    """Себестоимость проданного (материал) по строкам продаж."""
+    total = Decimal('0')
     items: list[dict[str, Any]] = []
-    for s in qs[:ANALYTICS_DETAIL_ITEMS_LIMIT]:
-        cst = _d(s.cost)
-        qty = _d(s.sold_pieces if (s.sold_pieces and s.sold_pieces > 0) else s.quantity)
-        profile_name = ''
-        wb = s.warehouse_batch
-        if wb and wb.profile_id and wb.profile:
-            profile_name = (wb.profile.name or '').strip()
-        d_iso = s.date.isoformat()
+    for row in iter_sale_pnl_rows(scope):
+        total += row.material_cost
+        if len(items) >= ANALYTICS_DETAIL_ITEMS_LIMIT:
+            continue
+        d_iso = row.sale_date.isoformat()
         items.append(
             {
                 'date': d_iso,
                 'sale_date': d_iso,
                 'created_at': d_iso,
-                'sale_id': s.id,
-                'order_number': s.order_number,
-                'product_name': (s.product or '').strip(),
-                'profile_name': profile_name,
-                'quantity': api_decimal_str(qty),
-                'cost_per_unit': _unit_cost_line(qty, cst),
-                'total_cost': api_decimal_str(cst),
+                'sale_id': row.sale_id,
+                'profile_id': row.profile_id,
+                'profile_name': row.profile_name,
+                'product_name': row.product_name or None,
+                'quantity': api_decimal_str(row.quantity),
+                'cost_per_unit': api_decimal_str(row.unit_material_cost),
+                'total_cost': api_decimal_str(row.material_cost),
             }
         )
-    tot_str = api_decimal_str(total)
+    tot_str = api_decimal_str(total.quantize(Decimal('0.01')))
     return {
         'period': scope.as_period_dict(),
         'total_sales_cost': tot_str,
+        'total': tot_str,
+        'items': items,
+    }
+
+
+def build_product_other_expenses_details(scope: AnalyticsScope) -> dict[str, Any]:
+    """Прочие расходы товара (extra_* профиля × проданные шт)."""
+    total = Decimal('0')
+    items: list[dict[str, Any]] = []
+    for row in iter_sale_pnl_rows(scope):
+        if row.product_other_cost <= 0:
+            continue
+        total += row.product_other_cost
+        if len(items) >= ANALYTICS_DETAIL_ITEMS_LIMIT:
+            continue
+        unit_s = api_decimal_str(row.unit_other_expenses)
+        d_iso = row.sale_date.isoformat()
+        items.append(
+            {
+                'date': d_iso,
+                'sale_id': row.sale_id,
+                'profile_id': row.profile_id,
+                'profile_name': row.profile_name,
+                'quantity': api_decimal_str(row.quantity),
+                'unit_other_expenses': unit_s,
+                'other_per_unit': unit_s,
+                'total_other_expenses': api_decimal_str(row.product_other_cost),
+                'breakdown': profile_extra_breakdown(row.profile),
+            }
+        )
+    tot_str = api_decimal_str(total.quantize(Decimal('0.01')))
+    return {
+        'period': scope.as_period_dict(),
+        'total_product_other_expenses': tot_str,
         'total': tot_str,
         'items': items,
     }
@@ -678,14 +739,20 @@ def build_profit_details(scope: AnalyticsScope) -> dict[str, Any]:
         .select_related('client', 'warehouse_batch', 'warehouse_batch__profile')
         .order_by('-date', '-id')
     )
-    agg = qs.aggregate(
-        rev=Sum('revenue'),
-        cst=Sum('cost'),
-        prf=Sum('profit'),
+    pnl = aggregate_sale_pnl(scope)
+    sales_cost_total = pnl['sales_cost_total']
+    product_other_expenses_total = pnl['product_other_expenses_total']
+    from .other_expenses import sum_accepted_other_expenses
+
+    purchase_total = _d(
+        MaterialBatch.objects.filter(scope.incoming_date_q()).aggregate(pt=Sum('total_price'))['pt']
     )
-    revenue_t = _d(agg['rev'])
-    cost_t = _d(agg['cst'])
-    profit_t = _d(agg['prf'])
+    other_expenses_total = sum_accepted_other_expenses(scope)
+    revenue_t = _d(qs.aggregate(rev=Sum('revenue'))['rev'])
+    period_expenses_total = (
+        purchase_total + other_expenses_total + sales_cost_total + product_other_expenses_total
+    ).quantize(Decimal('0.01'))
+    profit_t = _profit_dec(revenue_t, period_expenses_total)
     items: list[dict[str, Any]] = []
     for s in qs[:ANALYTICS_DETAIL_ITEMS_LIMIT]:
         rev = _d(s.revenue)
@@ -714,8 +781,13 @@ def build_profit_details(scope: AnalyticsScope) -> dict[str, Any]:
         )
     tot = {
         'revenue': api_decimal_str(revenue_t),
-        'sales_cost': api_decimal_str(cost_t),
+        'purchase_total': api_decimal_str(purchase_total),
+        'other_expenses_total': api_decimal_str(other_expenses_total),
+        'sales_cost_total': api_decimal_str(sales_cost_total),
+        'product_other_expenses_total': api_decimal_str(product_other_expenses_total),
+        'period_expenses_total': api_decimal_str(period_expenses_total),
         'profit': api_decimal_str(profit_t),
+        'sales_cost': api_decimal_str(sales_cost_total),
     }
     return {
         'period': scope.as_period_dict(),

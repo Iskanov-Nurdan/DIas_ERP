@@ -44,6 +44,7 @@ from apps.analytics.views import (
     AnalyticsSummaryView,
     AnalyticsRevenueDetailsView,
     AnalyticsSalesCostDetailsView,
+    AnalyticsProductOtherExpensesDetailsView,
     AnalyticsProductUnitCostsView,
     AnalyticsProductionCostDetailsView,
     AnalyticsPurchaseDetailsView,
@@ -102,6 +103,11 @@ router.register(r'otk/pending', OtkPendingView, basename='otk-pending')
 router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-summary')
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')
 router.register(r'analytics/sales-cost-details', AnalyticsSalesCostDetailsView, basename='analytics-sales-cost-details')
+router.register(
+    r'analytics/product-other-expenses-details',
+    AnalyticsProductOtherExpensesDetailsView,
+    basename='analytics-product-other-expenses-details',
+)
 router.register(
     r'analytics/product-unit-costs',
     AnalyticsProductUnitCostsView,

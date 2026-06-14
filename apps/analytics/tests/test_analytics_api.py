@@ -52,6 +52,9 @@ class AnalyticsApiTests(APITestCase):
         cards = resp.data['cards']
         self.assertEqual(cards['revenue_total'], '0')
         self.assertEqual(cards['sales_cost_total'], '0')
+        self.assertEqual(cards['product_other_expenses_total'], '0')
+        self.assertEqual(cards['sold_goods_cost_total'], '0')
+        self.assertEqual(cards['period_expenses_total'], '0')
         self.assertEqual(cards['profit_total'], '0')
         self.assertEqual(cards['sales_count'], 0)
         self.assertEqual(cards['client_debt_total'], '0')
@@ -71,6 +74,9 @@ class AnalyticsApiTests(APITestCase):
         cards = resp.data['cards']
         self.assertEqual(cards['revenue_total'], '1000')
         self.assertEqual(cards['sales_cost_total'], '400')
+        self.assertEqual(cards['product_other_expenses_total'], '0')
+        self.assertEqual(cards['sold_goods_cost_total'], '400')
+        self.assertEqual(cards['period_expenses_total'], '400')
         self.assertEqual(cards['profit_total'], '600')
         self.assertEqual(cards['sales_count'], 1)
         self.assertGreater(Decimal(cards['sold_units_total']), 0)
@@ -209,8 +215,8 @@ class AnalyticsApiTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         cards = resp.data['cards']
         self.assertEqual(cards['purchase_total'], '5000')
-        self.assertEqual(cards['period_expenses_total'], '5000')
-        self.assertEqual(cards['operating_expenses_total'], '5000')
+        self.assertEqual(cards['period_expenses_total'], '5400')
+        self.assertEqual(cards['operating_expenses_total'], '5400')
         self.assertEqual(cards['production_cost_total'], '9999')
         self.assertEqual(cards['sales_cost_total'], '400')
 
@@ -327,3 +333,27 @@ class AnalyticsApiTests(APITestCase):
         self.assertEqual(resp.data['cards']['purchase_total'], '1000')
         self.assertEqual(resp.data['cards']['other_expenses_total'], '200')
         self.assertEqual(resp.data['cards']['period_expenses_total'], '1200')
+
+    def test_product_other_expenses_in_summary_and_details(self):
+        self.profile.extra_rubber = Decimal('5')
+        self.profile.extra_label = Decimal('2')
+        self.profile.extra_labor = Decimal('3')
+        self.profile.save()
+        resp = self.client.get('/api/analytics/summary/?year=2026&month=4')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        cards = resp.data['cards']
+        self.assertEqual(cards['sales_cost_total'], '400')
+        self.assertEqual(cards['product_other_expenses_total'], '100')
+        self.assertEqual(cards['sold_goods_cost_total'], '500')
+        self.assertEqual(cards['period_expenses_total'], '500')
+        self.assertEqual(cards['profit_total'], '500')
+
+        detail = self.client.get('/api/analytics/product-other-expenses-details/?year=2026&month=4')
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data['total_product_other_expenses'], '100')
+        self.assertEqual(len(detail.data['items']), 1)
+        item = detail.data['items'][0]
+        self.assertEqual(item['sale_id'], self.sale.pk)
+        self.assertEqual(item['unit_other_expenses'], '10')
+        self.assertEqual(item['total_other_expenses'], '100')
+        self.assertIn('breakdown', item)

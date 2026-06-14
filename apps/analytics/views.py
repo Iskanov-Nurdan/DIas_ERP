@@ -16,6 +16,7 @@ from .reporting import (
     build_analytics_summary,
     build_debt_details,
     build_otk_details,
+    build_product_other_expenses_details,
     build_product_unit_costs,
     build_production_cost_details,
     build_profit_details,
@@ -109,6 +110,23 @@ class AnalyticsSalesCostDetailsView(viewsets.ViewSet):
     def list(self, request):
         scope = parse_analytics_scope(request)
         return Response(build_sales_cost_details(scope))
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=['analytics'],
+        summary='Прочие расходы товара по продажам (extra_* профиля × шт)',
+        parameters=_ANALYTICS_UI_SCOPE_PARAMS,
+        responses={200: OpenApiTypes.OBJECT, 401: DiasErrorSerializer, 403: DiasErrorSerializer},
+    ),
+)
+class AnalyticsProductOtherExpensesDetailsView(viewsets.ViewSet):
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'analytics'
+
+    def list(self, request):
+        scope = parse_analytics_scope(request)
+        return Response(build_product_other_expenses_details(scope))
 
 
 @extend_schema_view(
