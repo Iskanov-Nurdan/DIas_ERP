@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'apps.activity',
     'apps.realtime',
     'apps.workshop.apps.WorkshopConfig',
+    'apps.foam.apps.FoamConfig',
 ]
 
 MIDDLEWARE = [

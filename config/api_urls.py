@@ -72,6 +72,14 @@ from apps.workshop.otk_views import (
     OtkBlanksListView,
 )
 from apps.warehouse.gp_stock_views import GpStockView
+from apps.foam.views import (
+    FoamDensityGradeViewSet,
+    FoamGpOperationViewSet,
+    FoamGpStockViewSet,
+    FoamProductionRunViewSet,
+    FoamRawLotViewSet,
+    FoamSaleViewSet,
+)
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -145,6 +153,12 @@ router.register(
     basename='workshop-blank-production-run',
 )
 router.register(r'workshop/otk-accounting', OtkAccountingViewSet, basename='workshop-otk-accounting')
+router.register(r'foam/raw-lots', FoamRawLotViewSet, basename='foam-raw-lot')
+router.register(r'foam/density-grades', FoamDensityGradeViewSet, basename='foam-density-grade')
+router.register(r'foam/production-runs', FoamProductionRunViewSet, basename='foam-production-run')
+router.register(r'foam/gp-stock', FoamGpStockViewSet, basename='foam-gp-stock')
+router.register(r'foam/gp-operations', FoamGpOperationViewSet, basename='foam-gp-operation')
+router.register(r'foam/sales', FoamSaleViewSet, basename='foam-sale')
 
 # Фиксированные пути регистрируются ДО роутера, чтобы не конфликтовать с <pk>
 urlpatterns = [

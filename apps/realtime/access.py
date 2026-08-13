@@ -56,6 +56,12 @@ RESOURCE_ACCESS_KEYS: dict[str, tuple[str, ...]] = {
     'chemistry_balance': ('chemistry',),
     # Аналитика
     'other_expense': ('analytics',),
+    # Пенополистирол (отдельная продуктовая линия)
+    'foam_raw_lot': ('materials',),
+    'foam_density_grade': ('materials',),
+    'foam_production_run': ('production',),
+    'foam_gp_stock': ('warehouse',),
+    'foam_sale': ('sales',),
 }
 
 
