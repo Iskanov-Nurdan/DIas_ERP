@@ -84,7 +84,10 @@ _redis_channel = os.environ.get('REDIS_URL') or os.environ.get('CHANNEL_LAYER_RE
 if _redis_channel:
     CHANNEL_LAYERS = {
         'default': {
-            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            # PubSub-слой вместо RedisChannelLayer: у последнего на простаивающем
+            # соединении redis-py поднимает «Timeout reading from redis» и рвёт WebSocket.
+            # Проекту нужен только веерный broadcast (group_send), для него pubsub и предназначен.
+            'BACKEND': 'channels_redis.pubsub.RedisPubSubChannelLayer',
             'CONFIG': {'hosts': [_redis_channel]},
         },
     }
