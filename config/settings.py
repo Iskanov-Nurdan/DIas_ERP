@@ -372,6 +372,11 @@ JAZZMIN_UI_TWEAKS = {
 }
 
 # ——— Логирование (структурированное, request id) ———
+# Всё пишется в stdout/stderr → docker compose logs. Файлы внутри контейнера не ведём:
+# ротацией занимается docker (json-file, max-size в docker-compose.prod.yml).
+# LOG_LEVEL=DEBUG во время разбора инцидента, обратно INFO.
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -382,7 +387,8 @@ LOGGING = {
     },
     'formatters': {
         'verbose': {
-            'format': '{asctime} [{levelname}] request_id={request_id} {message}',
+            # logger в строке нужен, чтобы видеть источник: config.exceptions, django.request, daphne...
+            'format': '{asctime} [{levelname}] {name} request_id={request_id} {message}',
             'style': '{',
         },
     },
@@ -395,10 +401,19 @@ LOGGING = {
     },
     'root': {
         'handlers': ['console'],
-        'level': 'INFO',
+        'level': LOG_LEVEL,
     },
     'loggers': {
+        # 4xx → WARNING, 5xx → ERROR с трассировкой
         'django.request': {'level': 'WARNING'},
+        # Ошибки БД: обрыв соединения, дедлоки
+        'django.db.backends': {'level': 'WARNING'},
+        # Ошибки WebSocket-хендшейка и разрывы
+        'daphne': {'level': 'INFO'},
+        'channels': {'level': 'INFO'},
+        # Код проекта
+        'apps': {'level': LOG_LEVEL},
+        'config': {'level': LOG_LEVEL},
     },
 }
 
