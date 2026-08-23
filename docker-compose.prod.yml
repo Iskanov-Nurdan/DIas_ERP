@@ -49,8 +49,19 @@ services:
     restart: unless-stopped
     env_file: [.env.prod]
     environment:
+      # Значения из compose перебивают env_file. Задаём ОБА набора имён (DB_* и PG*),
+      # потому что settings.py и entrypoint отдают приоритет DB_*: иначе унаследованный
+      # из старого деплоя DB_HOST=localhost уводит контейнер мимо БД.
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${PGDATABASE}
+      DB_USER: ${PGUSER}
+      DB_PASSWORD: ${PGPASSWORD}
       PGHOST: db
       PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE}
+      PGUSER: ${PGUSER}
+      PGPASSWORD: ${PGPASSWORD}
       REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
