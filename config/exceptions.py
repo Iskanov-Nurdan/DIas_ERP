@@ -105,6 +105,27 @@ def _first_scalar(value):
     return value
 
 
+def _where(context) -> str:
+    """Контекст запроса для лога: метод, путь, вью, пользователь, request_id.
+
+    Без него в логе видна только трассировка — непонятно, какой запрос её вызвал.
+    """
+    request = context.get('request') if isinstance(context, dict) else None
+    view = context.get('view') if isinstance(context, dict) else None
+    parts = []
+    if request is not None:
+        parts.append(f'{request.method} {request.get_full_path()}')
+        user = getattr(request, 'user', None)
+        if user is not None and getattr(user, 'is_authenticated', False):
+            parts.append(f'user={user} (id={user.pk})')
+        else:
+            parts.append('user=anonymous')
+        parts.append(f'rid={getattr(request, "request_id", "-")}')
+    if view is not None:
+        parts.append(f'view={type(view).__name__}')
+    return ' | '.join(parts) if parts else 'контекст запроса недоступен'
+
+
 def dias_exception_handler(exc, context):
     if isinstance(exc, DjangoValidationError):
         exc = ValidationError(detail=exc.message_dict if hasattr(exc, 'message_dict') else exc.messages)
@@ -112,16 +133,22 @@ def dias_exception_handler(exc, context):
     response = exception_handler(exc, context)
 
     if response is None:
-        logger.exception('Необработанное исключение: %s', exc, exc_info=True)
+        logger.exception('Необработанное исключение [%s]: %s — %s', type(exc).__name__, exc, _where(context), exc_info=True)
         return _make_error_response('internal_error', 'Внутренняя ошибка сервера', http_status=500)
 
     http_status = response.status_code
     detail = response.data
 
+    if 400 <= http_status < 500:
+        logger.warning(
+            'HTTP %s [%s]: %s — %s',
+            http_status, type(exc).__name__, getattr(exc, 'detail', exc), _where(context),
+        )
+
     if http_status >= 500:
         logger.exception(
-            'Серверная ошибка %s: %s\n%s',
-            http_status, exc,
+            'Серверная ошибка %s [%s]: %s — %s\n%s',
+            http_status, type(exc).__name__, exc, _where(context),
             ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         )
 
@@ -197,8 +224,5 @@ def dias_exception_handler(exc, context):
         message = str(detail[0])
     else:
         message = str(detail) if detail else _DEFAULT_MESSAGES.get(http_status, 'Ошибка')
-
-    if 400 <= http_status < 500:
-        logger.warning('HTTP %s %s: %s', http_status, code, message)
 
     return _make_error_response(code, message, http_status=http_status)

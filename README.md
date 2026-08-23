@@ -11,7 +11,16 @@
 - django-jazzmin (админка)
 - SQLite (по умолчанию) или PostgreSQL
 
-## Установка
+## Production (Docker)
+
+```bash
+cp .env.prod.example .env.prod && nano .env.prod
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+```
+
+Подробно — [DEPLOY.md](DEPLOY.md).
+
+## Установка (локально)
 
 ```bash
 python -m venv .venv
@@ -55,4 +64,5 @@ python manage.py runserver
 - `DJANGO_SECRET_KEY`
 - `ALLOWED_HOSTS` — через запятую
 - `CORS_ALLOWED_ORIGINS` — через запятую
+- `FRONTEND_PORTS` — локальные порты фронта для CORS/WS, по умолчанию `3000,5173`
 - PostgreSQL: `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGHOST`, `PGPORT`

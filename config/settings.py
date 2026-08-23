@@ -2,6 +2,9 @@ import os
 from pathlib import Path
 
 from corsheaders.defaults import default_headers
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -9,7 +12,7 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-change-in-prod
 
 DEBUG = os.environ.get('DEBUG', 'True').lower() == 'true'
 
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
 
 INSTALLED_APPS = [
     'daphne',  # должен быть до django.contrib.staticfiles: подменяет runserver на ASGI (иначе WebSocket не работает)
@@ -92,17 +95,41 @@ else:
         },
     }
 
-# PostgreSQL: задайте DB_NAME (и при необходимости DB_USER, DB_PASSWORD, DB_HOST, DB_PORT).
-# Без DB_NAME используется SQLite в корне проекта — для локального запуска без Postgres.
-if os.getenv('DB_NAME'):
+
+def _env_first(*names: str, default: str = '') -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+FRONTEND_PORT = _env_first('FRONTEND_PORT', default='3000')
+_frontend_ports_env = os.environ.get('FRONTEND_PORTS', '').strip()
+FRONTEND_PORTS = [
+    p.strip()
+    for p in (_frontend_ports_env.split(',') if _frontend_ports_env else [FRONTEND_PORT, '5173'])
+    if p.strip()
+]
+FRONTEND_HOSTS = []
+for port in dict.fromkeys(FRONTEND_PORTS):
+    FRONTEND_HOSTS.extend([
+        f'http://localhost:{port}',
+        f'http://127.0.0.1:{port}',
+    ])
+
+# PostgreSQL: поддерживаем и DB_* и стандартные PG* переменные.
+# Без имени БД используется SQLite в корне проекта — для локального запуска без Postgres.
+db_name = _env_first('DB_NAME', 'PGDATABASE')
+if db_name:
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ['DB_NAME'],
-            'USER': os.getenv('DB_USER', 'postgres'),
-            'PASSWORD': os.getenv('DB_PASSWORD', ''),
-            'HOST': os.getenv('DB_HOST', 'localhost'),
-            'PORT': os.getenv('DB_PORT', '5432'),
+            'NAME': db_name,
+            'USER': _env_first('DB_USER', 'PGUSER', default='postgres'),
+            'PASSWORD': _env_first('DB_PASSWORD', 'PGPASSWORD'),
+            'HOST': _env_first('DB_HOST', 'PGHOST', default='localhost'),
+            'PORT': _env_first('DB_PORT', 'PGPORT', default='5432'),
         }
     }
 else:
@@ -185,17 +212,12 @@ SIMPLE_JWT = {
 # ——— CORS (по окружениям) ———
 _raw_cors_origins = os.environ.get(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000',
+    ','.join(FRONTEND_HOSTS),
 ).split(',')
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _raw_cors_origins if o.strip()]
 if DEBUG and not os.environ.get('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOW_ALL_ORIGINS = False
-    CORS_ALLOWED_ORIGINS = [
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-    ]
+    CORS_ALLOWED_ORIGINS = FRONTEND_HOSTS
 
 # Кастомные заголовки: расширяем default_headers (а не подменяем целиком).
 CORS_ALLOW_HEADERS = list(default_headers) + [
@@ -352,6 +374,11 @@ JAZZMIN_UI_TWEAKS = {
 }
 
 # ——— Логирование (структурированное, request id) ———
+# Всё пишется в stdout/stderr → docker compose logs. Файлы внутри контейнера не ведём:
+# ротацией занимается docker (json-file, max-size в docker-compose.prod.yml).
+# LOG_LEVEL=DEBUG во время разбора инцидента, обратно INFO.
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -362,7 +389,8 @@ LOGGING = {
     },
     'formatters': {
         'verbose': {
-            'format': '{asctime} [{levelname}] request_id={request_id} {message}',
+            # logger в строке нужен, чтобы видеть источник: config.exceptions, django.request, daphne...
+            'format': '{asctime} [{levelname}] {name} request_id={request_id} {message}',
             'style': '{',
         },
     },
@@ -375,10 +403,19 @@ LOGGING = {
     },
     'root': {
         'handlers': ['console'],
-        'level': 'INFO',
+        'level': LOG_LEVEL,
     },
     'loggers': {
+        # 4xx → WARNING, 5xx → ERROR с трассировкой
         'django.request': {'level': 'WARNING'},
+        # Ошибки БД: обрыв соединения, дедлоки
+        'django.db.backends': {'level': 'WARNING'},
+        # Ошибки WebSocket-хендшейка и разрывы
+        'daphne': {'level': 'INFO'},
+        'channels': {'level': 'INFO'},
+        # Код проекта
+        'apps': {'level': LOG_LEVEL},
+        'config': {'level': LOG_LEVEL},
     },
 }
 
@@ -406,3 +443,45 @@ USERS_SUPERUSER_ROLE_NAME = 'Админ'
 USERS_PLANNER_ACCESS_KEYS = [
     'lines', 'recipes', 'orders', 'production',
 ]
+
+# ——— Прод-режим: работа за reverse proxy (nginx) ———
+# Активируется только при DEBUG=False, чтобы не мешать локальной разработке.
+if not DEBUG:
+    from django.core.exceptions import ImproperlyConfigured
+
+    if SECRET_KEY.startswith('django-insecure'):
+        raise ImproperlyConfigured(
+            'DJANGO_SECRET_KEY не задан. В проде укажите его в .env.prod '
+            '(сгенерировать: python -c "from django.core.management.utils import '
+            'get_random_secret_key as k; print(k())").'
+        )
+
+    # nginx передаёт X-Forwarded-Proto/Host — без этого Django считает запрос http и ломает CSRF/redirect.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    USE_X_FORWARDED_HOST = True
+
+    _csrf_env = os.environ.get('CSRF_TRUSTED_ORIGINS', '').strip()
+    if _csrf_env:
+        CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(',') if o.strip()]
+    else:
+        # По умолчанию доверяем origin'ам фронта (CORS) и хостам из ALLOWED_HOSTS по https.
+        _hosts = [h.strip() for h in ALLOWED_HOSTS if h.strip() and h.strip() not in ('*', 'testserver')]
+        CSRF_TRUSTED_ORIGINS = list(dict.fromkeys(
+            [o for o in CORS_ALLOWED_ORIGINS if o.startswith(('http://', 'https://'))]
+            + [f'https://{h}' for h in _hosts]
+        ))
+
+    # Включайте после подключения TLS (SECURE_COOKIES=True): иначе cookie не уйдут по http и админка не залогинится.
+    SECURE_COOKIES = os.environ.get('SECURE_COOKIES', 'False').lower() in ('1', 'true', 'yes')
+    SESSION_COOKIE_SECURE = SECURE_COOKIES
+    CSRF_COOKIE_SECURE = SECURE_COOKIES
+    SECURE_SSL_REDIRECT = SECURE_COOKIES
+    if SECURE_COOKIES:
+        SECURE_HSTS_SECONDS = 31536000
+        SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+        SECURE_HSTS_PRELOAD = True
+
+    SESSION_COOKIE_HTTPONLY = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+    X_FRAME_OPTIONS = 'SAMEORIGIN'
