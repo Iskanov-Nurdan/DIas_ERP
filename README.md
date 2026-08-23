@@ -11,7 +11,16 @@
 - django-jazzmin (админка)
 - SQLite (по умолчанию) или PostgreSQL
 
-## Установка
+## Production (Docker)
+
+```bash
+cp .env.prod.example .env.prod && nano .env.prod
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+```
+
+Подробно — [DEPLOY.md](DEPLOY.md).
+
+## Установка (локально)
 
 ```bash
 python -m venv .venv

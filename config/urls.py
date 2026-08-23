@@ -2,6 +2,7 @@ from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
+from config.health import health
 from apps.accounts.views import LoginView, MeView, LogoutView, UserViewSet
 from apps.materials.views import MaterialsBalancesView, MaterialsMovementsView
 from apps.warehouse.views import WarehouseBatchViewSet
@@ -14,6 +15,7 @@ _materials_balances = MaterialsBalancesView.as_view({'get': 'list'})
 _materials_movements = MaterialsMovementsView.as_view({'get': 'list'})
 
 urlpatterns = [
+    path('health/', health, name='health'),
     path('admin/', admin.site.urls),
     path('api/openapi.json', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='schema-swagger-ui'),

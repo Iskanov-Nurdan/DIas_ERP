@@ -420,3 +420,45 @@ USERS_SUPERUSER_ROLE_NAME = 'Админ'
 USERS_PLANNER_ACCESS_KEYS = [
     'lines', 'recipes', 'orders', 'production',
 ]
+
+# ——— Прод-режим: работа за reverse proxy (nginx) ———
+# Активируется только при DEBUG=False, чтобы не мешать локальной разработке.
+if not DEBUG:
+    from django.core.exceptions import ImproperlyConfigured
+
+    if SECRET_KEY.startswith('django-insecure'):
+        raise ImproperlyConfigured(
+            'DJANGO_SECRET_KEY не задан. В проде укажите его в .env.prod '
+            '(сгенерировать: python -c "from django.core.management.utils import '
+            'get_random_secret_key as k; print(k())").'
+        )
+
+    # nginx передаёт X-Forwarded-Proto/Host — без этого Django считает запрос http и ломает CSRF/redirect.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    USE_X_FORWARDED_HOST = True
+
+    _csrf_env = os.environ.get('CSRF_TRUSTED_ORIGINS', '').strip()
+    if _csrf_env:
+        CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(',') if o.strip()]
+    else:
+        # По умолчанию доверяем origin'ам фронта (CORS) и хостам из ALLOWED_HOSTS по https.
+        _hosts = [h.strip() for h in ALLOWED_HOSTS if h.strip() and h.strip() not in ('*', 'testserver')]
+        CSRF_TRUSTED_ORIGINS = list(dict.fromkeys(
+            [o for o in CORS_ALLOWED_ORIGINS if o.startswith(('http://', 'https://'))]
+            + [f'https://{h}' for h in _hosts]
+        ))
+
+    # Включайте после подключения TLS (SECURE_COOKIES=True): иначе cookie не уйдут по http и админка не залогинится.
+    SECURE_COOKIES = os.environ.get('SECURE_COOKIES', 'False').lower() in ('1', 'true', 'yes')
+    SESSION_COOKIE_SECURE = SECURE_COOKIES
+    CSRF_COOKIE_SECURE = SECURE_COOKIES
+    SECURE_SSL_REDIRECT = SECURE_COOKIES
+    if SECURE_COOKIES:
+        SECURE_HSTS_SECONDS = 31536000
+        SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+        SECURE_HSTS_PRELOAD = True
+
+    SESSION_COOKIE_HTTPONLY = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+    X_FRAME_OPTIONS = 'SAMEORIGIN'
