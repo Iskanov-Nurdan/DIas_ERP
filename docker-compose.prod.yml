@@ -11,9 +11,9 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${PGDATABASE}
-      POSTGRES_USER: ${PGUSER}
-      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: ${PGDATABASE:?не задан в .env.prod — контейнер БД без имени базы не поднимется}
+      POSTGRES_USER: ${PGUSER:?не задан в .env.prod}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?не задан в .env.prod}
       TZ: ${TZ:-Europe/Moscow}
     volumes:
       - pg_data:/var/lib/postgresql/data
