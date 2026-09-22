@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Деплой бэкенда DIAS одной командой (запускать на сервере из /root/DIas_ERP):
-#   ./deploy.sh            — бэкап БД → git pull → сборка → запуск → проверка health
-#   ./deploy.sh --no-pull  — без git pull (собрать то, что уже лежит в папке)
+#   ./deploy.sh            — бэкап БД → код из origin/main → сборка → запуск → проверка health
+#   ./deploy.sh --no-pull  — без обновления кода (собрать то, что уже лежит в папке)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -41,8 +41,12 @@ fi
 
 # ——— Код ———
 if [ "${1:-}" != "--no-pull" ]; then
-    log "git pull"
-    git pull --ff-only
+    # Явно origin/main: не зависим от имени локальной ветки и её upstream.
+    # .env.prod, frontend-dist/, backups/ не в git — reset их не трогает.
+    log "обновление кода из origin/main"
+    git fetch origin main
+    git checkout -q -B main origin/main
+    git reset -q --hard origin/main
 fi
 
 # ——— Сборка и запуск ———
