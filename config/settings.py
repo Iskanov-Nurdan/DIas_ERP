@@ -79,7 +79,10 @@ _redis_channel = os.environ.get('REDIS_URL') or os.environ.get('CHANNEL_LAYER_RE
 if _redis_channel:
     CHANNEL_LAYERS = {
         'default': {
-            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            # PubSub-слой вместо RedisChannelLayer: у последнего на простаивающем
+            # соединении redis-py поднимает «Timeout reading from redis» и рвёт WebSocket.
+            # Проекту нужен только веерный broadcast (group_send), для него pubsub и предназначен.
+            'BACKEND': 'channels_redis.pubsub.RedisPubSubChannelLayer',
             'CONFIG': {'hosts': [_redis_channel]},
         },
     }
@@ -393,3 +396,19 @@ USERS_SUPERUSER_ROLE_NAME = 'Админ'
 USERS_PLANNER_ACCESS_KEYS = [
     'lines', 'recipes', 'orders', 'production',
 ]
+
+# ——— Прод за reverse proxy (nginx в контейнере + внешний nginx с TLS) ———
+if not DEBUG:
+    # Внешний nginx терминирует HTTPS и передаёт X-Forwarded-Proto=https.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+    _secure = os.environ.get('SECURE_COOKIES', 'False').lower() == 'true'
+    SESSION_COOKIE_SECURE = _secure
+    CSRF_COOKIE_SECURE = _secure
+
+    # Django 4 сверяет Origin при POST в админку — без этого «CSRF verification failed» по HTTPS.
+    _csrf_env = os.environ.get('CSRF_TRUSTED_ORIGINS', '').strip()
+    if _csrf_env:
+        CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(',') if o.strip()]
+    else:
+        CSRF_TRUSTED_ORIGINS = [f'https://{h.strip()}' for h in ALLOWED_HOSTS if h.strip() and '*' not in h]

@@ -4,6 +4,7 @@ from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, Spec
 
 from apps.accounts.views import LoginView, MeView, LogoutView, UserViewSet
 from apps.warehouse.views import WarehouseBatchViewSet
+from config.health import health
 
 # Совместимость с axios: путь с ведущим «/» уходит на корень хоста без /api/ — дублируем ключевые маршруты.
 _user_detail = UserViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'put': 'update', 'delete': 'destroy'})
@@ -11,6 +12,7 @@ _user_access_patch = UserViewSet.as_view({'patch': 'update_access'})
 _pack_from_otk = WarehouseBatchViewSet.as_view({'post': 'package'})
 
 urlpatterns = [
+    path('health/', health, name='health'),
     path('admin/', admin.site.urls),
     path('api/openapi.json', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='schema-swagger-ui'),
