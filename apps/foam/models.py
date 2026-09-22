@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 from .constants import (
     OPERATION_KIND_CHOICES,
@@ -39,7 +40,14 @@ class FoamRawLot(models.Model):
     bag_weight_kg = models.DecimalField('Вес мешка, кг', max_digits=12, decimal_places=1)
     received_kg = models.DecimalField('Приход, кг', max_digits=12, decimal_places=1)
     remaining_kg = models.DecimalField('Остаток, кг', max_digits=12, decimal_places=1)
-    received_at = models.DateTimeField('Дата прихода', auto_now_add=True)
+    # Цена — только для учёта закупки (себестоимость производства/склада ГП
+    # её пока не использует, apps.foam своих cost-полей на выходе не считает,
+    # см. FoamProductionRun/FoamGpStock) — как unit_price у apps.materials.MaterialBatch.
+    unit_price = models.DecimalField('Цена за единицу, сом', max_digits=14, decimal_places=2, default=0)
+    # Раньше auto_now_add — всегда "сейчас", без возможности указать дату прихода
+    # задним числом (см. apps.materials.MaterialBatch.received_at — та же дата, но
+    # обычная, редактируемая).
+    received_at = models.DateTimeField('Дата прихода', default=timezone.now)
 
     class Meta:
         db_table = 'foam_raw_lots'

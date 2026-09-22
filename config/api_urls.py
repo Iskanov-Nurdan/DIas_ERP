@@ -21,6 +21,7 @@ from apps.production.views import (
     ProductionRequestViewSet,
     RecipeRunViewSet,
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
+    ShiftClosingViewSet, ShiftPhotoReportViewSet,
 )
 from apps.warehouse.gp_packaging_views import GpPackageViewSet, GpUnpackedBalanceView
 from apps.warehouse.operations_views import WarehouseOperationsView
@@ -145,6 +146,8 @@ router.register(r'client-prices', ClientPriceViewSet, basename='client-price')
 router.register(r'order-reservations', OrderReservationViewSet, basename='order-reservation')
 router.register(r'client-financial-summary', ClientFinancialSummaryView, basename='client-financial-summary')
 router.register(r'shifts', ShiftViewSet, basename='shift')
+router.register(r'shift-closings', ShiftClosingViewSet, basename='shift-closing')
+router.register(r'shift-photo-reports', ShiftPhotoReportViewSet, basename='shift-photo-report')
 router.register(r'workshop/blanks', WorkshopBlankViewSet, basename='workshop-blank')
 router.register(r'workshop/prepared-blanks', PreparedBlankViewSet, basename='workshop-prepared-blank')
 router.register(

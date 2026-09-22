@@ -1,3 +1,4 @@
+from django.db.models.deletion import ProtectedError
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -19,6 +20,7 @@ from .serializers import (
     FoamProductionRunCreateSerializer,
     FoamProductionRunReadSerializer,
     FoamRawLotSerializer,
+    FoamRawLotUpdateSerializer,
     FoamSaleCreateSerializer,
     FoamSaleReadSerializer,
 )
@@ -38,6 +40,8 @@ class FoamRawLotViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     queryset = FoamRawLot.objects.all()
@@ -55,10 +59,51 @@ class FoamRawLotViewSet(
         lot = serializer.instance
         schedule_push(resource='foam_raw_lot', action='created', entity_id=lot.pk)
 
+    def get_serializer_class(self):
+        # Количество (bag_weight_kg/received_kg/remaining_kg) правится только
+        # через приход/производство — руками можно поправить лишь опечатку
+        # в названии материала или поставщике, не искажая остаток по лоту.
+        if self.action in ('update', 'partial_update'):
+            return FoamRawLotUpdateSerializer
+        return FoamRawLotSerializer
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        lot = serializer.instance
+        schedule_push(resource='foam_raw_lot', action='updated', entity_id=lot.pk)
+
+    def destroy(self, request, *args, **kwargs):
+        lot = self.get_object()
+        if lot.remaining_kg != lot.received_kg:
+            return _err(
+                'LOT_IN_USE',
+                'Лот уже частично или полностью израсходован — удаление недоступно.',
+                status.HTTP_409_CONFLICT,
+            )
+        if lot.production_runs.exists():
+            return _err(
+                'LOT_IN_USE',
+                'По лоту есть выпуски производства — удаление недоступно.',
+                status.HTTP_409_CONFLICT,
+            )
+        try:
+            self.perform_destroy(lot)
+        except ProtectedError:
+            return _err(
+                'LOT_IN_USE',
+                'Лот используется в других записях — удаление недоступно.',
+                status.HTTP_409_CONFLICT,
+            )
+        schedule_push(resource='foam_raw_lot', action='deleted', entity_id=kwargs.get('pk'))
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class FoamDensityGradeViewSet(
     mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
     mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     queryset = FoamDensityGrade.objects.all()
@@ -71,10 +116,19 @@ class FoamDensityGradeViewSet(
         qs = self.filter_queryset(self.get_queryset())
         return Response({'items': self.get_serializer(qs, many=True).data})
 
+    def _duplicate_code_error(self, code, instance=None):
+        qs = FoamDensityGrade.objects.filter(code=code)
+        if instance is not None:
+            qs = qs.exclude(pk=instance.pk)
+        if code and qs.exists():
+            return _err('DENSITY_GRADE_EXISTS', f'Плотность с кодом "{code}" уже существует', status.HTTP_409_CONFLICT)
+        return None
+
     def create(self, request, *args, **kwargs):
         code = str(request.data.get('code') or '').strip()
-        if code and FoamDensityGrade.objects.filter(code=code).exists():
-            return _err('DENSITY_GRADE_EXISTS', f'Плотность с кодом "{code}" уже существует', status.HTTP_409_CONFLICT)
+        dup = self._duplicate_code_error(code)
+        if dup:
+            return dup
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         grade = serializer.save()
@@ -90,6 +144,48 @@ class FoamDensityGradeViewSet(
         )
         schedule_push(resource='foam_density_grade', action='created')
         return Response(self.get_serializer(grade).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        code = str(request.data.get('code') or '').strip()
+        dup = self._duplicate_code_error(code, instance=instance) if code else None
+        if dup:
+            return dup
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        grade = serializer.save()
+        schedule_entity_audit(
+            user=request.user,
+            request=request,
+            section=ACTIVITY_SECTION,
+            description=f'Изменена плотность {grade.code}',
+            action='update',
+            model_cls=FoamDensityGrade,
+            after_instance=grade,
+            payload_extra={'endpoint': 'PATCH /api/foam/density-grades/{}/'.format(grade.pk)},
+        )
+        schedule_push(resource='foam_density_grade', action='updated', entity_id=grade.pk)
+        return Response(self.get_serializer(grade).data)
+
+    def destroy(self, request, *args, **kwargs):
+        grade = self.get_object()
+        if grade.production_runs.exists() or grade.gp_stock_rows.exists() or grade.gp_operations.exists():
+            return _err(
+                'DENSITY_GRADE_IN_USE',
+                'Плотность уже использована в производстве или на складе — удаление недоступно.',
+                status.HTTP_409_CONFLICT,
+            )
+        try:
+            self.perform_destroy(grade)
+        except ProtectedError:
+            return _err(
+                'DENSITY_GRADE_IN_USE',
+                'Плотность используется в других записях — удаление недоступно.',
+                status.HTTP_409_CONFLICT,
+            )
+        schedule_push(resource='foam_density_grade', action='deleted', entity_id=kwargs.get('pk'))
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class FoamProductionRunViewSet(

@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import generics, viewsets
@@ -27,6 +28,8 @@ def _apply_activity_filters(qs, query_params):
     entity_id = query_params.get('entity_id')
     action = query_params.get('action')
     request_id = query_params.get('request_id')
+    section = query_params.get('section')
+    search = query_params.get('search')
     if entity_type:
         qs = qs.filter(entity_type=entity_type)
     if entity_id is not None and str(entity_id).strip() != '':
@@ -35,6 +38,15 @@ def _apply_activity_filters(qs, query_params):
         qs = qs.filter(action=action)
     if request_id:
         qs = qs.filter(request_id=request_id)
+    if section:
+        qs = qs.filter(section=section)
+    if search and str(search).strip() != '':
+        term = str(search).strip()
+        qs = qs.filter(
+            Q(user__name__icontains=term)
+            | Q(description__icontains=term)
+            | Q(summary__icontains=term)
+        )
     return qs
 
 
@@ -45,6 +57,8 @@ _ACTIVITY_LIST_PARAMS = [
     OpenApiParameter('entity_type', str, required=False),
     OpenApiParameter('entity_id', str, required=False),
     OpenApiParameter('action', str, required=False, description='create | update | delete | restore'),
+    OpenApiParameter('section', str, required=False, description='Точное совпадение по разделу'),
+    OpenApiParameter('search', str, required=False, description='Поиск по имени пользователя, описанию, summary'),
     OpenApiParameter('request_id', str, required=False),
     OpenApiParameter('date_from', str, required=False, description='YYYY-MM-DD'),
     OpenApiParameter('date_to', str, required=False, description='YYYY-MM-DD'),
@@ -68,7 +82,7 @@ class ActivityMyView(viewsets.ViewSet):
     """
     GET /api/activity/my/ — личный журнал действий текущего пользователя.
     Параметры: page, page_size, shift_id,
-    entity_type, entity_id, action, request_id,
+    entity_type, entity_id, action, section, search, request_id,
     date_from, date_to (YYYY-MM-DD).
     shift_id — операционные действия смены (whitelist entity_type в AUDIT_SHIFT_ENTITY_TYPES):
     shift_id=смена ИЛИ legacy без shift_id в интервале opened_at … closed_at (только whitelist).
@@ -176,7 +190,7 @@ class ActivityAdminView(viewsets.ViewSet):
     GET /api/activity/ — журнал действий для администратора.
     Доступ: ключ «shifts».
     Параметры: user_id, date_from, date_to, shift_id,
-    entity_type, entity_id, action, request_id, page, page_size.
+    entity_type, entity_id, action, section, search, request_id, page, page_size.
     """
 
     permission_classes = [IsAdminOrHasAccess]

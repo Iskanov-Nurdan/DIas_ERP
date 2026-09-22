@@ -22,7 +22,8 @@ class FoamDensityGradeSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = FoamDensityGrade
-        fields = ('code', 'min_kg_m3', 'max_kg_m3')
+        fields = ('id', 'code', 'min_kg_m3', 'max_kg_m3')
+        read_only_fields = ('id',)
 
     def validate(self, attrs):
         min_v = attrs.get('min_kg_m3')
@@ -38,6 +39,8 @@ class FoamRawLotSerializer(serializers.ModelSerializer):
     bag_weight_kg = serializers.DecimalField(max_digits=12, decimal_places=1, coerce_to_string=True)
     received_kg = serializers.DecimalField(max_digits=12, decimal_places=1, read_only=True, coerce_to_string=True)
     remaining_kg = serializers.DecimalField(max_digits=12, decimal_places=1, read_only=True, coerce_to_string=True)
+    unit_price = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, coerce_to_string=True)
+    received_at = serializers.DateTimeField(required=False)
     warehouse = serializers.SerializerMethodField()
 
     class Meta:
@@ -50,10 +53,11 @@ class FoamRawLotSerializer(serializers.ModelSerializer):
             'bag_weight_kg',
             'received_kg',
             'remaining_kg',
+            'unit_price',
             'received_at',
             'warehouse',
         )
-        read_only_fields = ('id', 'lot_number', 'received_at')
+        read_only_fields = ('id', 'lot_number')
 
     def get_warehouse(self, obj):
         return RAW_WAREHOUSE_LABEL
@@ -61,6 +65,11 @@ class FoamRawLotSerializer(serializers.ModelSerializer):
     def validate_bag_weight_kg(self, value):
         if value is None or value <= 0:
             raise serializers.ValidationError('Должно быть > 0')
+        return value
+
+    def validate_unit_price(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError('Должно быть ≥ 0')
         return value
 
     def create(self, validated_data):
@@ -72,7 +81,20 @@ class FoamRawLotSerializer(serializers.ModelSerializer):
             bag_weight_kg=bag_weight_kg,
             received_kg=bag_weight_kg,
             remaining_kg=bag_weight_kg,
+            unit_price=validated_data.get('unit_price') or 0,
+            **({'received_at': validated_data['received_at']} if validated_data.get('received_at') else {}),
         )
+
+
+class FoamRawLotUpdateSerializer(serializers.ModelSerializer):
+    """Описательные + учётные поля — bag_weight_kg/received_kg/remaining_kg руками
+    не трогаются, иначе разъедутся с реальным остатком и историей выпусков производства."""
+
+    unit_price = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, coerce_to_string=True)
+
+    class Meta:
+        model = FoamRawLot
+        fields = ('material_name', 'supplier', 'unit_price', 'received_at')
 
 
 class FoamProductionRunReadSerializer(serializers.ModelSerializer):

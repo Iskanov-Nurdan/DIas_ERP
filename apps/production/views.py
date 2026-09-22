@@ -1,9 +1,11 @@
+import calendar
 import logging
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view, inline_serializer
 from rest_framework import serializers as drf_serializers
 from rest_framework import viewsets, status
@@ -11,7 +13,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, ValidationError as DRFValidationError
 from rest_framework.response import Response
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Case, Count, Prefetch, Q, When
+from django.db.models import Case, Count, Prefetch, Q, Sum, When
 
 from apps.activity.mixins import ActivityLoggingMixin
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
@@ -39,8 +41,11 @@ from .models import (
     RecipeRunBatch,
     RecipeRunBatchComponent,
     Shift,
+    ShiftClosing,
     ShiftComplaint,
     ShiftNote,
+    ShiftPhotoReport,
+    ShiftPhotoReportImage,
 )
 from .serializers import (
     LineSerializer,
@@ -55,6 +60,8 @@ from .serializers import (
     ShiftNoteSerializer,
     ShiftComplaintCreateSerializer,
     ShiftComplaintListSerializer,
+    ShiftClosingSerializer,
+    ShiftPhotoReportSerializer,
 )
 from apps.recipes.models import RecipeComponent
 
@@ -1922,3 +1929,286 @@ class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewS
                 context=self.get_serializer_context(),
             ).data
         return Response(payload, status=status.HTTP_201_CREATED)
+
+
+# ——— Закрытие смены (касса) / фотоотчёты по смене ———
+# Отдельная фича от ShiftViewSet (учёт рабочего времени): касса дня, фотоотчёты, сводка «Итоги».
+# Гейтится тем же ключом доступа 'shifts', отдельного ключа для «Итогов» нет (см. ТЗ).
+
+
+def _is_admin_user(user) -> bool:
+    return bool(getattr(user, 'is_superuser', False))
+
+
+def _parse_ymd_filters(params):
+    """year/month/day из query params → (year:int|None, month:int|None, day:int|None)."""
+    def _to_int(v):
+        if v in (None, ''):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return _to_int(params.get('year')), _to_int(params.get('month')), _to_int(params.get('day'))
+
+
+def _filter_by_ymd(qs, year, month, day):
+    if year is not None:
+        qs = qs.filter(created_at__year=year)
+    if month is not None:
+        qs = qs.filter(created_at__month=month)
+    if day is not None:
+        qs = qs.filter(created_at__day=day)
+    return qs
+
+
+class ShiftClosingViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    """
+    Закрытие смены (касса дня): наличные/карта/расход/аванс + комментарий.
+    Общая лента для всех с ключом доступа 'shifts' (не только свои записи).
+
+    GET    /api/shift-closings/?year=&month=&day=
+    POST   /api/shift-closings/
+    PATCH  /api/shift-closings/{id}/ — только автор или админ, только один раз
+    DELETE /api/shift-closings/{id}/ — только админ, только в день создания
+    GET    /api/shift-closings/summary/?year=&month=&day=&employeeId=
+    """
+
+    activity_section = 'Смены'
+    activity_label = 'закрытие смены (касса)'
+    queryset = ShiftClosing.objects.select_related('user').all()
+    serializer_class = ShiftClosingSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'shifts'
+    pagination_class = StandardResultsSetPagination
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return ShiftClosing.objects.none()
+        qs = ShiftClosing.objects.select_related('user').all()
+        if self.action in ('list', 'summary'):
+            year, month, day = _parse_ymd_filters(self.request.query_params)
+            qs = _filter_by_ymd(qs, year, month, day)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        cash = serializer.validated_data.get('cash') or Decimal('0')
+        card = serializer.validated_data.get('card') or Decimal('0')
+        # user/total не являются writable-полями сериализатора — прокидываем через validated_data,
+        # чтобы perform_create (ActivityLoggingMixin) сохранил их обычным путём и залогировал создание.
+        serializer.validated_data['user'] = request.user
+        serializer.validated_data['total'] = cash + card
+        self.perform_create(serializer)
+        read = ShiftClosingSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_201_CREATED)
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        if not (_is_admin_user(user) or instance.user_id == user.id):
+            return _err('forbidden', 'Редактировать может только автор записи или администратор', http_status=403)
+        if instance.is_edited:
+            return _err('bad_request', 'Запись уже была отредактирована и больше не может изменяться', http_status=400)
+
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        previous_snapshot = {
+            'cash': str(instance.cash),
+            'card': str(instance.card),
+            'expense': str(instance.expense),
+            'advance': str(instance.advance),
+            'total': str(instance.total),
+            'description': instance.description,
+        }
+        new_cash = serializer.validated_data.get('cash', instance.cash)
+        new_card = serializer.validated_data.get('card', instance.card)
+        serializer.validated_data['previous_snapshot'] = previous_snapshot
+        serializer.validated_data['is_edited'] = True
+        serializer.validated_data['edited_at'] = timezone.now()
+        serializer.validated_data['total'] = new_cash + new_card
+        self.perform_update(serializer)
+        read = ShiftClosingSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        if not _is_admin_user(user):
+            return _err('forbidden', 'Удалять может только администратор', http_status=403)
+        today = timezone.localtime().date()
+        if timezone.localtime(instance.created_at).date() != today:
+            return _err('bad_request', 'Удалить можно только запись, созданную сегодня', http_status=400)
+        self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request, *args, **kwargs):
+        params = request.query_params
+        year, month, day = _parse_ymd_filters(params)
+        if year is None:
+            year = timezone.localtime().year
+        employee_id = params.get('employeeId') or params.get('employee_id')
+        try:
+            employee_id = int(employee_id) if employee_id not in (None, '') else None
+        except (TypeError, ValueError):
+            employee_id = None
+
+        base_qs = _filter_by_ymd(ShiftClosing.objects.all(), year, month, day)
+
+        totals_qs = base_qs
+        if employee_id is not None:
+            totals_qs = totals_qs.filter(user_id=employee_id)
+        totals_agg = totals_qs.aggregate(
+            cash=Sum('cash'), card=Sum('card'), expense=Sum('expense'),
+            advance=Sum('advance'), total=Sum('total'), count=Count('id'),
+        )
+        zero = Decimal('0.00')
+
+        def _money(v):
+            return str((v or zero).quantize(Decimal('0.01')))
+
+        totals = {
+            'cash': _money(totals_agg['cash']),
+            'card': _money(totals_agg['card']),
+            'expense': _money(totals_agg['expense']),
+            'advance': _money(totals_agg['advance']),
+            'total': _money(totals_agg['total']),
+            'count': totals_agg['count'] or 0,
+        }
+
+        by_employee_rows = (
+            base_qs.values('user_id', 'user__name')
+            .annotate(
+                cash=Sum('cash'), card=Sum('card'), advance=Sum('advance'),
+                expense=Sum('expense'), total=Sum('total'), count=Count('id'),
+            )
+            .order_by('user__name')
+        )
+        by_employee = [
+            {
+                'employeeId': row['user_id'],
+                'employeeName': row['user__name'],
+                'cash': _money(row['cash']),
+                'card': _money(row['card']),
+                'advance': _money(row['advance']),
+                'expense': _money(row['expense']),
+                'total': _money(row['total']),
+                'count': row['count'] or 0,
+            }
+            for row in by_employee_rows
+        ]
+
+        coverage = None
+        if year is not None and month is not None and day is None:
+            days_in_month = calendar.monthrange(int(year), int(month))[1]
+            today = timezone.localtime()
+            if int(year) == today.year and int(month) == today.month:
+                checked_through = min(today.day, days_in_month)
+            else:
+                checked_through = days_in_month
+            covered_days = set(
+                base_qs.annotate().values_list('created_at__day', flat=True).distinct()
+            )
+            missing_days = []
+            for d in range(1, checked_through + 1):
+                weekday = date(int(year), int(month), d).weekday()  # Monday=0 ... Sunday=6
+                if weekday == 6:
+                    continue
+                if d not in covered_days:
+                    missing_days.append(d)
+            coverage = {
+                'daysInMonth': days_in_month,
+                'checkedThrough': checked_through,
+                'missingDays': sorted(missing_days),
+            }
+
+        return Response({'totals': totals, 'byEmployee': by_employee, 'coverage': coverage})
+
+
+class ShiftPhotoReportViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    """
+    Фотоотчёты по смене (до 10 фото на отчёт).
+    Общая лента для всех с ключом доступа 'shifts'.
+
+    GET    /api/shift-photo-reports/?year=&month=&day=
+    POST   /api/shift-photo-reports/ (multipart: photos[], description?)
+    DELETE /api/shift-photo-reports/{id}/ — только админ, без ограничения по дате
+    """
+
+    activity_section = 'Смены'
+    activity_label = 'фотоотчёт по смене'
+    queryset = ShiftPhotoReport.objects.select_related('user').prefetch_related('photos').all()
+    serializer_class = ShiftPhotoReportSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'shifts'
+    pagination_class = StandardResultsSetPagination
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    MAX_PHOTOS = 10
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return ShiftPhotoReport.objects.none()
+        qs = ShiftPhotoReport.objects.select_related('user').prefetch_related('photos').all()
+        year, month, day = _parse_ymd_filters(self.request.query_params)
+        qs = _filter_by_ymd(qs, year, month, day)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        files = request.FILES.getlist('photos')
+        if not files:
+            return _err('validation_error', 'Нужно приложить хотя бы одно фото (поле photos)', http_status=400)
+        if len(files) > self.MAX_PHOTOS:
+            return _err(
+                'validation_error',
+                f'Слишком много файлов: максимум {self.MAX_PHOTOS} фото на отчёт',
+                http_status=400,
+            )
+        description = request.data.get('description') or ''
+        report = ShiftPhotoReport.objects.create(user=request.user, description=description)
+        for f in files:
+            ShiftPhotoReportImage.objects.create(report=report, image=f)
+
+        schedule_entity_audit(
+            user=request.user,
+            request=request,
+            section=self.activity_section,
+            description=self._activity_description(report, 'create'),
+            action='create',
+            model_cls=ShiftPhotoReport,
+            after_instance=report,
+            payload_extra={'photos_count': len(files)},
+        )
+
+        read = ShiftPhotoReportSerializer(report, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if not _is_admin_user(request.user):
+            return _err('forbidden', 'Удалять может только администратор', http_status=403)
+
+        before = instance_to_snapshot(instance, ignore_fields=self._activity_ignore_set())
+        description = self._activity_description(instance, 'delete')
+
+        for photo in instance.photos.all():
+            if photo.image:
+                photo.image.delete(save=False)
+            photo.delete()
+        instance.delete()
+
+        schedule_entity_audit(
+            user=request.user,
+            request=request,
+            section=self.activity_section,
+            description=description,
+            action='delete',
+            model_cls=ShiftPhotoReport,
+            before=before,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)

@@ -624,3 +624,78 @@ class RecipeRunBatchComponent(models.Model):
 
     def __str__(self):
         return f'{self.batch_id}: {self.quantity} {self.unit}'
+
+
+class ShiftClosing(models.Model):
+    """Закрытие смены (касса/итоги дня): наличные, карта, расход, аванс. Отдельная фича от Shift (учёт времени)."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='shift_closings',
+        verbose_name='Сотрудник',
+    )
+    cash = models.DecimalField('Наличные', max_digits=12, decimal_places=2, default=0)
+    card = models.DecimalField('Карта', max_digits=12, decimal_places=2, default=0)
+    expense = models.DecimalField('Расход', max_digits=12, decimal_places=2, default=0)
+    advance = models.DecimalField('Аванс', max_digits=12, decimal_places=2, default=0)
+    total = models.DecimalField('Итого', max_digits=12, decimal_places=2, default=0)
+    description = models.TextField('Комментарий', blank=True, default='')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    is_edited = models.BooleanField('Отредактировано', default=False)
+    edited_at = models.DateTimeField('Отредактировано в', null=True, blank=True)
+    previous_snapshot = models.JSONField('Снимок до правки', null=True, blank=True)
+
+    class Meta:
+        db_table = 'shift_closings'
+        verbose_name = 'Закрытие смены (касса)'
+        verbose_name_plural = 'Закрытия смен (касса)'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        user_name = self.user.name if self.user_id else '—'
+        return f'{user_name}: {self.total} ({self.created_at:%d.%m.%Y})'
+
+
+class ShiftPhotoReport(models.Model):
+    """Фотоотчёт по смене."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='shift_photo_reports',
+        verbose_name='Сотрудник',
+    )
+    description = models.TextField('Комментарий', blank=True, default='')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'shift_photo_reports'
+        verbose_name = 'Фотоотчёт по смене'
+        verbose_name_plural = 'Фотоотчёты по сменам'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        user_name = self.user.name if self.user_id else '—'
+        return f'{user_name} ({self.created_at:%d.%m.%Y})'
+
+
+class ShiftPhotoReportImage(models.Model):
+    """Один снимок в составе фотоотчёта по смене."""
+
+    report = models.ForeignKey(
+        ShiftPhotoReport,
+        on_delete=models.CASCADE,
+        related_name='photos',
+        verbose_name='Отчёт',
+    )
+    image = models.ImageField('Фото', upload_to='shift_photo_reports/%Y/%m/')
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+
+    class Meta:
+        db_table = 'shift_photo_report_images'
+        verbose_name = 'Фото отчёта по смене'
+        verbose_name_plural = 'Фото отчётов по сменам'
+
+    def __str__(self):
+        return f'photo#{self.pk} for report#{self.report_id}'

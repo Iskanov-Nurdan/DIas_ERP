@@ -1,6 +1,9 @@
+from datetime import datetime, time
 from decimal import Decimal
 
 from django.db.models import Count
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import status, viewsets
@@ -29,40 +32,81 @@ REASON_TO_MOVEMENT = {
 }
 
 
-def _build_movement_items():
+def _parse_boundary(raw, *, end_of_day=False):
+    """query-параметр даты/даты-времени фильтра истории движения → aware datetime.
+
+    Фронт шлёт либо чистую дату (YYYY-MM-DD, из <input type="date">), либо
+    полноценный ISO datetime — поддерживаем оба, чтобы не привязываться к
+    конкретному виджету на фронте.
+    """
+    if not raw:
+        return None
+    dt = parse_datetime(raw)
+    if dt is None:
+        d = parse_date(raw)
+        if d is None:
+            return None
+        dt = datetime.combine(d, time.max if end_of_day else time.min)
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def _build_movement_items(*, material_id=None, date_from=None, date_to=None, direction=None):
+    """
+    material_id/date_from/date_to фильтруют исходные queryset'ы ДО слияния —
+    это единственное место, где вообще можно фильтровать эффективно, потому
+    что после сборки в один список это уже Python-объекты, а не SQL. direction
+    ('in'/'out') просто решает, какую из двух выборок вообще стоит обходить.
+    """
+    batches_qs = MaterialBatch.objects.select_related('material')
+    deductions_qs = MaterialStockDeduction.objects.select_related('batch__material')
+
+    if material_id:
+        batches_qs = batches_qs.filter(material_id=material_id)
+        deductions_qs = deductions_qs.filter(batch__material_id=material_id)
+    if date_from:
+        batches_qs = batches_qs.filter(received_at__gte=date_from)
+        deductions_qs = deductions_qs.filter(created_at__gte=date_from)
+    if date_to:
+        batches_qs = batches_qs.filter(received_at__lte=date_to)
+        deductions_qs = deductions_qs.filter(created_at__lte=date_to)
+
     rows = []
-    for b in MaterialBatch.objects.select_related('material').iterator():
-        mat = b.material
-        u = normalize_material_unit(mat.unit)
-        qi = kg_to_display_unit(Decimal(str(b.quantity_initial)), mat.unit)
-        rows.append({
-            'id': f'incoming-{b.pk}',
-            'occurred_at': b.received_at,
-            'material_id': mat.pk,
-            'material_name': mat.name,
-            'movement_type': 'incoming',
-            'quantity': float(qi),
-            'unit': u,
-            'comment': b.comment or '',
-            'batch_id': b.pk,
-        })
-    for d in MaterialStockDeduction.objects.select_related('batch__material').iterator():
-        b = d.batch
-        mat = b.material
-        u = normalize_material_unit(mat.unit)
-        q = -kg_to_display_unit(Decimal(str(d.quantity)), mat.unit)
-        mt = REASON_TO_MOVEMENT.get((d.reason or '').strip(), 'writeoff_other')
-        rows.append({
-            'id': f'writeoff-{d.pk}',
-            'occurred_at': d.created_at,
-            'material_id': mat.pk,
-            'material_name': mat.name,
-            'movement_type': mt,
-            'quantity': float(q),
-            'unit': u,
-            'comment': '',
-            'batch_id': b.pk,
-        })
+    if direction != 'out':
+        for b in batches_qs.iterator():
+            mat = b.material
+            u = normalize_material_unit(mat.unit)
+            qi = kg_to_display_unit(Decimal(str(b.quantity_initial)), mat.unit)
+            rows.append({
+                'id': f'incoming-{b.pk}',
+                'occurred_at': b.received_at,
+                'material_id': mat.pk,
+                'material_name': mat.name,
+                'movement_type': 'incoming',
+                'quantity': float(qi),
+                'unit': u,
+                'comment': b.comment or '',
+                'batch_id': b.pk,
+            })
+    if direction != 'in':
+        for d in deductions_qs.iterator():
+            b = d.batch
+            mat = b.material
+            u = normalize_material_unit(mat.unit)
+            q = -kg_to_display_unit(Decimal(str(d.quantity)), mat.unit)
+            mt = REASON_TO_MOVEMENT.get((d.reason or '').strip(), 'writeoff_other')
+            rows.append({
+                'id': f'writeoff-{d.pk}',
+                'occurred_at': d.created_at,
+                'material_id': mat.pk,
+                'material_name': mat.name,
+                'movement_type': mt,
+                'quantity': float(q),
+                'unit': u,
+                'comment': '',
+                'batch_id': b.pk,
+            })
     rows.sort(key=lambda x: x['occurred_at'], reverse=True)
     return rows
 
@@ -133,7 +177,14 @@ class MaterialsBalancesView(viewsets.GenericViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=['materials'], summary='Журнал движений сырья'),
+    list=extend_schema(
+        tags=['materials'],
+        summary='Журнал движений сырья',
+        description=(
+            'Query: material_id (id сырья), occurred_at_after / occurred_at_before '
+            '(YYYY-MM-DD или ISO datetime), direction (in|out).'
+        ),
+    ),
 )
 class MaterialsMovementsView(viewsets.GenericViewSet):
     permission_classes = [IsAdminOrHasAccess]
@@ -142,7 +193,18 @@ class MaterialsMovementsView(viewsets.GenericViewSet):
     queryset = MaterialBatch.objects.none()
 
     def list(self, request):
-        items = _build_movement_items()
+        material_id = request.query_params.get('material_id') or None
+        date_from = _parse_boundary(request.query_params.get('occurred_at_after'))
+        date_to = _parse_boundary(request.query_params.get('occurred_at_before'), end_of_day=True)
+        direction = request.query_params.get('direction')
+        direction = direction if direction in ('in', 'out') else None
+
+        items = _build_movement_items(
+            material_id=material_id,
+            date_from=date_from,
+            date_to=date_to,
+            direction=direction,
+        )
         page = self.paginate_queryset(items)
         if page is not None:
             return self.get_paginated_response(page)
