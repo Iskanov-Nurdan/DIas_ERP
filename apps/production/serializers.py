@@ -29,8 +29,11 @@ from .models import (
     RecipeRunBatch,
     RecipeRunBatchComponent,
     Shift,
+    ShiftClosing,
     ShiftComplaint,
     ShiftNote,
+    ShiftPhotoReport,
+    ShiftPhotoReportImage,
 )
 
 
@@ -1394,3 +1397,64 @@ class RecipeRunWriteSerializer(serializers.Serializer):
                 quantity=c['quantity'],
                 unit=(c.get('unit') or 'кг')[:50],
             )
+
+
+# ——— Закрытие смены (касса) / фотоотчёты по смене ———
+
+
+class ShiftClosingSerializer(serializers.ModelSerializer):
+    employeeName = serializers.CharField(source='user.name', read_only=True)
+    createdAt = serializers.DateTimeField(source='created_at', read_only=True)
+    isEdited = serializers.BooleanField(source='is_edited', read_only=True)
+    editedAt = serializers.DateTimeField(source='edited_at', read_only=True)
+    cash = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True)
+    card = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True)
+    expense = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True, required=False)
+    advance = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True, required=False)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True, read_only=True)
+    previous = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftClosing
+        fields = [
+            'id', 'employeeName', 'createdAt', 'cash', 'card', 'expense', 'advance',
+            'total', 'description', 'isEdited', 'editedAt', 'previous',
+        ]
+        read_only_fields = ['id', 'employeeName', 'createdAt', 'total', 'isEdited', 'editedAt', 'previous']
+
+    def get_previous(self, obj):
+        return obj.previous_snapshot or None
+
+
+class ShiftPhotoReportImageSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftPhotoReportImage
+        fields = ['id', 'url', 'thumbnail_url']
+
+    def _abs_url(self, obj):
+        request = self.context.get('request')
+        if not obj.image:
+            return None
+        if request is not None:
+            return request.build_absolute_uri(obj.image.url)
+        return obj.image.url
+
+    def get_url(self, obj):
+        return self._abs_url(obj)
+
+    def get_thumbnail_url(self, obj):
+        return self._abs_url(obj)
+
+
+class ShiftPhotoReportSerializer(serializers.ModelSerializer):
+    employeeName = serializers.CharField(source='user.name', read_only=True)
+    createdAt = serializers.DateTimeField(source='created_at', read_only=True)
+    photos = ShiftPhotoReportImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ShiftPhotoReport
+        fields = ['id', 'employeeName', 'createdAt', 'description', 'photos']
+        read_only_fields = fields

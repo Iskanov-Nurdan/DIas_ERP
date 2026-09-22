@@ -36,6 +36,40 @@ class WarehouseBatchViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = WarehouseResultsSetPagination
     ordering_fields = ['id', 'date']
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        if not isinstance(response.data, dict):
+            return response
+        inv = (request.query_params.get('inventory_form') or '').strip().lower()
+        if inv != WarehouseBatch.INVENTORY_PACKED:
+            return response
+        items = response.data.get('items') or []
+        from decimal import Decimal as D
+
+        packages_count = 0
+        pieces_total = D('0')
+        for row in items:
+            pc = row.get('packages_count') or row.get('sealed_packages_count')
+            if pc is not None:
+                try:
+                    packages_count += int(D(str(pc)).to_integral_value())
+                except (TypeError, ValueError, InvalidOperation):
+                    packages_count += 1
+            else:
+                packages_count += 1
+            try:
+                pieces_total += D(str(row.get('quantity') or 0))
+            except (TypeError, ValueError, InvalidOperation):
+                pass
+        meta = dict(response.data.get('meta') or {})
+        meta['summary'] = {
+            'rows_count': len(items),
+            'packages_count': packages_count,
+            'pieces_total': str(pieces_total.quantize(D('0.0001'))),
+        }
+        response.data['meta'] = meta
+        return response
+
     def get_queryset(self):
         qs = WarehouseBatch.objects.select_related(
             'profile',

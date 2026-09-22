@@ -14,6 +14,7 @@ from config.permissions import IsAdminOrHasAccess
 
 from .models import UserActivity
 from .serializers import UserActivitySerializer
+from .shift_audit import filter_activities_for_shift
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ def _apply_activity_filters(qs, query_params):
     entity_id = query_params.get('entity_id')
     action = query_params.get('action')
     request_id = query_params.get('request_id')
+    section = query_params.get('section')
+    search = query_params.get('search')
     if entity_type:
         qs = qs.filter(entity_type=entity_type)
     if entity_id is not None and str(entity_id).strip() != '':
@@ -35,6 +38,15 @@ def _apply_activity_filters(qs, query_params):
         qs = qs.filter(action=action)
     if request_id:
         qs = qs.filter(request_id=request_id)
+    if section:
+        qs = qs.filter(section=section)
+    if search and str(search).strip() != '':
+        term = str(search).strip()
+        qs = qs.filter(
+            Q(user__name__icontains=term)
+            | Q(description__icontains=term)
+            | Q(summary__icontains=term)
+        )
     return qs
 
 
@@ -45,6 +57,8 @@ _ACTIVITY_LIST_PARAMS = [
     OpenApiParameter('entity_type', str, required=False),
     OpenApiParameter('entity_id', str, required=False),
     OpenApiParameter('action', str, required=False, description='create | update | delete | restore'),
+    OpenApiParameter('section', str, required=False, description='Точное совпадение по разделу'),
+    OpenApiParameter('search', str, required=False, description='Поиск по имени пользователя, описанию, summary'),
     OpenApiParameter('request_id', str, required=False),
     OpenApiParameter('date_from', str, required=False, description='YYYY-MM-DD'),
     OpenApiParameter('date_to', str, required=False, description='YYYY-MM-DD'),
@@ -68,12 +82,12 @@ class ActivityMyView(viewsets.ViewSet):
     """
     GET /api/activity/my/ — личный журнал действий текущего пользователя.
     Параметры: page, page_size, shift_id,
-    entity_type, entity_id, action, request_id,
+    entity_type, entity_id, action, section, search, request_id,
     date_from, date_to (YYYY-MM-DD).
-    shift_id — действия этой смены: по полю shift_id ИЛИ по времени opened_at … closed_at
-    (чтобы попадали записи без shift_id, пока смена была открыта).
-    При переданном shift_id фильтры date_from / date_to не применяются — окно смены уже задаёт интервал;
-    иначе комбинация shift_id + даты часто давала пустой список (часовой пояс / другой календарный день).
+    shift_id — операционные действия смены (whitelist entity_type в AUDIT_SHIFT_ENTITY_TYPES):
+    shift_id=смена ИЛИ legacy без shift_id в интервале opened_at … closed_at (только whitelist).
+    Вне whitelist (users, recipes, analytics, …) в отчёт смены не попадают.
+    При переданном shift_id фильтры date_from / date_to не применяются.
     """
 
     permission_classes = [IsAuthenticated]
@@ -85,7 +99,6 @@ class ActivityMyView(viewsets.ViewSet):
         shift_applied = False
         if shift_id:
             from apps.production.models import Shift
-            from django.utils import timezone
 
             shift = Shift.objects.filter(pk=shift_id, user=request.user).first()
             if not shift:
@@ -94,12 +107,7 @@ class ActivityMyView(viewsets.ViewSet):
                     {'code': 'not_found', 'error': msg, 'detail': msg},
                     status=404,
                 )
-            end = shift.closed_at or timezone.now()
-            # Явная привязка к смене ИЛИ попадание во временной интервал смены (старые строки без shift_id)
-            qs = qs.filter(
-                Q(shift_id=shift.pk)
-                | Q(created_at__gte=shift.opened_at, created_at__lte=end)
-            )
+            qs = filter_activities_for_shift(qs, shift)
             shift_applied = True
 
         qs = _apply_activity_filters(qs, request.query_params)
@@ -182,7 +190,7 @@ class ActivityAdminView(viewsets.ViewSet):
     GET /api/activity/ — журнал действий для администратора.
     Доступ: ключ «shifts».
     Параметры: user_id, date_from, date_to, shift_id,
-    entity_type, entity_id, action, request_id, page, page_size.
+    entity_type, entity_id, action, section, search, request_id, page, page_size.
     """
 
     permission_classes = [IsAdminOrHasAccess]
@@ -202,7 +210,6 @@ class ActivityAdminView(viewsets.ViewSet):
         shift_applied = False
         if shift_id:
             from apps.production.models import Shift
-            from django.utils import timezone
 
             shift = Shift.objects.filter(pk=shift_id).first()
             if not shift:
@@ -211,11 +218,7 @@ class ActivityAdminView(viewsets.ViewSet):
                     {'code': 'not_found', 'error': msg, 'detail': msg},
                     status=404,
                 )
-            end = shift.closed_at or timezone.now()
-            qs = qs.filter(
-                Q(shift_id=shift.pk)
-                | Q(created_at__gte=shift.opened_at, created_at__lte=end)
-            )
+            qs = filter_activities_for_shift(qs, shift)
             shift_applied = True
 
         qs = _apply_activity_filters(qs, request.query_params)

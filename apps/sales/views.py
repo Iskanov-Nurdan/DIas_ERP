@@ -15,10 +15,12 @@ from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import extend_schema, extend_schema_view, inline_serializer, OpenApiParameter
+from rest_framework import serializers as drf_serializers
 
 from apps.activity.mixins import ActivityLoggingMixin
 from config.api_numbers import api_decimal_str
+from config.pagination import WarehouseResultsSetPagination
 from config.permissions import IsAdminOrHasAccess
 from .filters import ClientFilter, DefectFilter, OrderFilter, PaymentFilter, ReturnFilter, SaleFilter
 from .models import (
@@ -121,6 +123,55 @@ def _is_packages_mode(sale: Sale, line: SaleLine) -> bool:
     if line_mode in package_aliases or sale_mode in package_aliases:
         return True
     return sale.sale_mode == Sale.MODE_PACKAGES
+
+
+def _warehouse_batch_select_sources_availability(b, raw_available: Decimal) -> dict:
+    """
+    Разбивка остатка для GET sales/select-sources/.
+
+    - total_pieces: всегда get_available_quantity (штуки).
+    - unpacked_pieces: неупакованный хвост для вкладки «штуки».
+    - available_packages_str: только если это не приведёт к двойному вычитанию на фронте:
+      для packed — raw / pieces_per_package;
+      для unpacked/open_package — только при известном packages_count > 0 (запечатанные коробки),
+      иначе None (даже при pieces_per_package > 0).
+    """
+    from apps.warehouse.models import WarehouseBatch
+
+    raw = Decimal(str(raw_available))
+    ppp = (
+        Decimal(str(b.pieces_per_package))
+        if b.pieces_per_package is not None
+        else Decimal('0')
+    )
+    is_packed = b.inventory_form == WarehouseBatch.INVENTORY_PACKED
+
+    if is_packed:
+        unpacked = Decimal('0')
+        if ppp > 0:
+            pkg = (raw / ppp).quantize(Decimal('0.0001'))
+            avail_pkg = api_decimal_str(pkg) if pkg > 0 else None
+        else:
+            avail_pkg = None
+        return {'total_pieces': raw, 'unpacked_pieces': unpacked, 'available_packages_str': avail_pkg}
+
+    pc_raw = b.packages_count
+    if ppp > 0 and pc_raw is not None and Decimal(str(pc_raw)) > 0:
+        pc = Decimal(str(pc_raw))
+        sealed_pieces = min(raw, (pc * ppp)).quantize(Decimal('0.0001'))
+        unpacked = (raw - sealed_pieces).quantize(Decimal('0.0001'))
+        if unpacked < 0:
+            unpacked = Decimal('0')
+        if sealed_pieces > 0 and ppp > 0:
+            sealed_pkg = (sealed_pieces / ppp).quantize(Decimal('0.0001'))
+            avail_pkg = api_decimal_str(sealed_pkg) if sealed_pkg > 0 else None
+        else:
+            avail_pkg = None
+    else:
+        unpacked = raw
+        avail_pkg = None
+
+    return {'total_pieces': raw, 'unpacked_pieces': unpacked, 'available_packages_str': avail_pkg}
 
 
 def _sale_line_packaging_payload(sale: Sale, line: SaleLine, lines_count: int) -> dict:
@@ -507,7 +558,37 @@ def _order_display_payload(order: Order) -> dict:
         'payment_method': payment_method,
         'prepayment_amount': api_decimal_str(paid_amount),
         'advance_amount': api_decimal_str(paid_amount),
+        'amount_remaining': api_decimal_str(debt_amount),
     }
+
+
+def _order_sources_payload(order: Order) -> dict:
+    """Заявка для sales/select-sources и available_orders: полный order_lines[], без дублей по профилю."""
+    from apps.sales.serializers import OrderSerializer
+
+    base = _order_display_payload(order)
+    order_lines, _, _ = OrderSerializer.build_order_lines_read_payload(order)
+    lines_count = len(order_lines)
+    date_s = order.date.isoformat() if order.date else None
+    if lines_count > 1:
+        display = f'{date_s or "—"} — {lines_count}'
+    elif lines_count == 1:
+        display = f'{date_s or "—"} — {order_lines[0].get("profile_name") or "—"}'
+    else:
+        display = base.get('display') or (date_s or '—')
+    base.update(
+        {
+            'client_id': order.client_id,
+            'date': date_s,
+            'order_lines': order_lines,
+            'lines_count': lines_count,
+            'display': display,
+            'order_display': display,
+            'label': f'{order.order_number} — {display}',
+            **OrderSerializer.build_order_payment_read_fields(order),
+        },
+    )
+    return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -517,6 +598,7 @@ def _order_display_payload(order: Order) -> dict:
 class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
+    pagination_class = WarehouseResultsSetPagination
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'clients'
     activity_section = 'Клиенты'
@@ -761,6 +843,48 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 # ORDER (Заявка)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_OrderCartLineWrite = inline_serializer(
+    name='OrderCartLineWrite',
+    fields={
+        'profile': drf_serializers.IntegerField(help_text='ID пластикового профиля'),
+        'quantity': drf_serializers.IntegerField(help_text='Количество (шт), > 0'),
+        'length': drf_serializers.CharField(required=False, allow_null=True, allow_blank=True),
+        'recipe': drf_serializers.IntegerField(required=False, allow_null=True),
+    },
+)
+_OrderCreateRequestBody = inline_serializer(
+    name='OrderCreateRequestBody',
+    fields={
+        'client': drf_serializers.IntegerField(),
+        'date': drf_serializers.DateField(required=False),
+        'order_lines': drf_serializers.ListField(child=_OrderCartLineWrite, min_length=1, required=False),
+        'profile': drf_serializers.IntegerField(required=False),
+        'quantity': drf_serializers.IntegerField(required=False),
+        'length': drf_serializers.CharField(required=False, allow_null=True, allow_blank=True),
+        'recipe': drf_serializers.IntegerField(required=False, allow_null=True),
+        'total_amount': drf_serializers.CharField(required=False),
+        'paid_amount': drf_serializers.CharField(required=False),
+        'amount_remaining': drf_serializers.CharField(required=False),
+        'payment_type': drf_serializers.ChoiceField(choices=['full', 'partial', 'debt']),
+        'payment_method': drf_serializers.CharField(required=False, allow_blank=True, allow_null=True),
+        'source_type': drf_serializers.CharField(required=False),
+        'comment': drf_serializers.CharField(required=False, allow_blank=True),
+    },
+)
+
+
+@extend_schema_view(
+    create=extend_schema(
+        summary='Создать заявку',
+        description=(
+            'Минимум по строкам: profile + quantity. Поля recipe и length не обязательны; '
+            'либо массив order_lines, либо устаревший вариант с profile и quantity в корне. '
+            'При нескольких активных рецептах у профиля без recipe в строке — 400 AMBIGUOUS_RECIPE_FOR_PROFILE.'
+        ),
+        request=_OrderCreateRequestBody,
+        responses={201: OrderSerializer},
+    ),
+)
 class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Order.objects.select_related(
         'client', 'created_by', 'responsible_user', 'resolved_recipe', 'production_profile',
@@ -773,23 +897,18 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     ordering_fields = ['id', 'date', 'status']
     filterset_class = OrderFilter
 
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {'detail': 'Устарело: модуль заявок снят с фронта.'},
+            status=status.HTTP_410_GONE,
+        )
+
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
         serializer.save(created_by=user)
-        self._broadcast(serializer.instance, created=True)
 
     def perform_update(self, serializer):
         super().perform_update(serializer)
-        self._broadcast(serializer.instance, created=False)
-
-    def _broadcast(self, instance, created):
-        from apps.realtime.broadcast import schedule_push
-        schedule_push(
-            resource='order',
-            action='created' if created else 'updated',
-            entity_id=instance.pk,
-            extra={'client_id': instance.client_id, 'status': instance.status},
-        )
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1008,7 +1127,6 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
         order.status = new_status
         order.save(update_fields=['status', 'updated_at'])
-        self._broadcast(order, created=False)
         return Response(OrderSerializer(order).data)
 
     @action(detail=True, methods=['get'], url_path='waybill')
@@ -1146,7 +1264,6 @@ class OrderViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         released = release_all_for_order(order)
         order.status = Order.STATUS_CANCELED
         order.save(update_fields=['status', 'updated_at'])
-        self._broadcast(order, created=False)
         return Response({
             'status': order.status,
             'reservations_released': released,
@@ -1403,12 +1520,30 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         ],
         description=(
             'Справочники для формы продаж. В каждом order в полях orders/available_orders '
-            'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.'
+            'возвращаются paid_amount/debt_amount/total_amount/payment_type/payment_method.\n'
+            'Партии warehouse_batches / available_warehouse_batches:\n'
+            '- available_pieces_total — суммарные доступные штуки по партии (get_available_quantity).\n'
+            '- available_pieces, available_unpacked_pieces, unpacked_pieces — только неупакованный хвост; '
+            'для packed всегда 0 (штуки только в упаковках / GP).\n'
+            '- available_packages — только когда известны запечатанные упаковки: для packed = total/ipp; '
+            'для unpacked/open_package — только если задано packages_count>0 (иначе null, '
+            'чтобы фронт не вычитал «виртуальные коробки» из total при отсутствии учёта запечатанного).\n'
+            'При unit_type=packages партии с индивидуальным учётом (GpPackUnit) не дублируются в '
+            'available_warehouse_batches — только в available_gp_packages[]. '
+            'Продажа таких упаковок — через sale_lines[].gp_package_id (quantity=1).\n'
+            'При unit_type=pieces партии packed не включаются; строки без неупакованного хвоста '
+            '(unpacked_pieces<=0) тоже исключаются. '
+            'supports_packages=true при inventory_form=packed и pieces_per_package>0. '
+            'Строки GP после POST /warehouse/gp-packages/ попадают сюда как отдельные packed-партии (1 упаковка = 1 warehouse_batch).'
         ),
     )
     def select_sources(self, request):
-        from apps.warehouse.models import WarehouseBatch
-        from .reservations import get_available_quantity
+        from .sale_pieces_policy import PACKAGES_GONE_DETAIL, reject_packages_unit_type
+        from .sale_stock_sources import build_profile_stock_rows, build_warehouse_batch_sale_sources
+
+        unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
+        if reject_packages_unit_type(unit_type):
+            return Response({'detail': PACKAGES_GONE_DETAIL}, status=status.HTTP_410_GONE)
 
         clients = list(
             Client.objects.filter(is_active=True)
@@ -1419,143 +1554,78 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         client_id = request.query_params.get('client_id')
         if not client_id:
             client_id = request.query_params.get('client')
-        unit_type = (request.query_params.get('unit_type') or request.query_params.get('sale_mode') or '').strip().lower()
         if client_id:
             orders_qs = orders_qs.filter(client_id=client_id)
-        orders = list(orders_qs.select_related('client', 'production_profile', 'resolved_recipe')[:200])
+        orders = list(
+            orders_qs.select_related('client', 'production_profile', 'resolved_recipe')
+            .prefetch_related('lines', 'lines__profile')[:200]
+        )
         order_id = request.query_params.get('order_id') or request.query_params.get('order')
         order_lines = []
         if order_id:
-            lines_qs = OrderLine.objects.filter(order_id=order_id).order_by('id')[:300]
-            order_lines = [
-                {
-                    'id': line.id,
-                    'label': (
-                        f"{line.product} — заказано {api_decimal_str(line.ordered_quantity)} — "
-                        f"продано {api_decimal_str(line.shipped_quantity)} — "
-                        f"осталось {api_decimal_str(line.remaining_quantity)}"
-                    ),
-                    'product': line.product,
-                    'ordered_quantity': api_decimal_str(line.ordered_quantity),
-                    'shipped_quantity': api_decimal_str(line.shipped_quantity),
-                    'remaining_quantity': api_decimal_str(line.remaining_quantity),
-                    'unit_price': api_decimal_str(line.unit_price or Decimal('0')),
-                }
-                for line in lines_qs
-            ]
-        wb_qs = (
-            WarehouseBatch.objects.filter(
-                status=WarehouseBatch.STATUS_AVAILABLE,
-                quality=WarehouseBatch.QUALITY_GOOD,
-                stock_bucket=WarehouseBatch.STOCK_BUCKET_STANDARD,
-            )
-            .order_by('-date', '-id')
-            [:300]
-        )
-        warehouse_batches = []
-        available_batches = []
-        quality_labels = {
-            WarehouseBatch.QUALITY_GOOD: 'Годный',
-            WarehouseBatch.QUALITY_DEFECT: 'Брак',
-        }
-        inventory_labels = {
-            WarehouseBatch.INVENTORY_PACKED: 'Упаковано',
-            WarehouseBatch.INVENTORY_OPEN_PACKAGE: 'Открытая упаковка',
-            WarehouseBatch.INVENTORY_UNPACKED: 'Неупаковано',
-        }
-        for b in wb_qs:
-            available_qty = Decimal(str(get_available_quantity(b.pk)))
-            if available_qty <= 0:
-                continue
-            ppp = Decimal(str(b.pieces_per_package or 0))
-            avail_packages = None
-            if ppp > 0:
-                avail_packages = api_decimal_str((available_qty / ppp).quantize(Decimal('0.0001')))
-            if unit_type == Sale.MODE_PACKAGES:
-                if b.inventory_form != WarehouseBatch.INVENTORY_PACKED:
-                    continue
-                if ppp <= 0:
-                    continue
-                if (available_qty / ppp) < Decimal('1'):
-                    continue
-            elif unit_type == Sale.MODE_PIECES:
-                # pieces: доступны все строки, где можно списать штуки (включая packed через вскрытие)
-                pass
-            total_meters = None
-            if b.length_per_piece is not None:
-                total_meters = api_decimal_str(
-                    (available_qty * Decimal(str(b.length_per_piece))).quantize(Decimal('0.0001')),
+            from apps.sales.serializers import OrderSerializer
+
+            try:
+                order_pk = int(order_id)
+            except (TypeError, ValueError):
+                order_pk = None
+            target = next((o for o in orders if o.pk == order_pk), None) if order_pk else None
+            if target is None:
+                target = (
+                    Order.objects.filter(pk=order_id)
+                    .prefetch_related('lines', 'lines__profile')
+                    .first()
                 )
-            display = (
-                f"{(b.profile.name if b.profile_id else b.product)} — "
-                f"{api_decimal_str(Decimal(str(b.length_per_piece or 0)))} м — "
-                f"остаток: {api_decimal_str(available_qty)} шт"
-            )
-            if avail_packages is not None:
-                display += f" / {avail_packages} уп."
-            warehouse_batches.append(
-                {
-                    'id': b.pk,
-                    'label': (
-                        f"#{b.pk} — {b.product} — свободно {api_decimal_str(available_qty)} шт — "
-                        f"{quality_labels.get(b.quality, b.quality)} — "
-                        f"{inventory_labels.get(b.inventory_form, b.inventory_form)}"
-                    ),
-                    'product': b.product,
-                    'available_quantity': api_decimal_str(available_qty),
-                    'available_pieces': api_decimal_str(available_qty),
-                    'available_packages': avail_packages,
-                    'supports_pieces': True,
-                    'supports_packages': bool(
-                        b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
-                    ),
-                    'quality': b.quality,
-                    'status': b.status,
-                    'inventory_form': b.inventory_form,
-                },
-            )
-            available_batches.append(
-                {
-                    'id': b.pk,
-                    'display': display,
-                    'warehouse_batch_display': display,
-                    'profile_id': b.profile_id,
-                    'profile_name': b.profile.name if b.profile_id else None,
-                    'pieces_per_package': (
-                        api_decimal_str(Decimal(str(b.pieces_per_package)))
-                        if b.pieces_per_package is not None else None
-                    ),
-                    'length_per_piece': (
-                        api_decimal_str(Decimal(str(b.length_per_piece)))
-                        if b.length_per_piece is not None else None
-                    ),
-                    'available_pieces': api_decimal_str(available_qty),
-                    'available_packages': avail_packages,
-                    'supports_pieces': True,
-                    'supports_packages': bool(
-                        b.inventory_form == WarehouseBatch.INVENTORY_PACKED and ppp > 0
-                    ),
-                    'total_meters': total_meters,
-                    'quality': b.quality,
-                    'status': b.status,
-                    'unit_labels': {'pieces': 'шт', 'packages': 'уп', 'meters': 'м'},
-                },
-            )
-        available_orders = [_order_display_payload(o) for o in orders]
+            if target is not None:
+                built, _, _ = OrderSerializer.build_order_lines_read_payload(target)
+                for row in built:
+                    ol_id = row['id']
+                    order_lines.append(
+                        {
+                            **row,
+                            'label': (
+                                f"{row.get('profile_name') or row.get('product', '')} — "
+                                f"заказано {row.get('quantity')} — "
+                                f"осталось {row.get('remaining_quantity')}"
+                            ),
+                            'ordered_quantity': row.get('quantity'),
+                            'product': row.get('profile_name') or '',
+                        },
+                    )
+        available_batches = build_warehouse_batch_sale_sources(limit=300)
+        warehouse_batches = [
+            {
+                'id': row['id'],
+                'label': row['display'],
+                'product': row['product_name'],
+                'available_quantity': row['available_quantity'],
+                'available_pieces': str(row['available_pieces']),
+                'supports_pieces': True,
+                'supports_packages': False,
+                'profile_id': row['profile_id'],
+                'unit_sale_price': row.get('unit_sale_price'),
+                'cost_price': row.get('cost_price'),
+                'markup_amount': row.get('markup_amount'),
+            }
+            for row in available_batches
+        ]
+        profile_stock = build_profile_stock_rows()
+        available_orders = [_order_sources_payload(o) for o in orders]
         orders_payload = []
         for o, op in zip(orders, available_orders):
             orders_payload.append(
                 {
                     'id': o.id,
                     'client_id': o.client_id,
-                    'label': (
-                        f"{o.order_number} — {(o.client.name if o.client_id else '—')} — "
-                        f"осталось {api_decimal_str(o.remaining_amount)}"
-                    ),
+                    'date': op.get('date'),
+                    'lines_count': op.get('lines_count'),
+                    'order_lines': op.get('order_lines') or [],
+                    'label': op.get('label'),
                     'display': op.get('display'),
                     'order_display': op.get('order_display'),
                     'paid_amount': op['paid_amount'],
                     'prepaid_amount': op.get('prepayment_amount'),
+                    'amount_remaining': op.get('amount_remaining'),
                     'debt_amount': op['debt_amount'],
                     'total_amount': op['total_amount'],
                     'payment_type': op['payment_type'],
@@ -1571,6 +1641,8 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             'warehouse_batches': warehouse_batches,
             'available_orders': available_orders,
             'available_warehouse_batches': available_batches,
+            'available_gp_packages': [],
+            'profile_stock': profile_stock,
         })
 
     @action(detail=False, methods=['post'], url_path='preview')
@@ -1579,33 +1651,41 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         Предпросмотр продажи без списаний и без сохранения.
         """
         from apps.warehouse.models import WarehouseBatch
+        from .profile_sale_price import require_profile_for_batch, resolve_unit_sale_price
         from .reservations import get_available_quantity
+        from .sale_pieces_policy import PACKAGES_GONE_DETAIL, reject_packages_unit_type, reject_sale_line_packages
 
         data = request.data or {}
         client_id = data.get('client')
         if client_id in (None, ''):
-            return _err('MISSING_CLIENT', 'Поле client обязательно.', http_status=400)
+            client_id = data.get('client_id')
+        if client_id in (None, ''):
+            return _err('MISSING_CLIENT', 'Поле client (или client_id) обязательно.', http_status=400)
         sale_lines = data.get('sale_lines')
         if not isinstance(sale_lines, list) or len(sale_lines) < 1:
             return _err('MISSING_SALE_LINES', 'sale_lines обязателен и должен содержать минимум одну строку.', http_status=400)
 
-        unit_type = (data.get('unit_type') or Sale.MODE_PIECES).strip().lower()
-        if unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
-            return _err('INVALID_UNIT_TYPE', 'unit_type: pieces или packages', http_status=400)
+        pkg_err = reject_packages_unit_type(data.get('unit_type'))
+        if pkg_err:
+            return Response({'detail': pkg_err}, status=status.HTTP_410_GONE)
+
+        order_id = data.get('order') or data.get('linked_order')
+        linked_order = None
+        if order_id not in (None, ''):
+            try:
+                linked_order = Order.objects.prefetch_related('lines').get(pk=int(order_id))
+            except (Order.DoesNotExist, TypeError, ValueError):
+                return _err('ORDER_NOT_FOUND', 'Заявка не найдена.', http_status=400)
+
+        unit_type = Sale.MODE_PIECES
 
         total_amount = Decimal('0')
         normalized_lines = []
         errors = []
         for idx, row in enumerate(sale_lines, start=1):
-            line_unit_type = (row.get('unit_type') or unit_type or Sale.MODE_PIECES)
-            line_unit_type = str(line_unit_type).strip().lower()
-            if line_unit_type not in (Sale.MODE_PIECES, Sale.MODE_PACKAGES):
-                errors.append(
-                    {
-                        'field': f'sale_lines[{idx}].unit_type',
-                        'message': 'sale_lines[].unit_type: pieces | packages',
-                    },
-                )
+            line_err = reject_sale_line_packages(row, idx=idx)
+            if line_err:
+                errors.append(line_err)
                 continue
             wb_id = row.get('warehouse_batch')
             qty_raw = row.get('quantity')
@@ -1616,50 +1696,52 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             if qty_raw in (None, ''):
                 errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity обязателен'})
                 continue
-            if up_raw in (None, ''):
-                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price обязателен'})
-                continue
             try:
                 wb = WarehouseBatch.objects.select_related('profile').get(pk=wb_id)
             except WarehouseBatch.DoesNotExist:
                 errors.append({'field': f'sale_lines[{idx}].warehouse_batch', 'message': 'Партия не найдена'})
+                continue
+            if wb.inventory_form == WarehouseBatch.INVENTORY_PACKED:
+                errors.append({
+                    'field': f'sale_lines[{idx}].warehouse_batch',
+                    'message': 'Продажа только неупакованных остатков (штуки).',
+                })
                 continue
             try:
                 qty_in = Decimal(str(qty_raw))
             except (InvalidOperation, TypeError, ValueError):
                 errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity должен быть числом'})
                 continue
-            try:
-                unit_price = Decimal(str(up_raw))
-            except (InvalidOperation, TypeError, ValueError):
-                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price должен быть числом'})
-                continue
             if qty_in <= 0:
                 errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'quantity должен быть > 0'})
                 continue
-            if unit_price < 0:
-                errors.append({'field': f'sale_lines[{idx}].unit_price', 'message': 'unit_price не может быть < 0'})
+            try:
+                profile = require_profile_for_batch(wb)
+                unit_price = resolve_unit_sale_price(profile, up_raw)
+            except drf_serializers.ValidationError as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                errors.append({
+                    'field': f'sale_lines[{idx}].unit_price',
+                    'message': str(detail.get('message') or detail.get('detail') or exc.detail),
+                })
                 continue
-            available_pieces = Decimal(str(get_available_quantity(wb.pk)))
-            if line_unit_type == Sale.MODE_PACKAGES:
+            ol_id = row.get('order_line')
+            if linked_order is not None and ol_id not in (None, ''):
                 try:
-                    ppp = Decimal(str(wb.pieces_per_package or 0))
-                except (InvalidOperation, TypeError, ValueError):
-                    ppp = Decimal('0')
-                if wb.inventory_form != WarehouseBatch.INVENTORY_PACKED:
+                    ol_pk = int(ol_id)
+                except (TypeError, ValueError):
+                    errors.append({'field': f'sale_lines[{idx}].order_line', 'message': 'order_line должен быть числом'})
+                    continue
+                if not OrderLine.objects.filter(pk=ol_pk, order_id=linked_order.pk).exists():
                     errors.append(
                         {
-                            'field': f'sale_lines[{idx}].warehouse_batch',
-                            'message': 'Для unit_type=packages нужна партия с inventory_form=packed',
+                            'field': f'sale_lines[{idx}].order_line',
+                            'message': 'order_line не принадлежит заявке.',
                         },
                     )
                     continue
-                if ppp <= 0:
-                    errors.append({'field': f'sale_lines[{idx}].quantity', 'message': 'Для продажи в упаковках у партии нет pieces_per_package'})
-                    continue
-                qty_pieces = (qty_in * ppp).quantize(Decimal('0.0001'))
-            else:
-                qty_pieces = qty_in.quantize(Decimal('0.0001'))
+            available_pieces = Decimal(str(get_available_quantity(wb.pk)))
+            qty_pieces = qty_in.quantize(Decimal('0.0001'))
             if qty_pieces > available_pieces + Decimal('0.0001'):
                 errors.append({
                     'field': f'sale_lines[{idx}].quantity',
@@ -1670,8 +1752,9 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             total_amount += line_total
             normalized_lines.append({
                 'warehouse_batch': wb.pk,
+                'gp_package_id': None,
                 'warehouse_batch_display': f"{(wb.profile.name if wb.profile_id else wb.product)}",
-                'unit_type': line_unit_type,
+                'unit_type': unit_type,
                 'input_quantity': api_decimal_str(qty_in),
                 'quantity_pieces': api_decimal_str(qty_pieces),
                 'unit_price': api_decimal_str(unit_price),
@@ -1681,46 +1764,68 @@ class SaleViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
         if errors:
             return _err('VALIDATION_ERROR', 'Ошибки в предпросмотре продажи.', errors=errors, http_status=400)
 
-        payment_type = (data.get('payment_type') or '').strip().lower()
-        payment_method = (data.get('payment_method') or '').strip().lower()
-        paid_raw = data.get('paid_amount')
+        from .sale_checkout import METHOD_LABELS, resolve_checkout_payment
+
+        sale_date_raw = data.get('sale_date') or data.get('date')
+        if sale_date_raw in (None, ''):
+            return _err('MISSING_SALE_DATE', 'Поле sale_date обязательно (YYYY-MM-DD).', http_status=400)
+
         total_amount = total_amount.quantize(Decimal('0.01'))
-        paid_amount = Decimal('0')
-        debt_amount = Decimal('0')
-        if payment_type == 'full':
-            paid_amount = total_amount
-            debt_amount = Decimal('0')
-        elif payment_type == 'partial':
-            if paid_raw in (None, ''):
-                return _err('PAID_AMOUNT_REQUIRED', 'Для partial укажите paid_amount.', http_status=400)
+        order_prepaid = Decimal('0')
+        if linked_order is not None:
+            from .payment_status import order_payment_metrics
+
+            order_prepaid = Decimal(str(order_payment_metrics(linked_order)['paid_amount'] or 0)).quantize(Decimal('0.01'))
+        order_applied_raw = data.get('order_paid_amount_applied')
+        if order_applied_raw not in (None, ''):
             try:
-                paid_amount = Decimal(str(paid_raw)).quantize(Decimal('0.01'))
+                order_prepaid = Decimal(str(order_applied_raw)).quantize(Decimal('0.01'))
             except (InvalidOperation, TypeError, ValueError):
-                return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть числом.', http_status=400)
-            if paid_amount <= 0 or paid_amount > total_amount:
-                return _err('INVALID_PAID_AMOUNT', 'paid_amount должен быть в диапазоне (0, total_amount].', http_status=400)
-            debt_amount = (total_amount - paid_amount).quantize(Decimal('0.01'))
-        elif payment_type == 'debt':
-            paid_amount = Decimal('0')
-            debt_amount = total_amount
-        else:
-            return _err('INVALID_PAYMENT_TYPE', 'payment_type: full | partial | debt', http_status=400)
+                return _err('INVALID_ORDER_PAID_AMOUNT_APPLIED', 'order_paid_amount_applied должен быть числом.', http_status=400)
 
-        if payment_method not in ('cash', 'card', 'transfer'):
-            return _err('INVALID_PAYMENT_METHOD', 'payment_method: cash | card | transfer', http_status=400)
+        try:
+            checkout = resolve_checkout_payment(
+                initial=data,
+                sale_total=total_amount,
+                order_prepaid=order_prepaid,
+                payment_kind_choices=('full', 'partial', 'debt'),
+            )
+        except drf_serializers.ValidationError as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return _err(
+                str(detail.get('code') or 'CHECKOUT_PAYMENT_ERROR'),
+                str(detail.get('message') or detail.get('detail') or exc.detail),
+                http_status=400,
+            )
 
-        payment_status = 'paid' if debt_amount == 0 else ('partial' if paid_amount > 0 else 'debt')
+        supplemental_paid = checkout.supplemental_amount
+        debt_amount = max(Decimal('0'), total_amount - order_prepaid - supplemental_paid).quantize(Decimal('0.01'))
+        payment_status = 'paid' if debt_amount == 0 else ('partial' if supplemental_paid > 0 else 'debt')
+        splits_out = [
+            {
+                'payment_method': s['payment_method'],
+                'amount': api_decimal_str(s['amount']),
+            }
+            for s in checkout.splits
+        ]
         return Response({
             'total_amount': api_decimal_str(total_amount),
-            'paid_amount': api_decimal_str(paid_amount),
+            'paid_amount': api_decimal_str(supplemental_paid),
+            'order_paid_amount_applied': api_decimal_str(order_prepaid),
+            'amount_remaining': api_decimal_str(debt_amount),
             'debt_amount': api_decimal_str(debt_amount),
             'payment_status': payment_status,
-            'payment_type_label': {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[payment_type],
-            'payment_method_label': {'cash': 'Наличные', 'card': 'Карта', 'transfer': 'Перевод'}[payment_method],
+            'payment_type': checkout.payment_type,
+            'payment_method': checkout.primary_method,
+            'payment_splits': splits_out,
+            'payment_reference': checkout.payment_reference or None,
+            'sale_date': str(sale_date_raw)[:10],
+            'payment_type_label': {'full': 'Полная оплата', 'partial': 'Частичная оплата', 'debt': 'В долг'}[checkout.payment_type],
+            'payment_method_label': METHOD_LABELS.get(checkout.primary_method, checkout.primary_method),
             'payment_status_label': {'paid': 'Оплачено', 'partial': 'Частично оплачено', 'debt': 'В долг'}[payment_status],
             'summary': (
-                f"Итого {api_decimal_str(total_amount)}; оплачено {api_decimal_str(paid_amount)}; "
-                f"долг {api_decimal_str(debt_amount)}"
+                f"Итого {api_decimal_str(total_amount)}; аванс заявки {api_decimal_str(order_prepaid)}; "
+                f"доплата {api_decimal_str(supplemental_paid)}; долг {api_decimal_str(debt_amount)}"
             ),
             'unit_type': unit_type,
             'normalized_lines': normalized_lines,

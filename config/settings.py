@@ -38,6 +38,8 @@ INSTALLED_APPS = [
     'apps.analytics',
     'apps.activity',
     'apps.realtime',
+    'apps.workshop.apps.WorkshopConfig',
+    'apps.foam.apps.FoamConfig',
 ]
 
 MIDDLEWARE = [
@@ -131,6 +133,10 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# Загруженные файлы (фотоотчёты по сменам и т.п.)
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ——— REST & JWT ———
@@ -191,7 +197,17 @@ _raw_cors_origins = os.environ.get(
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _raw_cors_origins if o.strip()]
 if DEBUG and not os.environ.get('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOW_ALL_ORIGINS = False
-    CORS_ALLOWED_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000']
+    # 3000/3001 — два CRA-фронтенда одновременно на локалке (старый Dias_Front
+    # и новый Dias line, оба на одном локальном бэкенде); CRA сам занимает
+    # следующий свободный порт, если 3000 занят, поэтому 3001 тоже в списке.
+    CORS_ALLOWED_ORIGINS = [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+    ]
 
 # Кастомные заголовки: расширяем default_headers (а не подменяем целиком).
 CORS_ALLOW_HEADERS = list(default_headers) + [
@@ -386,6 +402,12 @@ ACCESS_KEYS = [
     # Коммерческий контур
     'client_orders', 'payments', 'returns', 'defects',
 ]
+
+# Журнал «Действия за смену»: entity_type (app_label.model_name), которые привязываются к shift_id.
+# Переопределение: AUDIT_SHIFT_ENTITY_TYPES=materials.rawmaterial,sales.sale,... (через env)
+# Полный список по умолчанию — apps.activity.shift_audit.DEFAULT_AUDIT_SHIFT_ENTITY_TYPES
+AUDIT_SHIFT_ENTITY_TYPES = None  # None → дефолт из shift_audit.py
+
 
 # Имена ролей из seed_roles: при создании User без role назначается «Планировщик»,
 # для суперпользователя — «Админ» (чтобы вкладки UI совпадали с матрицей RoleAccess).

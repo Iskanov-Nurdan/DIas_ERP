@@ -6,6 +6,65 @@ class PlasticProfile(models.Model):
 
     name = models.CharField('Наименование', max_length=255)
     code = models.CharField('Код', max_length=100)
+    weight_kg_per_piece = models.DecimalField(
+        'Вес одной штуки, кг',
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
+    cost_price = models.DecimalField(
+        'Себестоимость за 1 шт, сом (только расчёт ОТК)',
+        max_digits=16,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        default=None,
+    )
+    markup_amount = models.DecimalField(
+        'Наценка за 1 шт, сом',
+        max_digits=16,
+        decimal_places=4,
+        default=0,
+    )
+    blank = models.ForeignKey(
+        'workshop.WorkshopBlank',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='plastic_profiles',
+        verbose_name='Заготовка для ОТК',
+    )
+    extra_rubber = models.DecimalField(
+        'Резинка, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_label = models.DecimalField(
+        'Этикетка, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_labor = models.DecimalField(
+        'Рабочая сила, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_electricity = models.DecimalField(
+        'Свет, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+    extra_repair = models.DecimalField(
+        'Ремонт, сом/шт',
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
     comment = models.TextField('Комментарий', blank=True, default='')
     is_active = models.BooleanField('Активен', default=True)
 

@@ -292,6 +292,27 @@ def _json_structural_diff(
     return changes
 
 
+def _scalar_display(
+    field: Optional[models.Field],
+    value: Any,
+    instance: Optional[models.Model],
+    field_name: str,
+) -> Optional[str]:
+    from .audit_messages import format_audit_datetime
+
+    if field is not None:
+        itype = field.get_internal_type()
+        if itype in ('DateTimeField', 'DateField', 'TimeField'):
+            disp = format_audit_datetime(value)
+            if disp:
+                return disp
+    if instance is not None:
+        disp = _choice_display(instance, field_name, value)
+        if disp:
+            return disp
+    return None
+
+
 def build_field_changes(
     *,
     action: str,
@@ -302,13 +323,15 @@ def build_field_changes(
     after_instance: Optional[models.Model] = None,
     mask_pii: bool = False,
 ) -> List[Dict[str, Any]]:
+    from .audit_messages import should_skip_audit_field
+
     changes: List[Dict[str, Any]] = []
     opts = model_class._meta
     field_by_name = {f.name: f for f in opts.local_concrete_fields}
 
     if action == 'create' and after:
         for name, new_val in sorted(after.items()):
-            if name in ('password', 'last_login'):
+            if should_skip_audit_field(name, new_val):
                 continue
             field = field_by_name.get(name)
             ftype = _field_type_label(field) if field else 'scalar'
@@ -327,12 +350,16 @@ def build_field_changes(
                     entry['new_display'] = disp
             if ftype == 'fk' and field and isinstance(field, models.ForeignKey):
                 entry['new_display'] = _fk_display(model_class, field, new_val)
+            elif ftype == 'scalar':
+                sd = _scalar_display(field, new_val, after_instance, name)
+                if sd is not None:
+                    entry['new_display'] = sd
             changes.append(entry)
         return changes
 
     if action == 'delete' and before:
         for name, old_val in sorted(before.items()):
-            if name in ('password', 'last_login'):
+            if should_skip_audit_field(name, old_val):
                 continue
             field = field_by_name.get(name)
             ftype = _field_type_label(field) if field else 'scalar'
@@ -351,6 +378,10 @@ def build_field_changes(
                     entry['old_display'] = disp
             if ftype == 'fk' and field and isinstance(field, models.ForeignKey):
                 entry['old_display'] = _fk_display(model_class, field, old_val)
+            elif ftype == 'scalar':
+                sd = _scalar_display(field, old_val, before_instance, name)
+                if sd is not None:
+                    entry['old_display'] = sd
             changes.append(entry)
         return changes
 
@@ -359,7 +390,7 @@ def build_field_changes(
         return changes
     if before is None:
         for name, new_val in sorted(after.items()):
-            if name in ('password', 'last_login'):
+            if should_skip_audit_field(name, new_val):
                 continue
             field = field_by_name.get(name)
             ftype = _field_type_label(field) if field else 'scalar'
@@ -380,14 +411,18 @@ def build_field_changes(
                 entry['new_display'] = entry.get('new_display') or _fk_display(
                     model_class, field, new_val
                 )
+            elif ftype == 'scalar':
+                sd = _scalar_display(field, new_val, after_instance, name)
+                if sd is not None:
+                    entry['new_display'] = entry.get('new_display') or sd
             changes.append(entry)
         return changes
     keys = set(before) | set(after)
     for name in sorted(keys):
-        if name in ('password', 'last_login'):
-            continue
         old_val, new_val = before.get(name), after.get(name)
         if old_val == new_val:
+            continue
+        if should_skip_audit_field(name, old_val) and should_skip_audit_field(name, new_val):
             continue
         field = field_by_name.get(name)
         ftype = _field_type_label(field) if field else 'scalar'
@@ -437,6 +472,13 @@ def build_field_changes(
         if ftype == 'fk' and field and isinstance(field, models.ForeignKey):
             entry['old_display'] = _fk_display(model_class, field, old_val)
             entry['new_display'] = _fk_display(model_class, field, new_val)
+        elif ftype == 'scalar':
+            lo = _scalar_display(field, old_val, before_instance, name)
+            ln = _scalar_display(field, new_val, after_instance, name)
+            if lo is not None:
+                entry['old_display'] = lo
+            if ln is not None:
+                entry['new_display'] = ln
         changes.append(entry)
     return changes
 
@@ -482,6 +524,15 @@ def schedule_user_activity(
         else:
             ip = (request.META.get('REMOTE_ADDR') or '')[:45] or None
 
+    from .shift_audit import apply_shift_context_policy
+
+    shift_id, line_id, session_open_event_id = apply_shift_context_policy(
+        entity_type,
+        shift_id,
+        line_id,
+        session_open_event_id,
+    )
+
     row = {
         'user_id': user.pk if getattr(user, 'is_authenticated', False) else None,
         'action': action,
@@ -516,7 +567,7 @@ def schedule_user_activity(
     transaction.on_commit(_commit_write)
 
 
-_DEFAULT_IGNORE = ('updated_at', 'modified_at')
+_DEFAULT_IGNORE = ('updated_at', 'modified_at', 'created_at')
 
 
 def schedule_entity_audit(
@@ -549,6 +600,11 @@ def schedule_entity_audit(
 
     before, after = apply_request_overrides_to_audit_snapshots(request, model_cls, before, after)
 
+    from .audit_messages import build_audit_summary, prune_audit_snapshot
+
+    before = prune_audit_snapshot(before)
+    after = prune_audit_snapshot(after)
+
     entity_type = entity_type_for_model(model_cls)
     entity_id_str = ''
     if action == 'delete' and before is not None:
@@ -569,7 +625,14 @@ def schedule_entity_audit(
 
         entity_id_str = str(uuid.uuid4())
 
-    summary = (description or '')[:500]
+    summary = build_audit_summary(
+        description=description,
+        action=action,
+        model_cls=model_cls,
+        after_instance=after_instance,
+        before_instance=before_instance,
+    )
+    description = summary
     changes = build_field_changes(
         action=action,
         model_class=model_cls,

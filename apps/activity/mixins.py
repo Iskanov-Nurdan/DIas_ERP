@@ -22,7 +22,7 @@ class ActivityLoggingMixin:
     activity_section = ''
     activity_label = ''
     activity_entity_model: Optional[Type[models.Model]] = None
-    activity_ignore_fields: tuple = ('updated_at', 'modified_at')
+    activity_ignore_fields: tuple = ('updated_at', 'modified_at', 'created_at')
     activity_only_fields: Optional[tuple] = None
 
     def _activity_model_class(self) -> Optional[Type[models.Model]]:
@@ -33,19 +33,16 @@ class ActivityLoggingMixin:
         return getattr(meta, 'model', None)
 
     def _activity_description(self, instance, action: str) -> str:
-        action_map = {
-            'create': 'Создал',
-            'update': 'Изменил',
-            'delete': 'Удалил',
-            'restore': 'Восстановил',
-        }
-        verb = action_map.get(action, action)
-        label = self.activity_label or self.activity_section.lower()
-        try:
-            obj_str = str(instance)
-        except Exception:
-            obj_str = f'#{getattr(instance, "pk", "?")}'
-        return f'{verb} {label}: {obj_str}'
+        from apps.activity.audit_messages import human_activity_description
+
+        model_cls = self._activity_model_class() or instance.__class__
+        return human_activity_description(
+            action=action,
+            instance=instance,
+            section=self.activity_section,
+            label=self.activity_label,
+            model_cls=model_cls,
+        )
 
     def _activity_ignore_set(self) -> Set[str]:
         base = set(self.activity_ignore_fields or ())

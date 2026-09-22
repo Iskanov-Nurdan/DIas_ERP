@@ -9,6 +9,7 @@ class UserActivitySerializer(serializers.ModelSerializer):
     module = serializers.CharField(source='section', read_only=True)
     occurred_at = serializers.DateTimeField(source='created_at', read_only=True)
     has_detail = serializers.SerializerMethodField()
+    field_labels = serializers.SerializerMethodField()
 
     class Meta:
         model = UserActivity
@@ -36,7 +37,13 @@ class UserActivitySerializer(serializers.ModelSerializer):
             'client_ip',
             'user_agent',
             'has_detail',
+            'field_labels',
         )
+
+    def get_field_labels(self, obj):
+        from .audit_messages import field_labels_for_entity_type
+
+        return field_labels_for_entity_type(getattr(obj, 'entity_type', '') or '')
 
     def get_has_detail(self, obj):
         if getattr(obj, 'payload_version', 0) >= 1:

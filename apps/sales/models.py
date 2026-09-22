@@ -413,6 +413,24 @@ class Sale(models.Model):
         decimal_places=2,
         default=0,
     )
+    checkout_payment_type = models.CharField(
+        'Тип оплаты при продаже (full/partial/debt)',
+        max_length=20,
+        blank=True,
+        default='',
+    )
+    checkout_payment_method = models.CharField(
+        'Основной способ оплаты при продаже (cash/card)',
+        max_length=20,
+        blank=True,
+        default='',
+    )
+    payment_reference = models.CharField(
+        'Реквизит оплаты (карта/телефон)',
+        max_length=255,
+        blank=True,
+        default='',
+    )
     warehouse_mutation = models.JSONField(
         'Снимок списания склада для отката', null=True, blank=True, default=None, editable=False,
     )
@@ -467,6 +485,14 @@ class SaleLine(models.Model):
     profit = models.DecimalField('Прибыль строки', max_digits=16, decimal_places=2, default=0)
     defect_flag = models.BooleanField('Строка брака', default=False)
     comment = models.TextField('Комментарий', blank=True, default='')
+    gp_pack_unit = models.ForeignKey(
+        'warehouse.GpPackUnit',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sale_lines',
+        verbose_name='Упаковка GP (продажа по gp_package_id)',
+    )
 
     class Meta:
         db_table = 'sale_lines'

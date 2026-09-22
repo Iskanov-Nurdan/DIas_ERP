@@ -57,7 +57,7 @@ class PlasticProfileViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                     queryset=Recipe.objects.order_by('recipe', 'id').only('id', 'recipe'),
                 )
             )
-        return qs.order_by('-id')
+        return qs.select_related('blank').order_by('-id')
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()

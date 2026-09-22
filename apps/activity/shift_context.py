@@ -15,7 +15,8 @@ def resolve_audit_shift_context(
     Опционально фронт передаёт X-Audit-Shift-Id (приоритет над авто).
     Если открыто несколько смен (личная + на линии) и заголовка нет — берётся **самая поздно открытая**.
     session_open_event_id — из LineHistory для линии этой смены, если линия задана.
-    Вне смены — shift_id=None (события всё равно логируются).
+    В schedule_user_activity shift_id сбрасывается для entity_type вне AUDIT_SHIFT_ENTITY_TYPES
+    (см. apps.activity.shift_audit).
     """
     if not user or not getattr(user, 'is_authenticated', False):
         return None, None, None

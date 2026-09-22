@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, re_path, include
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
@@ -29,3 +31,6 @@ urlpatterns = [
     path('warehouse/pack/', _pack_from_otk, name='warehouse-pack-alias'),
     path('batches/pack_from_otk/', _pack_from_otk, name='batches-pack-from-otk-alias'),
 ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

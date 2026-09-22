@@ -21,7 +21,10 @@ from apps.production.views import (
     ProductionRequestViewSet,
     RecipeRunViewSet,
     ShiftViewSet, ShiftHistoryView, ShiftComplaintViewSet,
+    ShiftClosingViewSet, ShiftPhotoReportViewSet,
 )
+from apps.warehouse.gp_packaging_views import GpPackageViewSet, GpUnpackedBalanceView
+from apps.warehouse.operations_views import WarehouseOperationsView
 from apps.warehouse.views import WarehouseBatchViewSet
 from apps.sales.views import (
     ClientViewSet,
@@ -37,13 +40,17 @@ from apps.sales.views import (
     SaleViewSet,
 )
 from apps.otk.views import OtkPendingView
+from apps.analytics.other_expenses_views import AnalyticsOtherExpenseViewSet
 from apps.analytics.views import (
     AnalyticsSummaryView,
     AnalyticsRevenueDetailsView,
     AnalyticsSalesCostDetailsView,
+    AnalyticsProductOtherExpensesDetailsView,
+    AnalyticsProductUnitCostsView,
     AnalyticsProductionCostDetailsView,
     AnalyticsPurchaseDetailsView,
     AnalyticsProfitDetailsView,
+    AnalyticsDebtDetailsView,
     AnalyticsOtkDetailsView,
     AnalyticsWriteoffDetailsView,
     AnalyticsDefectView,
@@ -56,6 +63,23 @@ from apps.activity.views import (
     ActivityMyRetrieveView,
     ActivityAdminView,
     ActivityAdminRetrieveView,
+)
+from apps.workshop.views import BlankProductionRunViewSet, PreparedBlankViewSet, WorkshopBlankViewSet
+from apps.workshop.otk_views import (
+    OtkAccountView,
+    OtkAccountingViewSet,
+    OtkBlankAccountView,
+    OtkBlanksIntakesView,
+    OtkBlanksListView,
+)
+from apps.warehouse.gp_stock_views import GpStockView
+from apps.foam.views import (
+    FoamDensityGradeViewSet,
+    FoamGpOperationViewSet,
+    FoamGpStockViewSet,
+    FoamProductionRunViewSet,
+    FoamRawLotViewSet,
+    FoamSaleViewSet,
 )
 
 router = DefaultRouter()
@@ -76,6 +100,7 @@ router.register(r'recipes', RecipeViewSet, basename='recipe')
 router.register(r'batches', BatchViewSet, basename='batch')
 router.register(r'production/requests', ProductionRequestViewSet, basename='production-request')
 router.register(r'warehouse/batches', WarehouseBatchViewSet, basename='warehouse-batch')
+router.register(r'warehouse/gp-packages', GpPackageViewSet, basename='warehouse-gp-package')
 router.register(r'clients', ClientViewSet, basename='client')
 router.register(r'sales', SaleViewSet, basename='sale')
 router.register(r'orders', OrderViewSet, basename='order')
@@ -88,12 +113,28 @@ router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')
 router.register(r'analytics/sales-cost-details', AnalyticsSalesCostDetailsView, basename='analytics-sales-cost-details')
 router.register(
+    r'analytics/product-other-expenses-details',
+    AnalyticsProductOtherExpensesDetailsView,
+    basename='analytics-product-other-expenses-details',
+)
+router.register(
+    r'analytics/product-unit-costs',
+    AnalyticsProductUnitCostsView,
+    basename='analytics-product-unit-costs',
+)
+router.register(
+    r'analytics/other-expenses',
+    AnalyticsOtherExpenseViewSet,
+    basename='analytics-other-expense',
+)
+router.register(
     r'analytics/production-cost-details',
     AnalyticsProductionCostDetailsView,
     basename='analytics-production-cost-details',
 )
 router.register(r'analytics/purchase-details', AnalyticsPurchaseDetailsView, basename='analytics-purchase-details')
 router.register(r'analytics/profit-details', AnalyticsProfitDetailsView, basename='analytics-profit-details')
+router.register(r'analytics/debt-details', AnalyticsDebtDetailsView, basename='analytics-debt-details')
 router.register(r'analytics/otk-details', AnalyticsOtkDetailsView, basename='analytics-otk-details')
 router.register(r'analytics/writeoff-details', AnalyticsWriteoffDetailsView, basename='analytics-writeoff-details')
 router.register(r'analytics/defect-analytics', AnalyticsDefectView, basename='analytics-defect')
@@ -105,9 +146,36 @@ router.register(r'client-prices', ClientPriceViewSet, basename='client-price')
 router.register(r'order-reservations', OrderReservationViewSet, basename='order-reservation')
 router.register(r'client-financial-summary', ClientFinancialSummaryView, basename='client-financial-summary')
 router.register(r'shifts', ShiftViewSet, basename='shift')
+router.register(r'shift-closings', ShiftClosingViewSet, basename='shift-closing')
+router.register(r'shift-photo-reports', ShiftPhotoReportViewSet, basename='shift-photo-report')
+router.register(r'workshop/blanks', WorkshopBlankViewSet, basename='workshop-blank')
+router.register(r'workshop/prepared-blanks', PreparedBlankViewSet, basename='workshop-prepared-blank')
+router.register(
+    r'workshop/blank-production-runs',
+    BlankProductionRunViewSet,
+    basename='workshop-blank-production-run',
+)
+router.register(r'workshop/otk-accounting', OtkAccountingViewSet, basename='workshop-otk-accounting')
+router.register(r'foam/raw-lots', FoamRawLotViewSet, basename='foam-raw-lot')
+router.register(r'foam/density-grades', FoamDensityGradeViewSet, basename='foam-density-grade')
+router.register(r'foam/production-runs', FoamProductionRunViewSet, basename='foam-production-run')
+router.register(r'foam/gp-stock', FoamGpStockViewSet, basename='foam-gp-stock')
+router.register(r'foam/gp-operations', FoamGpOperationViewSet, basename='foam-gp-operation')
+router.register(r'foam/sales', FoamSaleViewSet, basename='foam-sale')
 
 # Фиксированные пути регистрируются ДО роутера, чтобы не конфликтовать с <pk>
 urlpatterns = [
+    path('warehouse/gp-stock/', GpStockView.as_view(), name='warehouse-gp-stock'),
+    path('warehouse/gp-unpacked-balance/', GpUnpackedBalanceView.as_view(), name='warehouse-gp-unpacked-balance'),
+    path('warehouse/operations/', WarehouseOperationsView.as_view(), name='warehouse-operations'),
+    path('workshop/otk-blanks/', OtkBlanksListView.as_view(), name='workshop-otk-blanks'),
+    path('workshop/otk-blanks/intakes/', OtkBlanksIntakesView.as_view(), name='workshop-otk-blanks-intakes'),
+    path('workshop/otk-account/', OtkAccountView.as_view(), name='workshop-otk-account'),
+    path(
+        'workshop/otk-blanks/<int:blank_id>/account/',
+        OtkBlankAccountView.as_view(),
+        name='workshop-otk-blank-account',
+    ),
     path(
         'shifts/complaints/',
         ShiftComplaintViewSet.as_view({'get': 'list', 'post': 'create'}),

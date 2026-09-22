@@ -158,10 +158,11 @@ class ClientsApiContractTests(APITestCase):
         resp = self.client.get(f'/api/clients/{c.pk}/history/')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         for key in (
-            'client_id', 'client_name', 'orders', 'sales', 'payments', 'returns',
+            'client_id', 'client_name', 'orders', 'sales', 'payments',
             'total_revenue', 'total_paid', 'client_debt_money', 'credit_limit_mode',
         ):
             self.assertIn(key, resp.data)
+        self.assertNotIn('returns', resp.data)
         # Агрегаты считаются только по реальным продажам (без draft/canceled).
         self.assertEqual(resp.data['total_revenue'], '200')
         self.assertEqual(resp.data['total_profit'], '100')
@@ -325,3 +326,21 @@ class ClientsApiContractTests(APITestCase):
         self.assertEqual(resp.data['summary']['total_paid_amount'], '200')
         self.assertEqual(resp.data['summary']['total_debt'], '200')
         self.assertTrue(any(d['id'] == sale.pk and d['debt_amount'] == '200' for d in resp.data['debts']))
+
+    def test_client_profile_json_has_no_returns_block(self):
+        c = self._create_client()
+        resp = self.client.get(f'/api/clients/{c.pk}/profile/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertNotIn('returns', resp.data)
+        self.assertNotIn('total_returns', resp.data['summary'])
+        self.assertIn('client_type_label', resp.data['client'])
+
+    def test_client_profile_html_renders_without_returns(self):
+        c = self._create_client(name='Тест HTML')
+        resp = self.client.get(f'/api/clients/{c.pk}/profile/?format=html')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('text/html', resp['Content-Type'])
+        body = resp.content.decode('utf-8')
+        self.assertIn('Тест HTML', body)
+        self.assertNotIn('Возврат', body)
+        self.assertNotIn('total_returns', body)

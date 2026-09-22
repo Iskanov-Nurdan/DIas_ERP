@@ -1,16 +1,19 @@
+import calendar
 import logging
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
+from django.utils import timezone
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view, inline_serializer
+from rest_framework import serializers as drf_serializers
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, ValidationError as DRFValidationError
 from rest_framework.response import Response
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Case, Count, Prefetch, Q, When
+from django.db.models import Case, Count, Prefetch, Q, Sum, When
 
 from apps.activity.mixins import ActivityLoggingMixin
 from apps.activity.audit_service import instance_to_snapshot, schedule_entity_audit
@@ -19,7 +22,7 @@ from config.openapi_common import DiasErrorSerializer, paginated_inline
 from apps.sales.models import Order as ClientOrder
 from apps.sales.serializers import ClientOrderProductionRequestSerializer
 from config.permissions import CanAccessShiftComplaints, IsAdminOrHasAccess, IsAdminOrHasProductionOrOtk
-from config.pagination import StandardResultsSetPagination
+from config.pagination import StandardResultsSetPagination, WarehouseResultsSetPagination
 from .shift_state import (
     line_current_shift_open_event,
     line_current_shift_params_event,
@@ -38,8 +41,11 @@ from .models import (
     RecipeRunBatch,
     RecipeRunBatchComponent,
     Shift,
+    ShiftClosing,
     ShiftComplaint,
     ShiftNote,
+    ShiftPhotoReport,
+    ShiftPhotoReportImage,
 )
 from .serializers import (
     LineSerializer,
@@ -54,6 +60,8 @@ from .serializers import (
     ShiftNoteSerializer,
     ShiftComplaintCreateSerializer,
     ShiftComplaintListSerializer,
+    ShiftClosingSerializer,
+    ShiftPhotoReportSerializer,
 )
 from apps.recipes.models import RecipeComponent
 
@@ -82,11 +90,13 @@ def _audit_line_history_row(
         section = 'Смены'
     else:
         section = 'Линии'
+    from apps.activity.audit_messages import line_history_audit_text
+
     schedule_entity_audit(
         user=user,
         request=request,
         section=section,
-        description=f'{hist.get_action_display()} на линии «{line_label}» (событие #{hist.pk})',
+        description=line_history_audit_text(hist),
         action='create',
         model_cls=LineHistory,
         after_instance=hist,
@@ -108,11 +118,14 @@ def _audit_shift_row(
 ) -> None:
     if shift_context is None:
         shift_context = shift_instance_audit_context(shift)
+    from apps.activity.audit_messages import shift_audit_text
+
+    text = shift_audit_text(endpoint=endpoint, shift=shift, action=action)
     kw = dict(
         user=user,
         request=request,
         section='Смены',
-        description=f'Смена #{shift.pk}: {endpoint}',
+        description=text,
         action=action,
         model_cls=Shift,
         payload_extra={'endpoint': endpoint},
@@ -128,11 +141,13 @@ def _audit_shift_row(
 
 
 def _audit_shift_note_row(request, user, note: ShiftNote, *, endpoint: str) -> None:
+    from apps.activity.audit_messages import shift_note_audit_text
+
     schedule_entity_audit(
         user=user,
         request=request,
         section='Смены',
-        description=f'Заметка к смене #{note.shift_id} (запись #{note.pk})',
+        description=shift_note_audit_text(note),
         action='create',
         model_cls=ShiftNote,
         after_instance=note,
@@ -193,6 +208,7 @@ def _body_for_line_shift_close(line, request_data):
 class LineViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = Line.objects.all()
     serializer_class = LineSerializer
+    pagination_class = WarehouseResultsSetPagination
     permission_classes = [IsAdminOrHasAccess]
     required_access_key = 'lines'
     activity_section = 'Линии'
@@ -866,7 +882,7 @@ class BatchViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             user=request.user,
             request=request,
             section='ОТК',
-            description=f'Приёмка ОТК: партия #{batch.pk}, заказ #{batch.order_id}',
+            description=f'Приёмка ОТК: {batch.product or "партия"}',
             action='update',
             model_cls=ProductionBatch,
             before=before_batch,
@@ -1758,7 +1774,7 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
             user=request.user,
             request=request,
             section='Производство',
-            description=f'Отправка запуска #{run.pk} в ОТК (партия {batch.pk})',
+            description='Отправка замеса в ОТК',
             action='update',
             model_cls=RecipeRun,
             before=before_run,
@@ -1800,7 +1816,9 @@ class RecipeRunViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
 
 class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewSet):
     """
-    GET /api/production/requests/ — заявки клиента в статусе ready (к производству).
+    GET /api/production/requests/ — заявки клиента к производству (тот же id, что /api/orders/{id}/).
+    Список не ограничиваем ready/складом: всё с клиентом, кроме уже в производстве, отклонённых
+    производством и коммерчески закрытых/отменённых.
     POST /api/production/requests/{id}/start/ — создание партии, FIFO сырьё/химия, заявка → in_production.
     """
     permission_classes = [IsAdminOrHasProductionOrOtk]
@@ -1814,38 +1832,383 @@ class ProductionRequestViewSet(ActivityLoggingMixin, viewsets.ReadOnlyModelViewS
     required_access_key = 'batches'
 
     def get_queryset(self):
+        excluded_request = (
+            ClientOrder.REQUEST_STATUS_IN_PRODUCTION,
+            ClientOrder.REQUEST_STATUS_REJECTED,
+        )
+        excluded_commercial = (
+            ClientOrder.STATUS_CANCELED,
+            ClientOrder.STATUS_CLOSED,
+        )
         return (
-            ClientOrder.objects.filter(
-                request_status=ClientOrder.REQUEST_STATUS_READY,
-            )
+            ClientOrder.objects.filter(client_id__isnull=False)
+            .exclude(request_status__in=excluded_request)
+            .exclude(status__in=excluded_commercial)
             .select_related('client', 'production_profile', 'resolved_recipe')
+            .prefetch_related('lines', 'lines__profile')
             .order_by('-date', '-id')
         )
 
+    @extend_schema(
+        summary='Старт производства по заявке',
+        description=(
+            'line_starts: [{ order_line_id, blank }, …] — по одной заготовке на позицию; '
+            'или { blank, order_line_id }. Поле line и массив blanks без привязки к позиции не поддерживаются. '
+            'Личная смена («Моя смена») или X-Shift-Id / X-Audit-Shift-Id.'
+        ),
+        request=inline_serializer(
+            name='ProductionRequestStartBody',
+            fields={
+                'line_starts': drf_serializers.ListField(
+                    child=inline_serializer(
+                        name='ProductionLineStartItem',
+                        fields={
+                            'order_line_id': drf_serializers.IntegerField(required=False),
+                            'profile_id': drf_serializers.IntegerField(required=False),
+                            'blank': drf_serializers.IntegerField(),
+                        },
+                    ),
+                    required=False,
+                ),
+                'blank': drf_serializers.IntegerField(required=False),
+                'order_line_id': drf_serializers.IntegerField(required=False),
+                'profile_id': drf_serializers.IntegerField(required=False),
+            },
+        ),
+    )
     @action(detail=True, methods=['post'], url_path='start')
     def start(self, request, pk=None):
-        from .client_order_start import start_production_for_client_order
+        return Response(
+            {'detail': 'Устарело: модуль заявок снят с фронта. Используйте workshop/blank-production-runs/.'},
+            status=status.HTTP_410_GONE,
+        )
+        from apps.sales.models import Order as ClientOrder
+        from apps.workshop.serializers import BlankProductionRunSerializer
+
+        from .client_order_start import (
+            parse_line_starts_from_body,
+            start_production_for_client_order,
+        )
 
         raw = getattr(request, 'data', None) or {}
-        line_id = raw.get('line') if isinstance(raw, dict) else None
-        if line_id is None or str(line_id).strip() == '':
-            return _err('MISSING_LINE', 'Укажите line (id линии) в теле.', http_status=400)
+        if not isinstance(raw, dict):
+            raw = {}
+        line_id = raw.get('line')
+        if line_id not in (None, '') and str(line_id).strip() != '':
+            return _err(
+                'LINE_NOT_SUPPORTED',
+                'Поле line в теле больше не поддерживается. Используйте line_starts или blank + order_line_id.',
+                http_status=400,
+            )
         try:
-            line_pk = int(line_id)
-        except (TypeError, ValueError):
-            return _err('INVALID_LINE', 'line должен быть числом.', http_status=400)
-        line = Line.objects.filter(pk=line_pk).first()
-        if line is None:
-            return _err('LINE_NOT_FOUND', 'Линия не найдена.', http_status=404)
+            client_order = ClientOrder.objects.prefetch_related('lines', 'lines__profile').get(pk=int(pk))
+        except ClientOrder.DoesNotExist:
+            return _err('NOT_FOUND', 'Заявка не найдена', http_status=404)
         try:
-            batch = start_production_for_client_order(
+            specs = parse_line_starts_from_body(raw, client_order=client_order)
+            runs = start_production_for_client_order(
                 user=request.user,
-                line=line,
                 client_order_id=int(pk),
+                line_starts=specs,
+                request=request,
             )
         except DRFValidationError as exc:
             return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
-        return Response(
-            BatchListSerializer(batch, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
+        runs_data = BlankProductionRunSerializer(
+            runs,
+            many=True,
+            context=self.get_serializer_context(),
+        ).data
+        payload = {
+            'client_request_id': int(pk),
+            'runs': runs_data,
+        }
+        if runs:
+            payload['batch'] = BatchListSerializer(
+                runs[0].production_batch,
+                context=self.get_serializer_context(),
+            ).data
+        return Response(payload, status=status.HTTP_201_CREATED)
+
+
+# ——— Закрытие смены (касса) / фотоотчёты по смене ———
+# Отдельная фича от ShiftViewSet (учёт рабочего времени): касса дня, фотоотчёты, сводка «Итоги».
+# Гейтится тем же ключом доступа 'shifts', отдельного ключа для «Итогов» нет (см. ТЗ).
+
+
+def _is_admin_user(user) -> bool:
+    return bool(getattr(user, 'is_superuser', False))
+
+
+def _parse_ymd_filters(params):
+    """year/month/day из query params → (year:int|None, month:int|None, day:int|None)."""
+    def _to_int(v):
+        if v in (None, ''):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return _to_int(params.get('year')), _to_int(params.get('month')), _to_int(params.get('day'))
+
+
+def _filter_by_ymd(qs, year, month, day):
+    if year is not None:
+        qs = qs.filter(created_at__year=year)
+    if month is not None:
+        qs = qs.filter(created_at__month=month)
+    if day is not None:
+        qs = qs.filter(created_at__day=day)
+    return qs
+
+
+class ShiftClosingViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    """
+    Закрытие смены (касса дня): наличные/карта/расход/аванс + комментарий.
+    Общая лента для всех с ключом доступа 'shifts' (не только свои записи).
+
+    GET    /api/shift-closings/?year=&month=&day=
+    POST   /api/shift-closings/
+    PATCH  /api/shift-closings/{id}/ — только автор или админ, только один раз
+    DELETE /api/shift-closings/{id}/ — только админ, только в день создания
+    GET    /api/shift-closings/summary/?year=&month=&day=&employeeId=
+    """
+
+    activity_section = 'Смены'
+    activity_label = 'закрытие смены (касса)'
+    queryset = ShiftClosing.objects.select_related('user').all()
+    serializer_class = ShiftClosingSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'shifts'
+    pagination_class = StandardResultsSetPagination
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return ShiftClosing.objects.none()
+        qs = ShiftClosing.objects.select_related('user').all()
+        if self.action in ('list', 'summary'):
+            year, month, day = _parse_ymd_filters(self.request.query_params)
+            qs = _filter_by_ymd(qs, year, month, day)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        cash = serializer.validated_data.get('cash') or Decimal('0')
+        card = serializer.validated_data.get('card') or Decimal('0')
+        # user/total не являются writable-полями сериализатора — прокидываем через validated_data,
+        # чтобы perform_create (ActivityLoggingMixin) сохранил их обычным путём и залогировал создание.
+        serializer.validated_data['user'] = request.user
+        serializer.validated_data['total'] = cash + card
+        self.perform_create(serializer)
+        read = ShiftClosingSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_201_CREATED)
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        if not (_is_admin_user(user) or instance.user_id == user.id):
+            return _err('forbidden', 'Редактировать может только автор записи или администратор', http_status=403)
+        if instance.is_edited:
+            return _err('bad_request', 'Запись уже была отредактирована и больше не может изменяться', http_status=400)
+
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        previous_snapshot = {
+            'cash': str(instance.cash),
+            'card': str(instance.card),
+            'expense': str(instance.expense),
+            'advance': str(instance.advance),
+            'total': str(instance.total),
+            'description': instance.description,
+        }
+        new_cash = serializer.validated_data.get('cash', instance.cash)
+        new_card = serializer.validated_data.get('card', instance.card)
+        serializer.validated_data['previous_snapshot'] = previous_snapshot
+        serializer.validated_data['is_edited'] = True
+        serializer.validated_data['edited_at'] = timezone.now()
+        serializer.validated_data['total'] = new_cash + new_card
+        self.perform_update(serializer)
+        read = ShiftClosingSerializer(serializer.instance, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        if not _is_admin_user(user):
+            return _err('forbidden', 'Удалять может только администратор', http_status=403)
+        today = timezone.localtime().date()
+        if timezone.localtime(instance.created_at).date() != today:
+            return _err('bad_request', 'Удалить можно только запись, созданную сегодня', http_status=400)
+        self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request, *args, **kwargs):
+        params = request.query_params
+        year, month, day = _parse_ymd_filters(params)
+        if year is None:
+            year = timezone.localtime().year
+        employee_id = params.get('employeeId') or params.get('employee_id')
+        try:
+            employee_id = int(employee_id) if employee_id not in (None, '') else None
+        except (TypeError, ValueError):
+            employee_id = None
+
+        base_qs = _filter_by_ymd(ShiftClosing.objects.all(), year, month, day)
+
+        totals_qs = base_qs
+        if employee_id is not None:
+            totals_qs = totals_qs.filter(user_id=employee_id)
+        totals_agg = totals_qs.aggregate(
+            cash=Sum('cash'), card=Sum('card'), expense=Sum('expense'),
+            advance=Sum('advance'), total=Sum('total'), count=Count('id'),
         )
+        zero = Decimal('0.00')
+
+        def _money(v):
+            return str((v or zero).quantize(Decimal('0.01')))
+
+        totals = {
+            'cash': _money(totals_agg['cash']),
+            'card': _money(totals_agg['card']),
+            'expense': _money(totals_agg['expense']),
+            'advance': _money(totals_agg['advance']),
+            'total': _money(totals_agg['total']),
+            'count': totals_agg['count'] or 0,
+        }
+
+        by_employee_rows = (
+            base_qs.values('user_id', 'user__name')
+            .annotate(
+                cash=Sum('cash'), card=Sum('card'), advance=Sum('advance'),
+                expense=Sum('expense'), total=Sum('total'), count=Count('id'),
+            )
+            .order_by('user__name')
+        )
+        by_employee = [
+            {
+                'employeeId': row['user_id'],
+                'employeeName': row['user__name'],
+                'cash': _money(row['cash']),
+                'card': _money(row['card']),
+                'advance': _money(row['advance']),
+                'expense': _money(row['expense']),
+                'total': _money(row['total']),
+                'count': row['count'] or 0,
+            }
+            for row in by_employee_rows
+        ]
+
+        coverage = None
+        if year is not None and month is not None and day is None:
+            days_in_month = calendar.monthrange(int(year), int(month))[1]
+            today = timezone.localtime()
+            if int(year) == today.year and int(month) == today.month:
+                checked_through = min(today.day, days_in_month)
+            else:
+                checked_through = days_in_month
+            covered_days = set(
+                base_qs.annotate().values_list('created_at__day', flat=True).distinct()
+            )
+            missing_days = []
+            for d in range(1, checked_through + 1):
+                weekday = date(int(year), int(month), d).weekday()  # Monday=0 ... Sunday=6
+                if weekday == 6:
+                    continue
+                if d not in covered_days:
+                    missing_days.append(d)
+            coverage = {
+                'daysInMonth': days_in_month,
+                'checkedThrough': checked_through,
+                'missingDays': sorted(missing_days),
+            }
+
+        return Response({'totals': totals, 'byEmployee': by_employee, 'coverage': coverage})
+
+
+class ShiftPhotoReportViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
+    """
+    Фотоотчёты по смене (до 10 фото на отчёт).
+    Общая лента для всех с ключом доступа 'shifts'.
+
+    GET    /api/shift-photo-reports/?year=&month=&day=
+    POST   /api/shift-photo-reports/ (multipart: photos[], description?)
+    DELETE /api/shift-photo-reports/{id}/ — только админ, без ограничения по дате
+    """
+
+    activity_section = 'Смены'
+    activity_label = 'фотоотчёт по смене'
+    queryset = ShiftPhotoReport.objects.select_related('user').prefetch_related('photos').all()
+    serializer_class = ShiftPhotoReportSerializer
+    permission_classes = [IsAdminOrHasAccess]
+    required_access_key = 'shifts'
+    pagination_class = StandardResultsSetPagination
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    MAX_PHOTOS = 10
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return ShiftPhotoReport.objects.none()
+        qs = ShiftPhotoReport.objects.select_related('user').prefetch_related('photos').all()
+        year, month, day = _parse_ymd_filters(self.request.query_params)
+        qs = _filter_by_ymd(qs, year, month, day)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        files = request.FILES.getlist('photos')
+        if not files:
+            return _err('validation_error', 'Нужно приложить хотя бы одно фото (поле photos)', http_status=400)
+        if len(files) > self.MAX_PHOTOS:
+            return _err(
+                'validation_error',
+                f'Слишком много файлов: максимум {self.MAX_PHOTOS} фото на отчёт',
+                http_status=400,
+            )
+        description = request.data.get('description') or ''
+        report = ShiftPhotoReport.objects.create(user=request.user, description=description)
+        for f in files:
+            ShiftPhotoReportImage.objects.create(report=report, image=f)
+
+        schedule_entity_audit(
+            user=request.user,
+            request=request,
+            section=self.activity_section,
+            description=self._activity_description(report, 'create'),
+            action='create',
+            model_cls=ShiftPhotoReport,
+            after_instance=report,
+            payload_extra={'photos_count': len(files)},
+        )
+
+        read = ShiftPhotoReportSerializer(report, context=self.get_serializer_context())
+        return Response(read.data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if not _is_admin_user(request.user):
+            return _err('forbidden', 'Удалять может только администратор', http_status=403)
+
+        before = instance_to_snapshot(instance, ignore_fields=self._activity_ignore_set())
+        description = self._activity_description(instance, 'delete')
+
+        for photo in instance.photos.all():
+            if photo.image:
+                photo.image.delete(save=False)
+            photo.delete()
+        instance.delete()
+
+        schedule_entity_audit(
+            user=request.user,
+            request=request,
+            section=self.activity_section,
+            description=description,
+            action='delete',
+            model_cls=ShiftPhotoReport,
+            before=before,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
