@@ -1589,7 +1589,23 @@ class SaleLineSerializer(serializers.ModelSerializer):
                 ret[k] = api_decimal_str(Decimal(str(ret[k])))
         if not ret.get('unit_type'):
             ret['unit_type'] = self._derive_unit_type(instance)
+        if not (ret.get('product') or '').strip():
+            # Уже сохранённые строки с пустым/пробельным именем — достаём
+            # читаемое на чтении, чтобы в чеке не было пустого места.
+            ret['product'] = self._derive_product_name(instance)
         return ret
+
+    @staticmethod
+    def _derive_product_name(line: SaleLine) -> str:
+        wb = line.warehouse_batch
+        if wb is not None:
+            if wb.profile_id and (wb.profile.name or '').strip():
+                return wb.profile.name.strip()
+            if (wb.product or '').strip():
+                return wb.product.strip()
+        if line.order_line_id and (line.order_line.product or '').strip():
+            return line.order_line.product.strip()
+        return ''
 
     @staticmethod
     def _derive_unit_type(line: SaleLine) -> str:
@@ -1866,10 +1882,16 @@ class SaleSerializer(serializers.ModelSerializer):
         payload['warehouse_batch'] = wb
         product = (payload.get('product') or '').strip()
         if not product:
-            if order_line is not None and getattr(order_line, 'product', None):
-                product = order_line.product
-            elif wb is not None and getattr(wb, 'product', None):
-                product = wb.product
+            # Читаемое имя: профиль партии (то, что видит кассир в каталоге)
+            # важнее сырого WarehouseBatch.product, который бывает пустым/
+            # пробельным; strip — чтобы «   » не считалось названием.
+            if order_line is not None and (getattr(order_line, 'product', '') or '').strip():
+                product = order_line.product.strip()
+            elif wb is not None:
+                if wb.profile_id and (wb.profile.name or '').strip():
+                    product = wb.profile.name.strip()
+                elif (getattr(wb, 'product', '') or '').strip():
+                    product = wb.product.strip()
         if not product:
             self._raise_sale_error(
                 'PRODUCT_OR_ORDER_LINE_REQUIRED',
@@ -2660,10 +2682,19 @@ class SaleSerializer(serializers.ModelSerializer):
         if client is not None and shipping:
             from .credit_check import enforce_credit_limit, CreditLimitBlocked
             revenue = validated_data.get('revenue') or Decimal('0')
+            # Лимит — это лимит ДОЛГА: в проекцию идёт только неоплаченная
+            # часть чека (сумма − аванс заявки − внесённое при продаже), а не
+            # вся выручка. Иначе полностью оплаченная продажа клиенту с
+            # лимитом ложно упиралась бы в hard-блокировку.
+            unpaid = max(
+                Decimal('0'),
+                Decimal(str(revenue)) - Decimal(str(order_paid_applied or 0))
+                - Decimal(str(checkout.supplemental_amount or 0)),
+            ).quantize(Decimal('0.01'))
             try:
-                enforce_credit_limit(client, revenue, user=user, force_override=force_override)
+                enforce_credit_limit(client, unpaid, user=user, force_override=force_override)
             except CreditLimitBlocked as exc:
-                raise serializers.ValidationError({'credit_limit': str(exc)})
+                self._raise_sale_error('CREDIT_LIMIT_EXCEEDED', str(exc), field='credit_limit')
 
         if not validated_data.get('order_number'):
             today = timezone.now().date()

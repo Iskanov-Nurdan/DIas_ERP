@@ -51,6 +51,7 @@ from .serializers import (
     PriceListSerializer,
     ReturnSerializer,
     ReworkRequestSerializer,
+    SaleLineSerializer,
     SaleSerializer,
     defect_record_source_label,
     rework_quantities_from_defect_record,
@@ -769,7 +770,7 @@ class ClientViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
                 'sale_number': s.sale_number or s.order_number,
                 'items': [
                     {
-                        'product': sl.product,
+                        'product': (sl.product or '').strip() or SaleLineSerializer._derive_product_name(sl),
                         'quantity': api_decimal_str(Decimal(str(sl.quantity or 0))),
                         'unit_price': api_decimal_str(Decimal(str(sl.unit_price or 0))),
                         'line_total': api_decimal_str(Decimal(str(sl.line_total or 0))),
