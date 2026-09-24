@@ -39,7 +39,10 @@ def _apply_activity_filters(qs, query_params):
     if request_id:
         qs = qs.filter(request_id=request_id)
     if section:
-        qs = qs.filter(section=section)
+        # Несколько разделов через запятую — фронт группирует разделы
+        # бэкенда под пункты сайдбара («Касса» = Продажи + Оплаты + Возвраты).
+        sections = [x.strip() for x in str(section).split(',') if x.strip()]
+        qs = qs.filter(section__in=sections) if len(sections) > 1 else qs.filter(section=sections[0]) if sections else qs
     if search and str(search).strip() != '':
         term = str(search).strip()
         qs = qs.filter(
