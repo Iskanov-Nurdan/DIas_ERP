@@ -398,6 +398,8 @@ LOGGING = {
 ACCESS_KEYS = [
     'users', 'lines', 'materials', 'chemistry', 'recipes', 'orders',
     'production', 'otk', 'warehouse', 'clients', 'sales', 'shipments', 'analytics',
+    # Финансовые показатели аналитики: себестоимость, маржа, прибыль, расходы, зарплата.
+    'analytics_finance',
     'shifts', 'my_shift',
     # Коммерческий контур
     'client_orders', 'payments', 'returns', 'defects',

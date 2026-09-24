@@ -40,7 +40,8 @@ from apps.sales.views import (
     SaleViewSet,
 )
 from apps.otk.views import OtkPendingView
-from apps.analytics.other_expenses_views import AnalyticsOtherExpenseViewSet
+from apps.analytics.dashboard_views import AnalyticsDashboardDetailsView, AnalyticsDashboardView
+from apps.analytics.other_expenses_views import AnalyticsExpenseCategoryViewSet, AnalyticsOtherExpenseViewSet
 from apps.analytics.views import (
     AnalyticsSummaryView,
     AnalyticsRevenueDetailsView,
@@ -110,6 +111,9 @@ router.register(r'defects', DefectRecordViewSet, basename='defect')
 router.register(r'rework-requests', ReworkRequestViewSet, basename='rework-request')
 router.register(r'otk/pending', OtkPendingView, basename='otk-pending')
 router.register(r'analytics/summary', AnalyticsSummaryView, basename='analytics-summary')
+router.register(r'analytics/dashboard', AnalyticsDashboardView, basename='analytics-dashboard')
+router.register(r'analytics/dashboard-details', AnalyticsDashboardDetailsView, basename='analytics-dashboard-details')
+router.register(r'analytics/expense-categories', AnalyticsExpenseCategoryViewSet, basename='analytics-expense-category')
 router.register(r'analytics/revenue-details', AnalyticsRevenueDetailsView, basename='analytics-revenue-details')
 router.register(r'analytics/sales-cost-details', AnalyticsSalesCostDetailsView, basename='analytics-sales-cost-details')
 router.register(
