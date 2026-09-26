@@ -21,8 +21,10 @@ if [ ! -f .env.prod ]; then
 fi
 grep -q 'CHANGE_ME' .env.prod && fail "в .env.prod остались значения CHANGE_ME"
 
-# Порт контейнерного nginx из HTTP_PORT (формат «8080» или «127.0.0.1:8080»)
-http_port="$(grep -E '^HTTP_PORT=' .env.prod | tail -1 | cut -d= -f2 | awk -F: '{print $NF}')"
+# Порт контейнерного nginx из HTTP_PORT (формат «8080» или «127.0.0.1:8080»).
+# `|| true` — если строки нет в .env.prod, grep вернёт 1 и уронит весь скрипт
+# из-за set -e/pipefail; переменная просто останется пустой, ниже дефолт :-80.
+http_port="$(grep -E '^HTTP_PORT=' .env.prod | tail -1 | cut -d= -f2 | awk -F: '{print $NF}' || true)"
 HEALTH_URL="http://127.0.0.1:${http_port:-80}/health/"
 
 mkdir -p frontend-dist backups
@@ -32,7 +34,7 @@ mkdir -p frontend-dist backups
 # и location /media/ в /etc/nginx/sites-enabled/diyas — оба должны указывать сюда же).
 # a+rwX — backend пишет туда под системным пользователем dias (не root), без этого
 # ловит permission denied при создании подпапок.
-media_dir="$(grep -E '^MEDIA_DIR=' .env.prod 2>/dev/null | tail -1 | cut -d= -f2)"
+media_dir="$(grep -E '^MEDIA_DIR=' .env.prod 2>/dev/null | tail -1 | cut -d= -f2 || true)"
 media_dir="${media_dir:-/opt/dias/backend/media}"
 mkdir -p "$media_dir"
 chmod -R a+rwX "$media_dir"
