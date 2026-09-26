@@ -9,9 +9,18 @@ RoleAccess/UserAccess системной пары после ensure_system_admin
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import ProtectedError, RestrictedError
 
 
-# Порядок: сначала зависимые (дочерние) строки.
+# Список — просто «что вообще считаем бизнес-данными» (какие таблицы чистим).
+# Порядок значения не имеет: handle() ниже сам разруливает on_delete=PROTECT/
+# RESTRICT повторными проходами, а не жёсткой последовательностью — раньше
+# список приходилось держать строго «дети перед родителями» вручную, и он
+# дважды расходился с реальной схемой (сначала без Workshop/Foam/ОТК, потом
+# без sales.Order/OrderLine — см. ProtectedError на PlasticProfile через
+# OtkAccountLine). Совсем «на автомате» через apps.get_models() не берём
+# специально: список — это ещё и explicit-документация, что именно считается
+# бизнес-данными, а не служебными Django-таблицами.
 _DELETE_MODEL_LABELS = [
     ('token_blacklist', 'BlacklistedToken'),
     ('token_blacklist', 'OutstandingToken'),
@@ -19,19 +28,58 @@ _DELETE_MODEL_LABELS = [
     ('sessions', 'Session'),
     ('activity', 'AuditOutbox'),
     ('activity', 'UserActivity'),
+
+    # --- sales ---
     ('sales', 'Shipment'),
-    ('sales', 'Sale'),
+    ('sales', 'OrderReservation'),
+    ('sales', 'ReworkRequest'),
+    ('sales', 'DefectRecord'),
+    ('sales', 'Return'),           # ReturnLine — каскадом
+    ('sales', 'Payment'),
+    ('sales', 'Sale'),             # SaleLine — каскадом
+    ('sales', 'ClientPrice'),
+    ('sales', 'ProductPrice'),
+    ('sales', 'PriceList'),
+    ('sales', 'OrderLine'),
+    ('sales', 'Order'),
+
     ('warehouse', 'WarehouseBatch'),
+
+    # --- workshop / ОТК (цех) ---
+    ('workshop', 'OtkAccountBlankAllocation'),
+    ('workshop', 'OtkAccountLine'),
+    ('workshop', 'OtkAccountSession'),
+    ('workshop', 'OtkBlankIntake'),
+    ('workshop', 'OtkBlankPool'),
+    ('workshop', 'BlankProductionRun'),
+    ('workshop', 'WorkshopPreparedState'),
+    ('workshop', 'WorkshopBlankCompositionLine'),
+    ('workshop', 'WorkshopBlank'),
+    ('otk', 'OtkCheck'),
+
+    # --- production ---
     ('production', 'RecipeRunBatchComponent'),
     ('production', 'RecipeRunBatch'),
     ('production', 'RecipeRun'),
     ('production', 'ShiftComplaint'),
     ('production', 'ShiftNote'),
+    ('production', 'ShiftPhotoReport'),   # ShiftPhotoReportImage — каскадом
     ('production', 'Shift'),
-    ('otk', 'OtkCheck'),
     ('production', 'ProductionBatch'),
     ('production', 'LineHistory'),
-    ('production', 'Order'),
+    ('production', 'Order'),              # legacy production.Order (не sales.Order)
+    ('production', 'Line'),
+
+    # --- foam (вторая линия — Пенополистирол) ---
+    ('foam', 'FoamSaleLine'),
+    ('foam', 'FoamSale'),
+    ('foam', 'FoamGpOperation'),
+    ('foam', 'FoamGpStock'),
+    ('foam', 'FoamProductionRun'),
+    ('foam', 'FoamRawLot'),
+    ('foam', 'FoamDensityGrade'),
+
+    # --- recipes / materials / chemistry ---
     ('recipes', 'RecipeComponent'),
     ('recipes', 'Recipe'),
     ('recipes', 'PlasticProfile'),
@@ -44,7 +92,7 @@ _DELETE_MODEL_LABELS = [
     ('chemistry', 'ChemistryRecipe'),
     ('materials', 'RawMaterial'),
     ('chemistry', 'ChemistryCatalog'),
-    ('production', 'Line'),
+
     ('sales', 'Client'),
 ]
 
@@ -64,20 +112,45 @@ class Command(BaseCommand):
         if not options['confirm']:
             raise CommandError('Добавьте флаг --yes для подтверждения полной очистки.')
 
+        models = []
+        for app_label, model_name in _DELETE_MODEL_LABELS:
+            try:
+                models.append(apps.get_model(app_label, model_name))
+            except LookupError:
+                self.stdout.write(self.style.WARNING(f'Пропуск (нет модели): {app_label}.{model_name}'))
+
         total = 0
         with transaction.atomic():
-            for app_label, model_name in _DELETE_MODEL_LABELS:
-                try:
-                    model = apps.get_model(app_label, model_name)
-                except LookupError:
-                    self.stdout.write(self.style.WARNING(f'Пропуск (нет модели): {app_label}.{model_name}'))
-                    continue
-                deleted, details = model.objects.all().delete()
-                total += deleted
-                if details:
-                    self.stdout.write(f'{app_label}.{model_name}: {deleted} объектов — {details}')
-                else:
-                    self.stdout.write(f'{app_label}.{model_name}: {deleted} объектов')
+            # Реальный порядок в _DELETE_MODEL_LABELS не важен: пробуем удалить
+            # всё по очереди, что не удалось из-за PROTECT/RESTRICT (ссылается
+            # ещё не удалённая строка другой модели из этого же списка) —
+            # откладываем и пробуем снова следующим проходом. Так порядок
+            # моделей в списке никогда больше не «сломает» команду — важно
+            # только чтобы модель вообще была в списке.
+            pending = models
+            while pending:
+                blocked = []
+                progressed = False
+                for model in pending:
+                    label = f'{model._meta.app_label}.{model.__name__}'
+                    try:
+                        with transaction.atomic():
+                            deleted, details = model.objects.all().delete()
+                    except (ProtectedError, RestrictedError):
+                        blocked.append(model)
+                        continue
+                    progressed = True
+                    total += deleted
+                    if details:
+                        self.stdout.write(f'{label}: {deleted} объектов — {details}')
+                    else:
+                        self.stdout.write(f'{label}: {deleted} объектов')
+                if blocked and not progressed:
+                    names = ', '.join(f'{m._meta.app_label}.{m.__name__}' for m in blocked)
+                    raise CommandError(
+                        f'Не удалось удалить (PROTECT на модель вне этого списка?): {names}'
+                    )
+                pending = blocked
 
         User = apps.get_model('accounts', 'User')
         Role = apps.get_model('accounts', 'Role')
