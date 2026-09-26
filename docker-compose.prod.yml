@@ -70,6 +70,10 @@ services:
         condition: service_healthy
     volumes:
       - static_files:/app/staticfiles
+      # Загруженные файлы (фотоотчёты по сменам и т.п., MEDIA_ROOT) — без
+      # именованного volume жили только в слое контейнера и терялись при
+      # каждом `docker compose up --build` (пересоздание контейнера).
+      - media_files:/app/media
     expose:
       - "8000"
     networks: [dias_net]
@@ -90,6 +94,7 @@ services:
       # Готовый билд SPA с сервера (scp/rsync) — без пересборки образа
       - ${FRONTEND_DIST:-./frontend-dist}:/usr/share/nginx/html:ro
       - static_files:/var/www/dias/static:ro
+      - media_files:/var/www/dias/media:ro
     networks: [dias_net]
     logging: *default-logging
 
@@ -97,6 +102,7 @@ volumes:
   pg_data:
   redis_data:
   static_files:
+  media_files:
 
 networks:
   dias_net:

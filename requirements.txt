@@ -13,3 +13,7 @@ daphne>=4.0
 reportlab>=4.0
 openpyxl>=3.1
 xhtml2pdf>=0.2.15
+# ImageField (например ShiftPhotoReportImage) требует Pillow напрямую — до сих
+# пор он ставился только транзитивно через reportlab/xhtml2pdf, зависимость
+# не была гарантирована. Явно фиксируем.
+Pillow>=10.0

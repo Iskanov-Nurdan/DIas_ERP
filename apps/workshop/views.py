@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from django.db import models
-from django.db.models import IntegerField, Prefetch, Q, Sum, Value
+from django.db.models import IntegerField, Prefetch, Sum, Value
 from django.db.models.functions import Coalesce
 from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
@@ -67,28 +66,12 @@ class PreparedBlankViewSet(
     pagination_class = WorkshopPreparedPagination
 
     def get_queryset(self):
-        dec_field = models.DecimalField(max_digits=14, decimal_places=6)
-        zero = Value(Decimal('0'), output_field=dec_field)
-        return (
-            WorkshopBlank.objects.prefetch_related('prepared_state')
-            .annotate(
-                _agg_machine_return_kg=Coalesce(
-                    Sum(
-                        'production_runs__gp_machine_remainder_kg',
-                        filter=Q(production_runs__gp_accepted_at__isnull=False),
-                    ),
-                    zero,
-                ),
-                _agg_defect_return_kg=Coalesce(
-                    Sum(
-                        'production_runs__defect_kg',
-                        filter=Q(production_runs__otk_recorded_at__isnull=False),
-                    ),
-                    zero,
-                ),
-            )
-            .order_by('name', 'pk')
-        )
+        # Раньше здесь агрегировался брак/остаток машины по полям
+        # BlankProductionRun.defect_kg / gp_machine_remainder_kg — их никто
+        # не заполняет (учёт брака идёт через OtkAccountSession →
+        # WorkshopPreparedState.defect_kg, см. serializers.WorkshopPreparedAggregateSerializer),
+        # агрегация была мёртвой и всегда давала 0.
+        return WorkshopBlank.objects.prefetch_related('prepared_state').order_by('name', 'pk')
 
     @action(detail=True, methods=['post'], url_path='add-barrel')
     def add_barrel(self, request, pk=None):

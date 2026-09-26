@@ -4,6 +4,8 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from apps.sales.models import Client
+
 
 class FoamApiAcceptanceTests(APITestCase):
     """Чек-лист приёмки из BACKEND_FOAM_REQUIREMENTS.md §8."""
@@ -14,6 +16,7 @@ class FoamApiAcceptanceTests(APITestCase):
             email='foam-admin@example.com', password='pass12345', name='Foam Admin'
         )
         self.client.force_authenticate(self.user)
+        self.crm_client = Client.objects.create(name='ТОО СтройМир', is_active=True)
 
     def _create_lot(self, bag_weight_kg='800'):
         resp = self.client.post(
@@ -142,7 +145,7 @@ class FoamApiAcceptanceTests(APITestCase):
         resp = self.client.post(
             '/api/foam/sales/',
             {
-                'client': 'ТОО СтройМир',
+                'client_id': self.crm_client.pk,
                 'sale_date': '2026-07-25',
                 'lines': [{'stock_id': stock_row['id'], 'qty': '999', 'unit_price': '10'}],
                 'paid_amount': '0',
@@ -167,7 +170,7 @@ class FoamApiAcceptanceTests(APITestCase):
         resp = self.client.post(
             '/api/foam/sales/',
             {
-                'client': 'ТОО СтройМир',
+                'client_id': self.crm_client.pk,
                 'sale_date': '2026-07-25',
                 'lines': [{'stock_id': stock_row['id'], 'qty': '5', 'unit_price': '45'}],
                 'paid_amount': '100',
@@ -189,6 +192,116 @@ class FoamApiAcceptanceTests(APITestCase):
 
         listed = self.client.get('/api/foam/sales/').data
         self.assertGreaterEqual(listed['meta']['total'], 1)
+
+    def _stock_row(self, kg='100'):
+        lot = self._create_lot(bag_weight_kg=kg)
+        self.client.post(
+            '/api/foam/production-runs/',
+            {'lot_id': lot['id'], 'input_kg': kg, 'output_format': 'granule'},
+            format='json',
+        )
+        return self.client.get('/api/foam/gp-stock/').data['items'][0]
+
+    def test_sale_discount_reduces_total_and_debt(self):
+        stock_row = self._stock_row()
+        resp = self.client.post(
+            '/api/foam/sales/',
+            {
+                'client_id': self.crm_client.pk,
+                'sale_date': '2026-07-25',
+                'lines': [{'stock_id': stock_row['id'], 'qty': '5', 'unit_price': '45'}],
+                'discount_amount': '25',
+                'paid_amount': '200',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(Decimal(resp.data['total_amount']), Decimal('200.00'))
+        self.assertEqual(Decimal(resp.data['discount_amount']), Decimal('25.00'))
+        self.assertEqual(resp.data['payment_status'], 'paid')
+
+    def test_sale_discount_over_subtotal_rejected(self):
+        stock_row = self._stock_row()
+        resp = self.client.post(
+            '/api/foam/sales/',
+            {
+                'client_id': self.crm_client.pk,
+                'sale_date': '2026-07-25',
+                'lines': [{'stock_id': stock_row['id'], 'qty': '5', 'unit_price': '45'}],
+                'discount_amount': '999',
+                'paid_amount': '0',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sale_requires_known_client_id(self):
+        stock_row = self._stock_row()
+        resp = self.client.post(
+            '/api/foam/sales/',
+            {
+                'client_id': 999999,
+                'sale_date': '2026-07-25',
+                'lines': [{'stock_id': stock_row['id'], 'qty': '1', 'unit_price': '10'}],
+                'paid_amount': '0',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sale_debt_counts_toward_shared_credit_limit(self):
+        """
+        Лимит долга общий на клиента — не отдельный по товарной линии.
+        Кассир — обычный пользователь без права обхода лимита: суперпользователь
+        (self.user) хард-блок обходит неявно (can_override_credit_limit), это
+        отдельная, уже проверенная в apps.sales логика, не то, что тестируем тут.
+        """
+        from apps.accounts.models import UserAccess
+
+        user_model = get_user_model()
+        cashier = user_model.objects.create_user(email='foam-cashier@example.com', password='pass12345', name='Кассир')
+        for key in ('sales', 'materials', 'production'):
+            UserAccess.objects.get_or_create(user=cashier, access_key=key)
+        self.client.force_authenticate(cashier)
+
+        self.crm_client.credit_limit = Decimal('100')
+        self.crm_client.credit_limit_mode = 'hard'
+        self.crm_client.save(update_fields=['credit_limit', 'credit_limit_mode'])
+
+        stock_row = self._stock_row()
+        resp = self.client.post(
+            '/api/foam/sales/',
+            {
+                'client_id': self.crm_client.pk,
+                'sale_date': '2026-07-25',
+                'lines': [{'stock_id': stock_row['id'], 'qty': '5', 'unit_price': '45'}],
+                'paid_amount': '0',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY, resp.data)
+        self.assertEqual(resp.data['code'], 'CREDIT_LIMIT_EXCEEDED')
+
+        debt_resp = self.client.get(f'/api/foam/sales/client-debt/?client_id={self.crm_client.pk}')
+        self.assertEqual(debt_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(debt_resp.data['current_debt']), Decimal('0'))
+        self.assertEqual(debt_resp.data['blocked'], False)  # additional_amount=0 в справочном вызове
+
+        # Полностью оплаченная продажа (unpaid=0) лимит не задевает.
+        ok = self.client.post(
+            '/api/foam/sales/',
+            {
+                'client_id': self.crm_client.pk,
+                'sale_date': '2026-07-25',
+                'lines': [{'stock_id': stock_row['id'], 'qty': '5', 'unit_price': '45'}],
+                'paid_amount': '225',
+            },
+            format='json',
+        )
+        self.assertEqual(ok.status_code, status.HTTP_201_CREATED, ok.data)
+
+        debt_resp2 = self.client.get(f'/api/foam/sales/client-debt/?client_id={self.crm_client.pk}')
+        self.assertEqual(Decimal(debt_resp2.data['current_debt']), Decimal('0'))
 
     def test_raw_lot_update_allows_only_name_and_supplier(self):
         lot = self._create_lot(bag_weight_kg='800')

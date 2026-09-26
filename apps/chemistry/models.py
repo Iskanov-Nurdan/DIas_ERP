@@ -140,7 +140,7 @@ class ChemistryTask(models.Model):
     name = models.CharField('Название', max_length=255)
     status = models.CharField('Статус', max_length=20, choices=STATUS_CHOICES, default='pending')
     deadline = models.DateField('Срок', null=True, blank=True)
-    chemistry = models.ForeignKey(ChemistryCatalog, on_delete=models.PROTECT, related_name='tasks')
+    chemistry = models.ForeignKey(ChemistryCatalog, on_delete=models.PROTECT, related_name='tasks', verbose_name='Химия')
     quantity = models.DecimalField('Количество', max_digits=14, decimal_places=4)
     unit = models.CharField('Единица', max_length=50, default='kg')
     created_at = models.DateTimeField(auto_now_add=True)

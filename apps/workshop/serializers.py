@@ -190,7 +190,6 @@ class WorkshopPreparedAggregateSerializer(serializers.ModelSerializer):
     barrels = serializers.SerializerMethodField()
     extra_kg = serializers.SerializerMethodField()
     total_kg = serializers.SerializerMethodField()
-    from_machine_remainder_kg = serializers.SerializerMethodField()
     from_defect_kg = serializers.SerializerMethodField()
     pure_kg = serializers.SerializerMethodField()
 
@@ -203,7 +202,6 @@ class WorkshopPreparedAggregateSerializer(serializers.ModelSerializer):
             'barrels',
             'extra_kg',
             'total_kg',
-            'from_machine_remainder_kg',
             'from_defect_kg',
             'pure_kg',
         )
@@ -212,8 +210,8 @@ class WorkshopPreparedAggregateSerializer(serializers.ModelSerializer):
         try:
             ps = obj.prepared_state
         except WorkshopPreparedState.DoesNotExist:
-            return 0, Decimal('0')
-        return ps.barrels, ps.extra_kg
+            return 0, Decimal('0'), Decimal('0')
+        return ps.barrels, ps.extra_kg, ps.defect_kg
 
     def _dec(self, value) -> Decimal:
         if value is None:
@@ -221,30 +219,30 @@ class WorkshopPreparedAggregateSerializer(serializers.ModelSerializer):
         return Decimal(str(value)).quantize(DEC_KG)
 
     def get_barrels(self, obj):
-        barrels, _ = self._prepared_or_default(obj)
+        barrels, _, _ = self._prepared_or_default(obj)
         return barrels
 
     def get_extra_kg(self, obj):
-        _, extra = self._prepared_or_default(obj)
+        _, extra, _ = self._prepared_or_default(obj)
         return extra
 
     def get_total_kg(self, obj):
         from apps.workshop.services import total_on_workshop
 
-        barrels, extra = self._prepared_or_default(obj)
+        barrels, extra, _ = self._prepared_or_default(obj)
         return total_on_workshop(barrels, extra, Decimal(str(obj.recipe_kg_per_barrel)))
 
-    def get_from_machine_remainder_kg(self, obj):
-        return self._dec(getattr(obj, '_agg_machine_return_kg', None))
-
     def get_from_defect_kg(self, obj):
-        return self._dec(getattr(obj, '_agg_defect_return_kg', None))
+        _, _, defect = self._prepared_or_default(obj)
+        return self._dec(defect)
 
     def get_pure_kg(self, obj):
+        # «Остаток машины» намеренно не вычитается: такой возврат нигде не
+        # реализован (ни одна операция его не пишет), поэтому он всегда 0 и
+        # плитка была убрана с фронта — здесь его тоже никогда не было бы видно.
         total = Decimal(str(self.get_total_kg(obj)))
-        fm = self.get_from_machine_remainder_kg(obj)
         fd = self.get_from_defect_kg(obj)
-        raw = total - fm - fd
+        raw = total - fd
         if raw < 0:
             return Decimal('0')
         return raw.quantize(DEC_KG)

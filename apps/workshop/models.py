@@ -76,6 +76,13 @@ class WorkshopPreparedState(models.Model):
     extra_kg = models.DecimalField(
         'Дробный остаток, кг', max_digits=14, decimal_places=6, default=0
     )
+    # Сколько из текущей массы на цеху (barrels*вес_бочки + extra_kg) — брак,
+    # возвращённый через ОТК. Заготовка на цеху — это одна перемешанная масса,
+    # не помеченные партии, поэтому при каждом списании (deduct_blank_from_workshop)
+    # эта доля уменьшается пропорционально: см. apps/workshop/services.py.
+    defect_kg = models.DecimalField(
+        'Брак в остатке, кг', max_digits=14, decimal_places=6, default=0
+    )
 
     class Meta:
         db_table = 'workshop_prepared_state'

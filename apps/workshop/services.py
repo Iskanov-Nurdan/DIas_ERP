@@ -55,16 +55,33 @@ def deduct_blank_from_workshop(blank: WorkshopBlank, use_kg: Decimal) -> Worksho
     new_barrels, new_extra = split_total_to_barrels_and_extra(new_total, barrel_kg)
     prepared.barrels = new_barrels
     prepared.extra_kg = new_extra
-    prepared.save(update_fields=['barrels', 'extra_kg'])
+    # Заготовка на цеху — одна перемешанная масса, а не помеченные партии:
+    # при списании доля брака в остатке уменьшается пропорционально тому,
+    # какую часть от всей массы забрали (тот же принцип, что при усреднении
+    # в перемешанной бочке). Пример: было 10 кг, из них 2 кг брака (20%),
+    # списали 4 кг → из них «ушло» 4*20% = 0.8 кг брака, в остатке осталось
+    # 2 - 0.8 = 1.2 кг брака из 6 кг.
+    prepared.defect_kg = _q_kg(prepared.defect_kg * new_total / cur_total) if cur_total > 0 else Decimal('0')
+    if prepared.defect_kg > new_total:
+        prepared.defect_kg = new_total
+    prepared.save(update_fields=['barrels', 'extra_kg', 'defect_kg'])
     return prepared
 
 
 @transaction.atomic
-def append_kg_to_workshop_prepared(blank: WorkshopBlank, kg: Decimal) -> WorkshopPreparedState:
-    """Добавить кг к остатку заготовки на цеху (остаток машины после ГП, возврат брака ОТК и т.д.)."""
+def append_kg_to_workshop_prepared(
+    blank: WorkshopBlank, kg: Decimal, *, defect_kg: Decimal = Decimal('0'),
+) -> WorkshopPreparedState:
+    """
+    Добавить кг к остатку заготовки на цеху (остаток машины после ГП, возврат
+    брака ОТК и т.д.). defect_kg — какая часть добавляемых kg является браком
+    (должна быть <= kg); увеличивает счётчик WorkshopPreparedState.defect_kg,
+    который используется для плитки «Брак» на карточке цеха.
+    """
     kg = _q_kg(Decimal(str(kg)))
     if kg <= 0:
         return get_or_create_prepared(blank)
+    defect_kg = min(_q_kg(Decimal(str(defect_kg))), kg)
     barrel_kg = _q_kg(Decimal(str(blank.recipe_kg_per_barrel)))
     if barrel_kg <= 0:
         raise WorkshopConflict(detail='В справочнике заготовки задан некорректный вес бочки.')
@@ -75,7 +92,9 @@ def append_kg_to_workshop_prepared(blank: WorkshopBlank, kg: Decimal) -> Worksho
     new_barrels, new_extra = split_total_to_barrels_and_extra(new_total, barrel_kg)
     prepared.barrels = new_barrels
     prepared.extra_kg = new_extra
-    prepared.save(update_fields=['barrels', 'extra_kg'])
+    if defect_kg > 0:
+        prepared.defect_kg = _q_kg(prepared.defect_kg + defect_kg)
+    prepared.save(update_fields=['barrels', 'extra_kg', 'defect_kg'])
     return prepared
 
 

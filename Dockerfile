@@ -29,7 +29,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=dias:dias . /app
-RUN install -d -o dias -g dias /app/staticfiles \
+RUN install -d -o dias -g dias /app/staticfiles /app/media \
  && chmod +x /app/docker/entrypoint.sh
 
 USER dias

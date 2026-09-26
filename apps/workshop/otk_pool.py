@@ -259,7 +259,7 @@ def account_otk_v2(
 
     if defect_kg_val > 0 and defect_blank is not None:
         blank_locked = WorkshopBlank.objects.select_for_update().get(pk=defect_blank.pk)
-        append_kg_to_workshop_prepared(blank_locked, defect_kg_val)
+        append_kg_to_workshop_prepared(blank_locked, defect_kg_val, defect_kg=defect_kg_val)
 
     staff_ids = [operator_id, chemist_id, *[u.pk for u in packer_users]]
     link_otk_session_to_shift(session, shift_period=shift_period, user_ids=staff_ids)

@@ -199,13 +199,27 @@ def _payment_status(total_amount: Decimal, paid_amount: Decimal) -> str:
 
 @transaction.atomic
 def create_sale(
-    *, client: str, sale_date, lines_data: list[dict], paid_amount: Decimal
+    *,
+    client_id: int,
+    sale_date,
+    lines_data: list[dict],
+    paid_amount: Decimal,
+    discount_amount: Decimal = Decimal('0'),
+    user=None,
+    force_credit_override: bool = False,
 ) -> FoamSale:
+    from apps.sales.credit_check import CreditLimitBlocked, enforce_credit_limit
+    from apps.sales.models import Client
+
     if not lines_data:
         raise ValidationError({'lines': 'Нужна минимум одна строка'})
 
+    client_account = Client.objects.filter(pk=client_id, is_active=True).first()
+    if client_account is None:
+        raise ValidationError({'client_id': 'Клиент не найден или неактивен.'})
+
     resolved_lines: list[tuple[FoamGpStock, Decimal, Decimal]] = []
-    total_amount = Decimal('0')
+    subtotal = Decimal('0')
     for line in lines_data:
         stock_id = line.get('stock_id')
         qty = _d(line.get('qty'))
@@ -229,17 +243,40 @@ def create_sale(
                 }
             )
         resolved_lines.append((stock, qty, unit_price))
-        total_amount += qty * unit_price
+        subtotal += qty * unit_price
 
-    total_amount = total_amount.quantize(Decimal('0.01'))
+    subtotal = subtotal.quantize(Decimal('0.01'))
+    discount_amount = _d(discount_amount)
+    if discount_amount < 0 or discount_amount > subtotal:
+        raise ValidationError({'discount_amount': 'Скидка должна быть в диапазоне 0..сумма чека.'})
+    total_amount = (subtotal - discount_amount).quantize(Decimal('0.01'))
+
     paid_amount = _d(paid_amount)
     if paid_amount < 0 or paid_amount > total_amount:
         raise ValidationError({'paid_amount': 'Должно быть в диапазоне 0..total_amount'})
 
+    # Лимит долга — общий на клиента, не отдельный по товарной линии: если
+    # клиент уже набрал долг на профиле, покупка пенопласта в долг тоже
+    # должна на это опираться (compute_client_debt суммирует обе линии).
+    unpaid = max(Decimal('0'), total_amount - paid_amount)
+    try:
+        enforce_credit_limit(client_account, unpaid, user=user, force_override=force_credit_override)
+    except CreditLimitBlocked as exc:
+        raise ValidationError(
+            {
+                'code': 'CREDIT_LIMIT_EXCEEDED',
+                'error': str(exc),
+                'detail': str(exc),
+                'field': 'credit_limit',
+            }
+        )
+
     sale = FoamSale.objects.create(
-        client=client,
+        client=client_account.name,
+        client_account=client_account,
         sale_date=sale_date,
         total_amount=total_amount,
+        discount_amount=discount_amount,
         paid_amount=paid_amount,
         payment_status=_payment_status(total_amount, paid_amount),
     )

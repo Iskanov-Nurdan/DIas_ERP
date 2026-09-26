@@ -15,7 +15,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 from typing import Optional
 
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.db.models.functions import Coalesce
 
 
@@ -34,9 +34,15 @@ class CreditCheckResult:
 
 def compute_client_debt(client) -> Decimal:
     """
-    Текущий долг клиента.
-    Долг = сумма выручки (все не-черновик продажи) минус чистые поступления.
-    Предоплата сокращает долг. Возврат денег сокращает поступления.
+    Текущий долг клиента по ОБЕИМ товарным линиям — лимит долга общий на
+    клиента, а не отдельный по линии «Пластиковый профиль»/«Пенополистирол».
+
+    Профиль: сумма выручки (все не-черновик продажи) минус чистые
+    поступления (Payment). Предоплата сокращает долг, возврат денег
+    сокращает поступления.
+    Foam: своей модели платежей нет — долг по продаже это
+    total_amount − paid_amount (FoamSale.debt_amount), total_amount уже
+    посчитан за вычетом скидки на чек (discount_amount).
     """
     from .models import Payment, Sale
 
@@ -60,7 +66,15 @@ def compute_client_debt(client) -> Decimal:
 
     net_paid = total_incoming - total_refunded
     debt = total_revenue - net_paid
-    return max(Decimal('0'), debt)
+
+    from apps.foam.models import FoamSale
+
+    foam_debt = (
+        FoamSale.objects.filter(client_account=client)
+        .aggregate(t=Coalesce(Sum(F('total_amount') - F('paid_amount')), Decimal('0')))['t']
+    ) or Decimal('0')
+
+    return max(Decimal('0'), debt + foam_debt)
 
 
 def check_credit_limit(client, additional_amount: Decimal = Decimal('0')) -> CreditCheckResult:

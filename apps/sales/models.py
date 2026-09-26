@@ -348,6 +348,7 @@ class Sale(models.Model):
     )
     client = models.ForeignKey(
         Client, on_delete=models.PROTECT, related_name='sales', null=True, blank=True,
+        verbose_name='Клиент',
     )
     warehouse_batch = models.ForeignKey(
         'warehouse.WarehouseBatch',
@@ -565,6 +566,7 @@ class Payment(models.Model):
     date = models.DateField('Дата')
     client = models.ForeignKey(
         Client, on_delete=models.PROTECT, related_name='payments', null=True, blank=True,
+        verbose_name='Клиент',
     )
     linked_order = models.ForeignKey(
         Order,

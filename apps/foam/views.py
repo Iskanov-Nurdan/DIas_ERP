@@ -348,13 +348,19 @@ class FoamSaleViewSet(
         data = ser.validated_data
         try:
             sale = services.create_sale(
-                client=data['client'],
+                client_id=data['client_id'],
                 sale_date=data['sale_date'],
                 lines_data=data['lines'],
                 paid_amount=data['paid_amount'],
+                discount_amount=data.get('discount_amount') or 0,
+                user=request.user,
+                force_credit_override=data.get('force_credit_override', False),
             )
         except DRFValidationError as exc:
-            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+            detail = exc.detail
+            code = detail.get('code') if isinstance(detail, dict) else None
+            http_status = status.HTTP_422_UNPROCESSABLE_ENTITY if code == 'CREDIT_LIMIT_EXCEEDED' else status.HTTP_400_BAD_REQUEST
+            return Response(detail, status=http_status)
         schedule_entity_audit(
             user=request.user,
             request=request,
@@ -366,3 +372,22 @@ class FoamSaleViewSet(
             payload_extra={'endpoint': 'POST /api/foam/sales/'},
         )
         return Response(FoamSaleReadSerializer(sale).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], url_path='client-debt')
+    def client_debt(self, request):
+        """
+        GET /api/foam/sales/client-debt/?client_id= — долг/лимит клиента для
+        баннера в кассе Foam. Долг общий на обе товарные линии — см.
+        apps.sales.credit_check.compute_client_debt.
+        """
+        from apps.sales.credit_check import check_credit_limit, credit_check_result_to_dict
+        from apps.sales.models import Client
+
+        client_id = request.query_params.get('client_id')
+        if not client_id:
+            return _err('client_id_required', 'Укажите client_id.')
+        client_obj = Client.objects.filter(pk=client_id).first()
+        if client_obj is None:
+            return _err('not_found', 'Клиент не найден.', http_status=status.HTTP_404_NOT_FOUND)
+        result = check_credit_limit(client_obj)
+        return Response(credit_check_result_to_dict(result))

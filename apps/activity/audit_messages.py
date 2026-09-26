@@ -8,6 +8,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Dict, Optional, Type
 
+from django.apps import apps as django_apps
 from django.db import models
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -297,10 +298,36 @@ AUDIT_FIELD_LABELS: Dict[str, Dict[str, str]] = {
 }
 
 
+def _model_field_labels(entity_type: str) -> Dict[str, str]:
+    """
+    Русские подписи прямо из модели: у полей почти везде уже задан
+    человекочитаемый verbose_name (см. models.py по всему проекту), но
+    журнал действий вместо этого держал свой отдельный словарь
+    (AUDIT_FIELD_LABELS) — неполный и требующий ручного пополнения на
+    каждую новую модель/поле. Теперь это источник по умолчанию, а
+    AUDIT_FIELD_LABELS — только точечные переопределения поверх него
+    (см. field_labels_for_entity_type).
+    """
+    try:
+        app_label, model_name = entity_type.split('.', 1)
+        model_cls = django_apps.get_model(app_label, model_name)
+    except (LookupError, ValueError):
+        return {}
+    labels: Dict[str, str] = {}
+    for field in model_cls._meta.fields:
+        label = str(field.verbose_name)
+        if not label or label == field.name:
+            continue
+        labels[field.name] = label[0].upper() + label[1:]
+    return labels
+
+
 def field_labels_for_entity_type(entity_type: str) -> Dict[str, str]:
     if not entity_type:
         return {}
-    return dict(AUDIT_FIELD_LABELS.get(entity_type, {}))
+    labels = _model_field_labels(entity_type)
+    labels.update(AUDIT_FIELD_LABELS.get(entity_type, {}))
+    return labels
 
 
 def prune_audit_snapshot(snap: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

@@ -66,16 +66,18 @@ class FoamRawLot(models.Model):
 class FoamProductionRun(models.Model):
     """Выпуск производства: списывает input_kg с лота, пополняет склад ГП."""
 
-    lot = models.ForeignKey(FoamRawLot, on_delete=models.PROTECT, related_name='production_runs')
+    lot = models.ForeignKey(FoamRawLot, on_delete=models.PROTECT, related_name='production_runs', verbose_name='Лот сырья')
     grade = models.ForeignKey(
-        FoamDensityGrade, on_delete=models.PROTECT, related_name='production_runs', null=True, blank=True
+        FoamDensityGrade, on_delete=models.PROTECT, related_name='production_runs', null=True, blank=True,
+        verbose_name='Плотность (грейд)',
     )
     input_kg = models.DecimalField('Расход сырья, кг', max_digits=12, decimal_places=1)
     output_format = models.CharField('Формат выхода', max_length=20, choices=OUTPUT_FORMAT_CHOICES)
     output_qty = models.DecimalField('Выход', max_digits=12, decimal_places=1)
     produced_at = models.DateTimeField('Дата выпуска', auto_now_add=True)
     operator = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='foam_production_runs'
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='foam_production_runs',
+        verbose_name='Оператор',
     )
 
     class Meta:
@@ -93,7 +95,8 @@ class FoamGpStock(models.Model):
 
     output_format = models.CharField('Формат', max_length=20, choices=OUTPUT_FORMAT_CHOICES)
     grade = models.ForeignKey(
-        FoamDensityGrade, on_delete=models.PROTECT, related_name='gp_stock_rows', null=True, blank=True
+        FoamDensityGrade, on_delete=models.PROTECT, related_name='gp_stock_rows', null=True, blank=True,
+        verbose_name='Плотность (грейд)',
     )
     thickness_cm = models.PositiveSmallIntegerField('Толщина, см', null=True, blank=True)
     qty = models.DecimalField('Остаток', max_digits=12, decimal_places=1, default=0)
@@ -136,11 +139,27 @@ class FoamGpOperation(models.Model):
 
 
 class FoamSale(models.Model):
-    """Продажа готовой продукции (клиент — свободный текст, без общего справочника clients/)."""
+    """
+    Продажа готовой продукции. `client` — денормализованное имя (для старых
+    записей и мест, которые просто печатают строку); `client_account` —
+    ссылка на общий справочник клиентов (apps.sales.Client), нужна, чтобы
+    считать долг/лимит клиента заодно с линией «Пластиковый профиль»
+    (см. apps.sales.credit_check.compute_client_debt) — лимит долга общий
+    на клиента, а не отдельный по товарной линии.
+    """
 
     client = models.CharField('Клиент', max_length=255)
+    client_account = models.ForeignKey(
+        'sales.Client',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='foam_sales',
+        verbose_name='Клиент (справочник)',
+    )
     sale_date = models.DateField('Дата продажи')
     total_amount = models.DecimalField('Сумма', max_digits=14, decimal_places=2, default=0)
+    discount_amount = models.DecimalField('Скидка на чек', max_digits=14, decimal_places=2, default=0)
     paid_amount = models.DecimalField('Оплачено', max_digits=14, decimal_places=2, default=0)
     payment_status = models.CharField('Статус оплаты', max_length=20, choices=PAYMENT_STATUS_CHOICES)
     created_at = models.DateTimeField('Создано', auto_now_add=True)

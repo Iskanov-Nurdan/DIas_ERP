@@ -49,6 +49,7 @@ class LineHistory(models.Model):
         null=True,
         blank=True,
         related_name='history',
+        verbose_name='Линия',
     )
     line_name_snapshot = models.CharField(
         'Название линии (снимок)',
@@ -60,7 +61,7 @@ class LineHistory(models.Model):
     action = models.CharField('Действие', max_length=20, choices=ACTION_CHOICES)
     date = models.DateField('Дата')
     time = models.TimeField('Время')
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='line_actions')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='line_actions', verbose_name='Сотрудник')
     height = models.DecimalField('Высота', max_digits=10, decimal_places=2, null=True, blank=True)
     width = models.DecimalField('Ширина', max_digits=10, decimal_places=2, null=True, blank=True)
     angle_deg = models.DecimalField('Угол, °', max_digits=8, decimal_places=2, null=True, blank=True)
@@ -177,6 +178,7 @@ class ProductionBatch(models.Model):
         related_name='batches',
         null=True,
         blank=True,
+        verbose_name='Заявка на производство',
     )
     client_order = models.ForeignKey(
         'sales.Order',
@@ -208,6 +210,7 @@ class ProductionBatch(models.Model):
         related_name='production_batches',
         null=True,
         blank=True,
+        verbose_name='Рецепт',
     )
     line = models.ForeignKey(
         Line,
@@ -215,6 +218,7 @@ class ProductionBatch(models.Model):
         related_name='production_batches',
         null=True,
         blank=True,
+        verbose_name='Линия',
     )
     shift = models.ForeignKey(
         'production.Shift',
@@ -234,7 +238,7 @@ class ProductionBatch(models.Model):
         decimal_places=4,
         default=0,
     )
-    operator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='production_batches')
+    operator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='production_batches', verbose_name='Оператор')
     date = models.DateField('Дата')
     produced_at = models.DateTimeField('Произведено', null=True, blank=True)
     comment = models.TextField('Комментарий', blank=True)
@@ -456,6 +460,7 @@ class RecipeRun(models.Model):
         null=True,
         blank=True,
         related_name='recipe_runs',
+        verbose_name='Рецепт',
     )
     recipe_name_snapshot = models.CharField(
         'Наименование рецепта (снимок)',
@@ -470,6 +475,7 @@ class RecipeRun(models.Model):
         null=True,
         blank=True,
         related_name='recipe_runs',
+        verbose_name='Линия',
     )
     line_name_snapshot = models.CharField(
         'Название линии (снимок)',

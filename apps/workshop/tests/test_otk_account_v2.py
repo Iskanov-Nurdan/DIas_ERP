@@ -84,6 +84,44 @@ class OtkAccountV2ApiTests(APITestCase):
         pool = OtkBlankPool.objects.get(blank_id=self.blank_a.pk)
         self.assertLess(pool.remaining_kg, Decimal('100'))
 
+        # Брак (5 кг) вернулся в остаток цеха и виден в WorkshopPreparedState.defect_kg —
+        # источник плитки «Брак» на карточке цеха (см. WorkshopPreparedAggregateSerializer).
+        prepared = WorkshopPreparedState.objects.get(blank_id=self.blank_a.pk)
+        self.assertEqual(prepared.defect_kg, Decimal('5'))
+
+    def test_defect_share_shrinks_proportionally_on_next_deduction(self):
+        """
+        Заготовка на цеху — одна перемешанная масса: списание после возврата
+        брака должно уменьшать defect_kg пропорционально, а не оставлять его
+        как было (иначе после нескольких циклов «Брак» накопится больше,
+        чем реально осталось в остатке).
+        """
+        from apps.workshop.models import OtkBlankPool
+        from apps.workshop.services import deduct_blank_from_workshop
+
+        # Пул ОТК (списание при учёте профилей) — отдельная сущность от
+        # остатка на цеху (WorkshopPreparedState), их не смешиваем в тесте.
+        OtkBlankPool.objects.create(blank=self.blank_a, remaining_kg=Decimal('100'))
+        WorkshopPreparedState.objects.filter(blank=self.blank_a).update(barrels=0, extra_kg=Decimal('10'))
+        self.client.post(
+            '/api/workshop/otk-account/',
+            {
+                'lines': [{'profile_id': self.profile_a.pk, 'pieces': 1}],
+                'defect_kg': '2',
+                'shift_period': 'day',
+            },
+            format='json',
+        )
+        prepared = WorkshopPreparedState.objects.get(blank_id=self.blank_a.pk)
+        self.assertEqual(prepared.extra_kg, Decimal('12'))
+        self.assertEqual(prepared.defect_kg, Decimal('2'))  # 2 из 12 кг (~16.7%) — брак
+
+        deduct_blank_from_workshop(self.blank_a, Decimal('4'))  # списали 4 кг из 12
+        prepared.refresh_from_db()
+        self.assertEqual(prepared.extra_kg, Decimal('8'))
+        # 2 * (8/12) = 1.333333 — брак уменьшился на ту же долю, что и весь остаток.
+        self.assertEqual(prepared.defect_kg, Decimal('1.333333'))
+
     def test_v2_multi_blank(self):
         self._produce(self.blank_a.pk)
         self._produce(self.blank_b.pk, kg='50')
@@ -136,6 +174,10 @@ class OtkAccountV2ApiTests(APITestCase):
         session = OtkAccountSession.objects.get(pk=resp.data['id'])
         self.assertEqual(session.defect_blank_id, self.blank_b.pk)
         self.assertEqual(len(resp.data['blank_breakdown']), 2)
+
+        # Брак ушёл в заготовку B (defect_blank_id), а не в A, где реально проверяли профиль.
+        self.assertEqual(WorkshopPreparedState.objects.get(blank_id=self.blank_b.pk).defect_kg, Decimal('10'))
+        self.assertEqual(WorkshopPreparedState.objects.get(blank_id=self.blank_a.pk).defect_kg, Decimal('0'))
 
     def test_accounting_list_has_shift_and_packers(self):
         self._produce(self.blank_a.pk)

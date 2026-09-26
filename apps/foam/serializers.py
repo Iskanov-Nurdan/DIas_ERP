@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -203,7 +205,9 @@ class FoamSaleLineReadSerializer(serializers.ModelSerializer):
 class FoamSaleReadSerializer(serializers.ModelSerializer):
     lines = FoamSaleLineReadSerializer(many=True, read_only=True)
     date = serializers.SerializerMethodField()
+    client_id = serializers.IntegerField(source='client_account_id', read_only=True)
     total_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True, coerce_to_string=True)
+    discount_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True, coerce_to_string=True)
     paid_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True, coerce_to_string=True)
     debt_amount = serializers.SerializerMethodField()
 
@@ -212,9 +216,11 @@ class FoamSaleReadSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'client',
+            'client_id',
             'date',
             'lines',
             'total_amount',
+            'discount_amount',
             'paid_amount',
             'debt_amount',
             'payment_status',
@@ -238,10 +244,15 @@ class FoamSaleLineWriteSerializer(serializers.Serializer):
 
 
 class FoamSaleCreateSerializer(serializers.Serializer):
-    client = serializers.CharField(required=True, allow_blank=False)
+    # client_id — обязателен: клиент выбирается из общего справочника (тот
+    # же Select, что и в кассе профиля), не вводится текстом — иначе не с
+    # чем сверять долг/лимит (см. apps.sales.credit_check.compute_client_debt).
+    client_id = serializers.IntegerField(required=True)
     sale_date = serializers.DateField(required=True)
     lines = FoamSaleLineWriteSerializer(many=True, required=True)
     paid_amount = serializers.DecimalField(max_digits=14, decimal_places=2, required=True)
+    discount_amount = serializers.DecimalField(max_digits=14, decimal_places=2, required=False, default=Decimal('0'))
+    force_credit_override = serializers.BooleanField(required=False, default=False)
 
     def validate_lines(self, value):
         if not value:
@@ -249,6 +260,11 @@ class FoamSaleCreateSerializer(serializers.Serializer):
         return value
 
     def validate_paid_amount(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError('Должно быть ≥ 0')
+        return value
+
+    def validate_discount_amount(self, value):
         if value is None or value < 0:
             raise serializers.ValidationError('Должно быть ≥ 0')
         return value

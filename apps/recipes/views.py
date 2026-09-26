@@ -31,7 +31,12 @@ class PlasticProfileViewSet(ActivityLoggingMixin, viewsets.ModelViewSet):
     queryset = PlasticProfile.objects.all()
     serializer_class = PlasticProfileSerializer
     permission_classes = [IsAdminOrHasAccess]
-    required_access_key = 'recipes'
+    # 'materials', не 'recipes': во фронте Dias Line это вкладка «Профили»
+    # внутри страницы «Заготовка» (доступ туда — по ключу materials), а
+    # ключ 'recipes' там негде выдать — модалка доступов его не показывает
+    # (страница «Рецепты» на этот фронт ещё не мигрирована). RecipeViewSet
+    # ниже сознательно оставлен на 'recipes' — тот раздел не используется.
+    required_access_key = 'materials'
     activity_section = 'Рецепты'
     activity_label = 'профиль'
     activity_entity_model = PlasticProfile
