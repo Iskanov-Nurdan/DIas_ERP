@@ -28,6 +28,15 @@ HEALTH_URL="http://127.0.0.1:${http_port:-80}/health/"
 mkdir -p frontend-dist backups
 [ -f frontend-dist/index.html ] || log "frontend-dist/ пустая — залейте билд фронта (Dias_Front/deploy.sh)"
 
+# MEDIA_DIR — путь хоста для загруженных файлов (см. MEDIA_DIR в docker-compose.prod.yml
+# и location /media/ в /etc/nginx/sites-enabled/diyas — оба должны указывать сюда же).
+# a+rwX — backend пишет туда под системным пользователем dias (не root), без этого
+# ловит permission denied при создании подпапок.
+media_dir="$(grep -E '^MEDIA_DIR=' .env.prod 2>/dev/null | tail -1 | cut -d= -f2)"
+media_dir="${media_dir:-/opt/dias/backend/media}"
+mkdir -p "$media_dir"
+chmod -R a+rwX "$media_dir"
+
 # ——— Бэкап БД (если контейнер БД уже работает) ———
 if $COMPOSE ps --status running --services 2>/dev/null | grep -qx db; then
     backup="backups/dias-$(date +%Y%m%d-%H%M%S).sql.gz"
