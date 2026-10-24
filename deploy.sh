@@ -71,6 +71,9 @@ for i in $(seq 1 30); do
         $COMPOSE ps
         log "готово: $(curl -fsS "$HEALTH_URL")"
         docker image prune -f >/dev/null
+        # кэш сборки иначе растёт на каждом деплое (на 14 ГБ диске набегало 2+ ГБ);
+        # свежий оставляем, чтобы следующая сборка шла быстро
+        docker builder prune -f --filter until=24h >/dev/null
         exit 0
     fi
     sleep 3
