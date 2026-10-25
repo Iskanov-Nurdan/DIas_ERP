@@ -28,6 +28,10 @@ http_port="$(grep -E '^HTTP_PORT=' .env.prod | tail -1 | cut -d= -f2 | awk -F: '
 HEALTH_URL="http://127.0.0.1:${http_port:-80}/health/"
 
 mkdir -p frontend-dist backups
+
+# Том БД объявлен в compose как external (защита от `docker compose down -v`) —
+# compose сам его больше не создаёт, на чистом сервере создаём вручную.
+docker volume inspect dias_pg_data >/dev/null 2>&1 || docker volume create dias_pg_data >/dev/null
 [ -f frontend-dist/index.html ] || log "frontend-dist/ пустая — залейте билд фронта (Dias_Front/deploy.sh)"
 
 # MEDIA_DIR — путь хоста для загруженных файлов (см. MEDIA_DIR в docker-compose.prod.yml
@@ -41,11 +45,8 @@ chmod -R a+rwX "$media_dir"
 
 # ——— Бэкап БД (если контейнер БД уже работает) ———
 if $COMPOSE ps --status running --services 2>/dev/null | grep -qx db; then
-    backup="backups/dias-$(date +%Y%m%d-%H%M%S).sql.gz"
-    log "бэкап БД → $backup"
-    $COMPOSE exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | gzip > "$backup"
-    # храним последние 10 бэкапов
-    ls -1t backups/dias-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
+    # Проверяет дамп и ротирует старые; упадёт — деплой дальше не пойдёт.
+    ./scripts/backup.sh || fail "бэкап не получился — деплой остановлен, база не тронута"
 else
     log "БД ещё не запущена — бэкап пропущен (первый деплой)"
 fi

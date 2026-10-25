@@ -2,7 +2,7 @@
 # Использование: make up | make logs | make migrate | make backup
 COMPOSE := docker compose --env-file .env.prod -f docker-compose.prod.yml
 
-.PHONY: build up down restart logs ps migrate seed superuser shell dbshell collectstatic backup restore prune
+.PHONY: build up down restart logs ps migrate seed superuser shell dbshell collectstatic backup restore restore-test cron-install prune
 
 build:          ## Собрать образы
 	$(COMPOSE) build --pull
@@ -41,11 +41,20 @@ shell:          ## Django shell
 dbshell:        ## psql внутри контейнера БД
 	$(COMPOSE) exec db sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
 
-backup:         ## Дамп БД в ./backups/dias-<дата>.sql.gz
-	@mkdir -p backups
-	$(COMPOSE) exec -T db sh -c 'pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"' \
-		| gzip > backups/dias-$$(date +%Y%m%d-%H%M%S).sql.gz
-	@ls -lh backups | tail -1
+backup:         ## Дамп БД + media в ./backups/ (с проверкой и ротацией)
+	./scripts/backup.sh
+
+restore-test:   ## Проверить, что последний бэкап восстанавливается (боевую БД не трогает)
+	./scripts/restore-test.sh $(FILE)
+
+cron-install:   ## Ночной бэкап в 03:00 (/etc/cron.d/dias-backup, лог — backups/cron.log)
+	@printf '%s\n' \
+		'# DIAS: ночной бэкап БД + media (ставится make cron-install)' \
+		'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+		'0 3 * * * root cd $(CURDIR) && flock -n /tmp/dias-backup.lock ./scripts/backup.sh >> backups/cron.log 2>&1' \
+		> /etc/cron.d/dias-backup
+	@chmod 644 /etc/cron.d/dias-backup
+	@cat /etc/cron.d/dias-backup
 
 restore:        ## Восстановить: make restore FILE=backups/dias-....sql.gz
 	@test -n "$(FILE)" || (echo "Укажите FILE=backups/....sql.gz" && exit 1)

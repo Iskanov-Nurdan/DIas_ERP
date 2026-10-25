@@ -105,7 +105,11 @@ services:
     logging: *default-logging
 
 volumes:
+  # external — `docker compose down -v` не удаляет том с базой (остальные удалит).
+  # Создаётся в deploy.sh, если его нет. Имя — то, под которым том уже живёт на сервере.
   pg_data:
+    external: true
+    name: dias_pg_data
   redis_data:
   static_files:
 
