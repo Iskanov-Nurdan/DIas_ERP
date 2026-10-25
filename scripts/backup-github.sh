@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COMPOSE="docker compose --env-file .env.prod -f docker-compose.prod.yml"
-REPO_URL="${BACKUP_REPO_URL:-git@github.com:Iskanov-Nurdan/DIas_backups.git}"
+REPO_URL="${BACKUP_REPO_URL:-git@github.com:Iskanov-Nurdan/becap_Dias.git}"
 REPO_DIR="${BACKUP_REPO_DIR:-/root/dias-backups-repo}"
 KEY="${BACKUP_REPO_KEY:-/root/.ssh/dias_backups_deploy}"
 export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"

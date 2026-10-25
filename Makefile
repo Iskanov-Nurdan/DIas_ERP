@@ -47,7 +47,7 @@ backup:         ## Дамп БД + media в ./backups/ (с проверкой и
 restore-test:   ## Проверить, что последний бэкап восстанавливается (боевую БД не трогает)
 	./scripts/restore-test.sh $(FILE)
 
-backup-github:  ## Копия БД + media в приватный GitHub-репозиторий DIas_backups
+backup-github:  ## Копия БД + media в приватный GitHub-репозиторий becap_Dias
 	./scripts/backup-github.sh
 
 cron-install:   ## Ночной бэкап в 03:00 + копия на GitHub (/etc/cron.d/dias-backup, лог — backups/cron.log)
