@@ -52,7 +52,7 @@ cd /root/DIas_ERP
 |---|---|---|
 | сервер, `backups/` | каждую ночь в 03:00 UTC и перед каждым `deploy.sh` | `dias-*.sql.gz` (30 последних), `media-*.tar.gz` (14) |
 | GitHub, приватный `Iskanov-Nurdan/becap_Dias` | каждую ночь сразу после серверного | `db/dias.sql` + `media/`; один коммит = одна ночь |
-| локально, `~/dias-backups` | `scripts/backup-pull.sh` (на машине разработчика — systemd-таймер) | копии файлов из `backups/` |
+| локально, `~/dias-backups` | каждый день в 04:00 UTC — systemd-таймер на машине разработчика (`scripts/install-backup-timer.sh`, после переустановки системы — запустить заново) | копии файлов из `backups/` |
 
 ```bash
 make backup          # бэкап вручную (с проверкой целостности)
