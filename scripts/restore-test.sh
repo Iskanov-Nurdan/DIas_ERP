@@ -26,7 +26,7 @@ done
 log "заливка $file"
 # Роль владельца из боевой БД во временном postgres не существует — без неё дамп ругается на OWNER TO.
 gunzip -c "$file" | docker exec -i "$name" psql -q -U postgres -d restore_test \
-    -v ON_ERROR_STOP=0 --set=client_min_messages=warning 2>&1 | grep -v 'role .* does not exist' || true
+    -v ON_ERROR_STOP=0 --set=client_min_messages=warning 2>&1 >/dev/null | grep -v 'role .* does not exist' || true
 
 tables="$(docker exec "$name" psql -tA -U postgres -d restore_test -c \
     "select count(*) from information_schema.tables where table_schema='public'")"

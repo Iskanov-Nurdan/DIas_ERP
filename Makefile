@@ -2,7 +2,7 @@
 # Использование: make up | make logs | make migrate | make backup
 COMPOSE := docker compose --env-file .env.prod -f docker-compose.prod.yml
 
-.PHONY: build up down restart logs ps migrate seed superuser shell dbshell collectstatic backup restore restore-test cron-install prune
+.PHONY: build up down restart logs ps migrate seed superuser shell dbshell collectstatic backup restore restore-test backup-github cron-install prune
 
 build:          ## Собрать образы
 	$(COMPOSE) build --pull
@@ -47,11 +47,14 @@ backup:         ## Дамп БД + media в ./backups/ (с проверкой и
 restore-test:   ## Проверить, что последний бэкап восстанавливается (боевую БД не трогает)
 	./scripts/restore-test.sh $(FILE)
 
-cron-install:   ## Ночной бэкап в 03:00 (/etc/cron.d/dias-backup, лог — backups/cron.log)
+backup-github:  ## Копия БД + media в приватный GitHub-репозиторий DIas_backups
+	./scripts/backup-github.sh
+
+cron-install:   ## Ночной бэкап в 03:00 + копия на GitHub (/etc/cron.d/dias-backup, лог — backups/cron.log)
 	@printf '%s\n' \
-		'# DIAS: ночной бэкап БД + media (ставится make cron-install)' \
+		'# DIAS: ночной бэкап БД + media и копия на GitHub (ставится make cron-install)' \
 		'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-		'0 3 * * * root cd $(CURDIR) && flock -n /tmp/dias-backup.lock ./scripts/backup.sh >> backups/cron.log 2>&1' \
+		'0 3 * * * root cd $(CURDIR) && flock -n /tmp/dias-backup.lock sh -c "./scripts/backup.sh; ./scripts/backup-github.sh" >> backups/cron.log 2>&1' \
 		> /etc/cron.d/dias-backup
 	@chmod 644 /etc/cron.d/dias-backup
 	@cat /etc/cron.d/dias-backup
